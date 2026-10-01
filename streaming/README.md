@@ -87,7 +87,6 @@ The CLI flushes stdout after each received chunk, so generated text becomes visi
             StreamEvent::Chunk(chunk) => {
                 println!("{chunk:?}");
             }
-            StreamEvent::Text { .. } | StreamEvent::Reasoning { .. } => {}
             StreamEvent::Done => break,
         }
     }
