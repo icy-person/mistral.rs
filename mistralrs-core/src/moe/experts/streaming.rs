@@ -975,11 +975,13 @@ impl StreamedExpertsWeights {
         cfg: &super::config::MoEExpertsConfig,
         experts_vb: &mistralrs_quant::ShardedVarBuilder,
         layer_device: &Device,
+        comm: &Arc<mistralrs_quant::Comm>,
         loading_isq: bool,
     ) -> Result<Option<Self>> {
         let config = MoeStreamConfig::from_env();
         if !config.enabled
             || loading_isq
+            || comm.world_size() != 1
             || !layer_device.is_cpu()
             || experts_vb.lora_registry().is_some()
         {
