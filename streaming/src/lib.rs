@@ -180,8 +180,6 @@ impl StreamingClientBuilder {
 
         if let Some(timeout) = self.request_timeout {
             builder = builder.timeout(timeout);
-        } else {
-            builder = builder.timeout(None);
         }
 
         if let Some(token) = self.bearer_token {
@@ -351,7 +349,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data_len = 0usize;
 
     for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b'\r').unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(&b'\r').unwrap_or(raw_line);
         if line.is_empty() || line[0] == b':' {
             continue;
         }
