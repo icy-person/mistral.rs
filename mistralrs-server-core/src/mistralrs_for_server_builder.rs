@@ -831,7 +831,7 @@ impl MistralRsForServerBuilder {
             init_device(self.cpu, self.seed)?
         };
 
-        let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params);
+        let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params, self.cpu);
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
 
         let cache_config = reserve_external_mtp_memory_with_runtime(
@@ -1027,6 +1027,7 @@ impl MistralRsForServerBuilder {
                 .clone()
                 .or(self.num_device_layers.clone()),
             &auto_device_map_params,
+            self.cpu,
         );
         let mapper_for_config = mapper.clone();
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
@@ -1230,6 +1231,7 @@ impl MistralRsForServerBuilder {
                     .clone()
                     .or(self.num_device_layers.clone()),
                 &auto_device_map_params,
+                self.cpu,
             );
             let mapper_for_config = mapper.clone();
 
@@ -1412,7 +1414,21 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
 fn init_mapper(
     num_device_layers: &Option<Vec<String>>,
     auto_device_map_params: &AutoDeviceMapParams,
+    force_cpu: bool,
 ) -> DeviceMapSetting {
+    // A forced CPU run has exactly one physical execution device. Avoid the
+    // automatic layer mapper here: it cannot improve placement and its
+    // available-memory check would reject models that intentionally rely on
+    // host virtual memory (for example a large GGUF with swap/zram).
+    if force_cpu && num_device_layers.is_none() {
+        return DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(vec![
+            DeviceLayerMapMetadata {
+                ordinal: 0,
+                layers: 0,
+            },
+        ]));
+    }
+
     // Parse device mapper
     if let Some(device_layers) = num_device_layers {
         if device_layers.len() == 1 && device_layers[0].parse::<usize>().is_ok() {
