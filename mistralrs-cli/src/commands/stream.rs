@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::args::GlobalOptions;
 
-pub(crate) async fn run_stream(
+pub async fn run_stream(
     base_url: String,
     model: String,
     input: String,
@@ -32,7 +32,8 @@ pub(crate) async fn run_stream(
 ) -> Result<()> {
     if reconnect > 0 && resume_id.is_some() {
         anyhow::bail!(
-            "--resume-id cannot be combined with --reconnect; reconnect resumes automatically              from SSE event ids"
+            "--resume-id cannot be combined with --reconnect; reconnect resumes automatically \
+             from SSE event ids"
         );
     }
 
@@ -83,29 +84,17 @@ pub(crate) async fn run_stream(
             .await?;
         consume_reconnect_stream(stream, no_stats).await?;
     } else {
-        let mut stream = match resume_id {
-            Some(id) => client
-                .stream_with_resume_and_cancellation(request, id, cancellation)
-                .await?,
-            None => client.stream_with_cancellation(request, cancellation).await?,
-        };
-
-        while let Some(event) = stream.next().await {
-            match event? {
-                StreamEvent::Chunk(chunk) => print_chunk(&chunk),
-                StreamEvent::Done => break,
+        match resume_id {
+            Some(id) => {
+                let mut stream = client
+                    .stream_with_resume_and_cancellation(request, id, cancellation)
+                    .await?;
+                consume_chat_stream(&mut stream, no_stats).await?;
             }
-        }
-
-        io::stdout().flush()?;
-        if !no_stats {
-            eprintln!();
-            eprintln!("TTFT: {:?}", stream.stats().ttft());
-            eprintln!("Elapsed: {:?}", stream.stats().elapsed());
-            eprintln!("Content bytes: {}", stream.stats().content_bytes);
-            eprintln!("Reasoning bytes: {}", stream.stats().reasoning_bytes);
-            eprintln!("Chunks: {}", stream.stats().chunks);
-            eprintln!("Last-Event-ID: {}", stream.last_event_id().unwrap_or("<none>"));
+            None => {
+                let mut stream = client.stream_with_cancellation(request, cancellation).await?;
+                consume_chat_stream(&mut stream, no_stats).await?;
+            }
         }
     }
 
@@ -117,6 +106,34 @@ fn install_ctrl_c_cancellation(cancellation: CancellationToken) {
         let _ = tokio::signal::ctrl_c().await;
         cancellation.cancel();
     });
+}
+
+async fn consume_chat_stream<S>(
+    stream: &mut mistralrs_streaming::ChatStream<S>,
+    no_stats: bool,
+) -> Result<()>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::Chunk(chunk) => print_chunk(&chunk),
+            StreamEvent::Done => break,
+        }
+    }
+
+    io::stdout().flush()?;
+    if !no_stats {
+        eprintln!();
+        eprintln!("TTFT: {:?}", stream.stats().ttft());
+        eprintln!("Elapsed: {:?}", stream.stats().elapsed());
+        eprintln!("Content bytes: {}", stream.stats().content_bytes);
+        eprintln!("Reasoning bytes: {}", stream.stats().reasoning_bytes);
+        eprintln!("Chunks: {}", stream.stats().chunks);
+        eprintln!("Last-Event-ID: {}", stream.last_event_id().unwrap_or("<none>"));
+    }
+
+    Ok(())
 }
 
 fn print_chunk(chunk: &mistralrs_streaming::ChatChunk) {
