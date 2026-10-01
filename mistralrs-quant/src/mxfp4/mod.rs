@@ -35,6 +35,317 @@ pub struct MXFP4Layer {
     bias: Option<Tensor>,
 }
 
+/// File-backed GPT-OSS MXFP4 expert projection.
+///
+/// The packed expert bank remains in the GGUF mmap. gather_forward_raw decodes
+/// only the routed expert rows into a temporary output buffer.
+#[derive(Debug)]
+pub struct MxFp4StreamingExpertLayer {
+    archive: Arc<crate::GgufArchive>,
+    raw_weights: Vec<String>,
+    num_experts: usize,
+    component_out_dim: usize,
+    in_dim: usize,
+    out_dim: usize,
+    bias: Option<Tensor>,
+}
+
+impl MxFp4StreamingExpertLayer {
+    pub(crate) fn from_gguf(
+        archive: Arc<crate::GgufArchive>,
+        raw_weights: Vec<String>,
+        num_experts: usize,
+        in_dim: usize,
+        out_dim: usize,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        if raw_weights.is_empty() || raw_weights.len() > 2 {
+            candle_core::bail!("GPT-OSS MXFP4 streaming expects one or two raw expert tensors");
+        }
+        if raw_weights.len() == 2 && !out_dim.is_multiple_of(2) {
+            candle_core::bail!(
+                "GPT-OSS gate/up streamed projection output dimension must be even, got {out_dim}"
+            );
+        }
+
+        let component_out_dim = if raw_weights.len() == 2 {
+            out_dim / 2
+        } else {
+            out_dim
+        };
+
+        for name in &raw_weights {
+            let info = archive.tensor_info(name)?;
+            validate_mxfp4(info.dtype().raw(), info.shape(), name)?;
+            let shape = info.shape();
+            if shape.len() != 3
+                || shape[0] != num_experts
+                || shape[1] != component_out_dim
+                || shape[2] != in_dim
+            {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming tensor {name} has shape {shape:?}, expected [{num_experts}, {component_out_dim}, {in_dim}]"
+                );
+            }
+            if !in_dim.is_multiple_of(MXFP4_BLOCK_SIZE) {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming tensor {name} has K {in_dim}, not divisible by block size {MXFP4_BLOCK_SIZE}"
+                );
+            }
+            let expected_bytes = num_experts
+                .checked_mul(component_out_dim)
+                .and_then(|v| v.checked_mul(in_dim / MXFP4_BLOCK_SIZE))
+                .and_then(|v| v.checked_mul(MXFP4_BLOCK_SIZE / 2 + 1))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "GPT-OSS MXFP4 streaming byte-size overflow for {name}"
+                    ))
+                })?;
+            let actual_bytes = archive.tensor_data(name)?.bytes().len();
+            if actual_bytes != expected_bytes {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming tensor {name} has {actual_bytes} bytes, expected {expected_bytes}"
+                );
+            }
+        }
+
+        if let Some(bias) = &bias {
+            if bias.dims() != [num_experts, out_dim] {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming bias has shape {:?}, expected [{num_experts}, {out_dim}]",
+                    bias.dims()
+                );
+            }
+        }
+
+        Ok(Self {
+            archive,
+            raw_weights,
+            num_experts,
+            component_out_dim,
+            in_dim,
+            out_dim,
+            bias,
+        })
+    }
+
+    fn raw_expert_bytes(&self, weight_idx: usize, expert_idx: usize) -> Result<&[u8]> {
+        let name = self
+            .raw_weights
+            .get(weight_idx)
+            .ok_or_else(|| candle_core::Error::Msg("invalid streamed MXFP4 weight index".into()))?;
+
+        if expert_idx >= self.num_experts {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
+                self.num_experts
+            );
+        }
+
+        let info = self.archive.tensor_info(name)?;
+        let data = self.archive.tensor_data(name)?.bytes();
+        let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row
+            .checked_mul(MXFP4_BLOCK_SIZE / 2 + 1)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 row byte-size overflow".into()))?;
+        let expert_bytes = self
+            .component_out_dim
+            .checked_mul(row_bytes)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert byte-size overflow".into()))?;
+        let start = expert_idx
+            .checked_mul(expert_bytes)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
+        let end = start
+            .checked_add(expert_bytes)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert range overflow".into()))?;
+
+        if end > data.len() || end > info.data_len()? {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 streamed expert range {start}..{end} exceeds tensor {name}"
+            );
+        }
+        Ok(&data[start..end])
+    }
+
+    fn dot_row(
+        x: &[f32],
+        raw_expert: &[u8],
+        row: usize,
+        out_row_offset: usize,
+        output: &mut [f32],
+        output_row: usize,
+        output_rows: usize,
+    ) {
+        let blocks_per_row = x.len() / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+        let mut acc = 0f32;
+
+        for block_idx in 0..blocks_per_row {
+            let start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let end = start + (MXFP4_BLOCK_SIZE / 2 + 1);
+            let block = &raw_expert[start..end];
+            let dequant = &MXFP4Layer::DEQUANT_LUT[block[0] as usize];
+            let packed = &block[1..];
+
+            let col_start = block_idx * MXFP4_BLOCK_SIZE;
+            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                let packed_byte = packed[byte_idx];
+                acc += x[col_start + byte_idx * 2] * dequant[(packed_byte & 0x0f) as usize];
+                acc += x[col_start + byte_idx * 2 + 1]
+                    * dequant[(packed_byte >> 4) as usize];
+            }
+        }
+
+        output[output_row * output_rows + out_row_offset + row] += acc;
+    }
+}
+
+impl QuantMethod for MxFp4StreamingExpertLayer {
+    fn new(_method: QuantMethodConfig) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        candle_core::bail!("MxFp4StreamingExpertLayer must be constructed from a GGUF archive")
+    }
+
+    fn dequantize_w(&self) -> Result<Tensor> {
+        candle_core::bail!(
+            "{} keeps expert weights file-backed and supports gather_forward only",
+            self.name()
+        )
+    }
+
+    fn forward_raw(&self, _a: &Tensor) -> Result<Tensor> {
+        candle_core::bail!(
+            "{} is a routed expert layer; use gather_forward",
+            self.name()
+        )
+    }
+
+    fn gather_forward_raw(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let x_dims = x.dims();
+        let index_dims = indices.dims();
+        if index_dims.len() != 2 {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 streaming expects rank-2 indices, got rank {}",
+                index_dims.len()
+            );
+        }
+
+        let (num_tokens, topk, k, x_has_topk) = match x_dims {
+            [tokens, cols] => (*tokens, index_dims[1], *cols, false),
+            [tokens, x_topk, cols] => {
+                if *tokens != index_dims[0] || *x_topk != index_dims[1] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input and index shapes do not agree"
+                    );
+                }
+                (*tokens, *x_topk, *cols, true)
+            }
+            _ => candle_core::bail!(
+                "GPT-OSS MXFP4 streaming expects rank-2 or rank-3 input, got rank {}",
+                x_dims.len()
+            ),
+        };
+
+        if k != self.in_dim || !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 streaming input K {k} does not match expected {}",
+                self.in_dim
+            );
+        }
+
+        let x_cpu = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let x_data = x_cpu.flatten_all()?.to_vec1::<f32>()?;
+        let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
+        let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
+
+        let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+
+        for token_idx in 0..num_tokens {
+            for slot_idx in 0..topk {
+                let expert_idx = indices_data[token_idx * topk + slot_idx] as usize;
+                if expert_idx >= self.num_experts {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
+                        self.num_experts
+                    );
+                }
+
+                let route_row = token_idx * topk + slot_idx;
+                let x_offset = if x_has_topk {
+                    route_row * self.in_dim
+                } else {
+                    token_idx * self.in_dim
+                };
+                let x_row = &x_data[x_offset..x_offset + self.in_dim];
+
+                for component in 0..self.raw_weights.len() {
+                    let expert = self.raw_expert_bytes(component, expert_idx)?;
+                    let out_offset = component * self.component_out_dim;
+                    for row in 0..self.component_out_dim {
+                        Self::dot_row(
+                            x_row,
+                            expert,
+                            row,
+                            out_offset,
+                            &mut output,
+                            route_row,
+                            self.out_dim,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut result =
+            Tensor::from_vec(output, (num_tokens, topk, self.out_dim), &Device::Cpu)?;
+        if let Some(bias) = &self.bias {
+            result = result.broadcast_add(bias)?;
+        }
+        result = result.to_device(x.device())?.to_dtype(x.dtype())?;
+        Ok(result)
+    }
+
+    fn quantized_act_type(&self) -> Option<DType> {
+        None
+    }
+
+    fn dtype_and_device(&self) -> (DType, Device) {
+        (DType::BF16, Device::Cpu)
+    }
+
+    fn plan_isq(&self, _request: &crate::IsqRequest) -> Result<crate::IsqPlanParams> {
+        candle_core::bail!("{} does not support ISQ", self.name())
+    }
+
+    fn add_delta_w(&self, _delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {
+        candle_core::bail!("{} does not support add_delta_w", self.name())
+    }
+
+    fn apply_isq(
+        self: Arc<Self>,
+        _dtype: Option<IsqType>,
+        _device: Device,
+        _n_quantized: &AtomicUsize,
+        _imatrix_weight: Option<Vec<f32>>,
+        _guard: QuantizeOntoGuard,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        candle_core::bail!("{} does not support ISQ", self.name())
+    }
+
+    fn has_bias(&self) -> bool {
+        self.bias.is_some()
+    }
+}
+
+impl QuantizedSerde for MxFp4StreamingExpertLayer {
+    fn name(&self) -> &'static str {
+        "mxfp4-expert-stream"
+    }
+}
+
 impl MXFP4Layer {
     pub(crate) fn inspect_uqff_header(layer: &UqffLayerHeaderView<'_>) -> Option<UqffHeaderMatch> {
         const WEIGHT_SUFFIXES: &[&str] = &["weight", "weight.format", "weight.scales"];
