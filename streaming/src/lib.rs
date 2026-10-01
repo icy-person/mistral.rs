@@ -549,7 +549,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            last_event_id: last_event_id.filter(|id| !id.is_empty()),
         })
     }
 }
