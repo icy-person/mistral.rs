@@ -482,25 +482,18 @@ mod tests {
     #[test]
     fn ignores_comments_and_parses_multiline_data() {
         let mut p = parser();
-        p.push(
-            b": heartbeat\nevent: message\ndata: {\"id\":\"x\",\ndata: \"choices\":[]}\n\n",
-        )
-        .unwrap();
+        p.push(b": heartbeat\nevent: message\ndata: {\"id\":\"x\",\ndata: \"choices\":[]}\n\n")
+            .unwrap();
 
-        assert!(matches!(
-            p.next_event(),
-            Some(Ok(StreamEvent::Chunk(_)))
-        ));
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
     }
 
     #[test]
     fn parses_crlf_and_done() {
         let mut p = parser();
-        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n").unwrap();
-        assert!(matches!(
-            p.next_event(),
-            Some(Ok(StreamEvent::Chunk(_)))
-        ));
+        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n")
+            .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
 
         p.push(b"data: [DONE]\r\n\r\n").unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
