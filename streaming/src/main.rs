@@ -306,7 +306,10 @@ mod tests {
         assert!(matches!(args.output, OutputFormat::Jsonl));
         assert!(args.reconnect);
         assert_eq!(args.max_retries, 5);
-        assert_eq!(args.prompt, vec!["Explain".to_string(), "mixture-of-experts".to_string()]);
+        assert_eq!(
+            args.prompt,
+            vec!["Explain".to_string(), "mixture-of-experts".to_string()]
+        );
     }
 
     #[test]
@@ -337,20 +340,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_generation_ranges() {
-        assert!(Args::try_parse_from([
-            "mistralrs-streaming",
-            "--temperature",
-            "3.0",
-            "hello",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from(["mistralrs-streaming", "--temperature", "3.0", "hello",]).is_err()
+        );
 
-        assert!(Args::try_parse_from([
-            "mistralrs-streaming",
-            "--max-tokens",
-            "0",
-            "hello",
-        ])
-        .is_err());
+        assert!(
+            Args::try_parse_from(["mistralrs-streaming", "--max-tokens", "0", "hello",]).is_err()
+        );
     }
 }
