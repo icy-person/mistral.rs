@@ -494,11 +494,12 @@ impl StreamingClient {
                 started: Some(started),
                 ..Default::default()
             },
-            saw_done: false,
             cancellation,
             cancelled,
-            cancellation_emitted: false,
-            last_event_id: last_event_id.map(str::to_owned),
+            finished: false,
+            last_event_id: last_event_id
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
         })
     }
 
@@ -547,17 +548,15 @@ impl StreamingClient {
                 started: Some(started),
                 ..Default::default()
             },
-            saw_done: false,
             cancellation,
             cancelled,
-            cancellation_emitted: false,
-            last_event_id,
+            finished: false,
+            last_event_id: last_event_id
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
         })
     }
 }
-
-type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
-type CancelFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
