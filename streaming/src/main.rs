@@ -261,3 +261,92 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_streaming_cli_controls() {
+        let args = Args::try_parse_from([
+            "mistralrs-streaming",
+            "--base-url",
+            "http://127.0.0.1:1234/v1",
+            "--model",
+            "Qwen3.5-2B",
+            "--max-tokens",
+            "256",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+            "--show-reasoning",
+            "--stats",
+            "--output",
+            "jsonl",
+            "--reconnect",
+            "--max-retries",
+            "5",
+            "Explain",
+            "mixture-of-experts",
+        ])
+        .unwrap();
+
+        assert_eq!(args.base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(args.model, "Qwen3.5-2B");
+        assert_eq!(args.max_tokens, 256);
+        assert_eq!(args.temperature, Some(0.2));
+        assert_eq!(args.top_p, Some(0.9));
+        assert!(args.show_reasoning);
+        assert!(args.stats);
+        assert!(matches!(args.output, OutputFormat::Jsonl));
+        assert!(args.reconnect);
+        assert_eq!(args.max_retries, 5);
+        assert_eq!(args.prompt, ["Explain", "mixture-of-experts"]);
+    }
+
+    #[test]
+    fn request_uses_cli_generation_settings_and_always_streams() {
+        let args = Args::try_parse_from([
+            "mistralrs-streaming",
+            "--model",
+            "test-model",
+            "--max-tokens",
+            "64",
+            "--temperature",
+            "0.4",
+            "--top-p",
+            "0.8",
+            "hello",
+            "world",
+        ])
+        .unwrap();
+
+        let request = build_request(&args);
+        assert_eq!(request.model, "test-model");
+        assert_eq!(request.messages[0].content, "hello world");
+        assert!(request.stream);
+        assert_eq!(request.max_tokens, Some(64));
+        assert_eq!(request.temperature, Some(0.4));
+        assert_eq!(request.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn rejects_invalid_generation_ranges() {
+        assert!(Args::try_parse_from([
+            "mistralrs-streaming",
+            "--temperature",
+            "3.0",
+            "hello",
+        ])
+        .is_err());
+
+        assert!(Args::try_parse_from([
+            "mistralrs-streaming",
+            "--max-tokens",
+            "0",
+            "hello",
+        ])
+        .is_err());
+    }
+}
