@@ -651,42 +651,54 @@ pub struct RuntimeOptions {
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 
     /// Stream routed MoE expert weights from GGUF instead of materializing the full expert stack.
-    #[arg(long)]
+    #[arg(long, env = "MISTRALRS_MOE_STREAM")]
     #[serde(default)]
     pub moe_stream: bool,
 
     /// Expert-cache budget in MiB, or auto to derive it from MemAvailable.
-    #[arg(long = "cache-mb", default_value = "auto")]
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
     #[serde(default = "default_moe_cache_mb")]
     pub moe_cache_mb: String,
 
     /// Memory to leave available when auto-sizing the expert cache.
-    #[arg(long = "cache-floor-mb", default_value_t = 1536)]
+    #[arg(
+        long = "cache-floor-mb",
+        env = "MISTRALRS_MOE_CACHE_FLOOR_MB",
+        default_value_t = 1536
+    )]
     #[serde(default = "default_moe_cache_floor_mb")]
     pub moe_cache_floor_mb: usize,
 
     /// Hard ceiling for an auto-sized expert cache. Omit to disable the ceiling.
-    #[arg(long = "cache-ceil-mb")]
+    #[arg(
+        long = "cache-ceil-mb",
+        env = "MISTRALRS_MOE_CACHE_CEIL_MB",
+        default_value = "4096"
+    )]
     #[serde(default)]
     pub moe_cache_ceil_mb: Option<usize>,
 
     /// Number of parallel expert-read lanes.
-    #[arg(long = "io-threads", default_value_t = 4)]
+    #[arg(
+        long = "io-threads",
+        env = "MISTRALRS_MOE_IO_THREADS",
+        default_value_t = 4
+    )]
     #[serde(default = "default_moe_io_threads")]
     pub moe_io_threads: usize,
 
     /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
-    #[arg(long)]
+    #[arg(long, env = "MISTRALRS_MOE_OVERLAP", default_value_t = true)]
     #[serde(default = "default_moe_overlap")]
     pub moe_overlap: bool,
 
     /// Try Linux O_DIRECT for expert reads; falls back to buffered I/O when unsupported.
-    #[arg(long = "o-direct")]
+    #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
     #[serde(default)]
     pub moe_o_direct: bool,
 
     /// Emit periodic MoE cache/I/O telemetry to the log.
-    #[arg(long = "moe-stats")]
+    #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
     #[serde(default)]
     pub moe_stats: bool,
 
