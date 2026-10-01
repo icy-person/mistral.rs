@@ -20,7 +20,7 @@ pub struct StreamingClient {
     chat_url: Url,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StreamingClientBuilder {
     base_url: String,
     connect_timeout: Duration,
