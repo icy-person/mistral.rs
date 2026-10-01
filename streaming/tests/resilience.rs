@@ -86,6 +86,99 @@ fn chunk(id: u32, content: &str) -> String {
     )
 }
 
+
+#[test]
+fn serializes_extended_chat_request_controls() {
+    let mut request = request();
+    request.frequency_penalty = Some(0.25);
+    request.presence_penalty = Some(0.5);
+    request.stop = Some(serde_json::json!(["END", "STOP"]));
+    request.tools = Some(vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Return the weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"}
+                },
+                "required": ["city"]
+            }
+        }
+    })]);
+    request.tool_choice = Some(serde_json::json!({
+        "type": "function",
+        "function": {"name": "get_weather"}
+    }));
+    request.parallel_tool_calls = Some(true);
+    request.response_format = Some(serde_json::json!({"type": "json_object"}));
+    request.seed = Some(42);
+    request.stream_options = Some(mistralrs_streaming::StreamOptions {
+        include_usage: Some(true),
+        include_obfuscation: Some(false),
+    });
+
+    let json = serde_json::to_value(request).unwrap();
+
+    assert_eq!(json["frequency_penalty"], 0.25);
+    assert_eq!(json["presence_penalty"], 0.5);
+    assert_eq!(json["stop"], serde_json::json!(["END", "STOP"]));
+    assert_eq!(json["tools"][0]["function"]["name"], "get_weather");
+    assert_eq!(json["tool_choice"]["function"]["name"], "get_weather");
+    assert_eq!(json["parallel_tool_calls"], true);
+    assert_eq!(json["response_format"]["type"], "json_object");
+    assert_eq!(json["seed"], 42);
+    assert_eq!(json["stream_options"]["include_usage"], true);
+    assert_eq!(json["stream_options"]["include_obfuscation"], false);
+}
+
+#[test]
+fn parses_streamed_tool_call_and_refusal_deltas() {
+    let mut parser = mistralrs_streaming::SseParser::new();
+    parser
+        .push(
+            br#"data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Baku\"}"}}]}}]}
+
+"#,
+        )
+        .unwrap();
+
+    match parser.next_event().unwrap().unwrap() {
+        StreamEvent::Chunk(chunk) => {
+            let tool = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+            assert_eq!(tool[0].index, 0);
+            assert_eq!(tool[0].id.as_deref(), Some("call_1"));
+            assert_eq!(tool[0].r#type.as_deref(), Some("function"));
+            let function = tool[0].function.as_ref().unwrap();
+            assert_eq!(function.name.as_deref(), Some("get_weather"));
+            assert_eq!(
+                function.arguments.as_deref(),
+                Some(r#"{"city":"Baku"}"#)
+            );
+        }
+        StreamEvent::Done => panic!("unexpected done"),
+    }
+
+    parser
+        .push(
+            br#"data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"refusal":"not allowed"}}]}
+
+"#,
+        )
+        .unwrap();
+
+    match parser.next_event().unwrap().unwrap() {
+        StreamEvent::Chunk(chunk) => {
+            assert_eq!(
+                chunk.choices[0].delta.refusal.as_deref(),
+                Some("not allowed")
+            );
+        }
+        StreamEvent::Done => panic!("unexpected done"),
+    }
+}
+
 #[tokio::test]
 async fn reconnects_with_last_event_id_without_restarting_output() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
