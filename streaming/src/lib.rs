@@ -704,7 +704,9 @@ mod tests {
             let split = split.min(EVENT.len());
             let mut p = parser();
             p.push(&EVENT[..split]).unwrap();
-            assert!(p.next_event().is_none());
+            if split < EVENT.len() {
+                assert!(p.next_event().is_none());
+            }
             p.push(&EVENT[split..]).unwrap();
             assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         }
