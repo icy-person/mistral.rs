@@ -484,7 +484,7 @@ impl StreamingClient {
         }
 
         let cancellation = cancellation.unwrap_or_else(tokio_util::sync::CancellationToken::new);
-        let cancelled = cancellation.clone().cancelled_owned();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
             body: Box::pin(response.bytes_stream()),
@@ -536,7 +536,7 @@ impl StreamingClient {
         }
 
         let cancellation = cancellation.unwrap_or_else(tokio_util::sync::CancellationToken::new);
-        let cancelled = cancellation.clone().cancelled_owned();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
             body: response.bytes_stream(),
@@ -568,18 +568,14 @@ fn is_retryable_stream_error(error: &StreamingError) -> bool {
     }
 }
 
-pin_project_lite::pin_project! {
-    pub struct ChatStream<S> {
-        #[pin]
-        body: S,
-        parser: SseParser,
-        stats: StreamStats,
-        cancellation: tokio_util::sync::CancellationToken,
-        #[pin]
-        cancelled: tokio_util::sync::WaitForCancellationFutureOwned,
-        finished: bool,
-        last_event_id: Option<String>,
-    }
+pub struct ChatStream<S> {
+    body: S,
+    parser: SseParser,
+    stats: StreamStats,
+    cancellation: tokio_util::sync::CancellationToken,
+    cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    finished: bool,
+    last_event_id: Option<String>,
 }
 
 impl<S> ChatStream<S> {
@@ -598,35 +594,33 @@ impl<S> ChatStream<S> {
 
 impl<S> Stream for ChatStream<S>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
     type Item = Result<StreamEvent, StreamingError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
 
-        if *this.finished {
+        if this.finished {
             return Poll::Ready(None);
         }
 
-        if this.cancelled.as_mut().poll(cx).is_ready() {
+        if Pin::as_mut(&mut this.cancelled).poll(cx).is_ready() {
             this.stats.finished = Some(Instant::now());
-            *this.finished = true;
+            this.finished = true;
             return Poll::Ready(Some(Err(StreamingError::Cancelled)));
         }
 
         loop {
-            let parsed = this.parser.next_event();
+            if let Some(result) = this.parser.next_event() {
+                if let Some(id) = this.parser.last_event_id() {
+                    this.last_event_id = (!id.is_empty()).then_some(id.to_owned());
+                }
 
-            if let Some(id) = this.parser.last_event_id() {
-                *this.last_event_id = (!id.is_empty()).then_some(id.to_owned());
-            }
-
-            if let Some(result) = parsed {
                 match result {
                     Ok(StreamEvent::Done) => {
                         this.stats.finished = Some(Instant::now());
-                        *this.finished = true;
+                        this.finished = true;
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
@@ -653,28 +647,31 @@ where
                     }
                     Err(error) => {
                         this.stats.finished = Some(Instant::now());
-                        *this.finished = true;
+                        this.finished = true;
                         return Poll::Ready(Some(Err(error)));
                     }
                 }
             }
 
-            match this.body.as_mut().poll_next(cx) {
+            match Pin::new(&mut this.body).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Err(error) = this.parser.push(&bytes) {
                         this.stats.finished = Some(Instant::now());
-                        *this.finished = true;
+                        this.finished = true;
                         return Poll::Ready(Some(Err(error)));
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.stats.finished = Some(Instant::now());
-                    *this.finished = true;
+                    this.finished = true;
                     return Poll::Ready(Some(Err(StreamingError::Http(error))));
                 }
                 Poll::Ready(None) => {
                     this.stats.finished = Some(Instant::now());
-                    *this.finished = true;
+                    this.finished = true;
+                    if this.cancellation.is_cancelled() {
+                        return Poll::Ready(Some(Err(StreamingError::Cancelled)));
+                    }
                     return Poll::Ready(Some(Err(StreamingError::UnexpectedEof)));
                 }
                 Poll::Pending => return Poll::Pending,
@@ -682,6 +679,7 @@ where
         }
     }
 }
+
 
 pub struct SseParser {
     buffer: BytesMut,
@@ -1119,7 +1117,7 @@ data: {"id":"x","choices":[]}
     #[tokio::test]
     async fn chat_stream_cancel_is_available_on_plain_stream() {
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let cancelled = cancellation.clone().cancelled_owned();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         let body = futures_util::stream::empty::<Result<Bytes, reqwest::Error>>();
         let mut stream = ChatStream {
