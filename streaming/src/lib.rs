@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
