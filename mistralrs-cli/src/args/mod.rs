@@ -116,6 +116,63 @@ pub enum Command {
         adapter: Option<String>,
     },
 
+    /// Stream chat completions from an OpenAI-compatible HTTP endpoint.
+    ///
+    /// This exercises the optimized mistralrs-streaming SSE client directly.
+    Stream {
+        /// OpenAI-compatible base URL, e.g. http://127.0.0.1:1234/v1
+        #[arg(long, default_value = "http://127.0.0.1:1234/v1")]
+        base_url: String,
+
+        /// Model id exposed by the HTTP server
+        #[arg(short = 'm', long, default_value = "default")]
+        model: String,
+
+        /// One-shot text prompt
+        #[arg(short = 'i', long)]
+        input: String,
+
+        /// Maximum generated tokens
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+
+        /// Sampling temperature
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Nucleus sampling probability
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Connect timeout in milliseconds
+        #[arg(long, default_value_t = 10_000)]
+        connect_timeout_ms: u64,
+
+        /// Optional whole-request timeout in milliseconds
+        #[arg(long)]
+        request_timeout_ms: Option<u64>,
+
+        /// Reconnect after retryable stream failures. Requires a server-emitted SSE event id.
+        #[arg(long, default_value_t = 0)]
+        reconnect: u32,
+
+        /// Initial reconnect backoff in milliseconds
+        #[arg(long, default_value_t = 250)]
+        reconnect_backoff_ms: u64,
+
+        /// Maximum reconnect backoff in milliseconds
+        #[arg(long, default_value_t = 4_000)]
+        reconnect_max_backoff_ms: u64,
+
+        /// Start from this SSE event id. Useful for explicit resume testing.
+        #[arg(long)]
+        resume_id: Option<String>,
+
+        /// Do not print final streaming statistics
+        #[arg(long)]
+        no_stats: bool,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
