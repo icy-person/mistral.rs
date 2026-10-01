@@ -831,7 +831,11 @@ impl MistralRsForServerBuilder {
             init_device(self.cpu, self.seed)?
         };
 
-        let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params, self.cpu);
+        let mapper = init_mapper(
+            &self.num_device_layers,
+            &auto_device_map_params,
+            self.cpu || device.is_cpu(),
+        );
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
 
         let cache_config = reserve_external_mtp_memory_with_runtime(
@@ -1027,7 +1031,7 @@ impl MistralRsForServerBuilder {
                 .clone()
                 .or(self.num_device_layers.clone()),
             &auto_device_map_params,
-            self.cpu,
+            self.cpu || device.is_cpu(),
         );
         let mapper_for_config = mapper.clone();
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
