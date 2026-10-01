@@ -86,7 +86,6 @@ fn chunk(id: u32, content: &str) -> String {
     )
 }
 
-
 #[test]
 fn serializes_extended_chat_request_controls() {
     let mut request = request();
