@@ -152,10 +152,7 @@ fn parses_streamed_tool_call_and_refusal_deltas() {
             assert_eq!(tool[0].r#type.as_deref(), Some("function"));
             let function = tool[0].function.as_ref().unwrap();
             assert_eq!(function.name.as_deref(), Some("get_weather"));
-            assert_eq!(
-                function.arguments.as_deref(),
-                Some(r#"{"city":"Baku"}"#)
-            );
+            assert_eq!(function.arguments.as_deref(), Some(r#"{"city":"Baku"}"#));
         }
         StreamEvent::Done => panic!("unexpected done"),
     }
