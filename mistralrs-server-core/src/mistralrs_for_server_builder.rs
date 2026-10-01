@@ -303,6 +303,9 @@ pub struct MistralRsForServerBuilder {
     code_exec_config: Option<mistralrs_core::CodeExecutionConfig>,
     /// Shell execution configuration
     shell_config: Option<mistralrs_core::ShellConfig>,
+
+    /// Keep supported MoE expert banks file-backed and load only routed experts.
+    moe_streaming: bool,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -350,6 +353,7 @@ impl Default for MistralRsForServerBuilder {
             disable_eos_stop: false,
             code_exec_config: None,
             shell_config: None,
+            moe_streaming: false,
         }
     }
 }
@@ -716,6 +720,12 @@ impl MistralRsForServerBuilder {
         if let Some(paged_attn_block_size) = paged_attn_block_size {
             self = self.with_paged_attn_block_size(paged_attn_block_size);
         }
+        self
+    }
+
+    /// Enables BigMoe-style routed-expert streaming for supported GGUF MoE models.
+    pub fn with_moe_streaming(mut self, enabled: bool) -> Self {
+        self.moe_streaming = enabled;
         self
     }
 
@@ -1216,6 +1226,7 @@ impl MistralRsForServerBuilder {
                 .or(self.hf_config_overrides.clone());
 
             let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+                .with_moe_streaming(self.moe_streaming)
                 .with_no_kv_cache(self.no_kv_cache)
                 .with_chat_template(chat_template.clone())
                 .with_jinja_explicit(jinja_explicit.clone())
