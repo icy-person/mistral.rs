@@ -483,7 +483,7 @@ impl StreamingClient {
             return Err(StreamingError::HttpStatus { status, body });
         }
 
-        let cancellation = cancellation.unwrap_or_else(tokio_util::sync::CancellationToken::new);
+        let cancellation = cancellation.unwrap_or_default();
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
@@ -535,7 +535,7 @@ impl StreamingClient {
             return Err(StreamingError::HttpStatus { status, body });
         }
 
-        let cancellation = cancellation.unwrap_or_else(tokio_util::sync::CancellationToken::new);
+        let cancellation = cancellation.unwrap_or_default();
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
