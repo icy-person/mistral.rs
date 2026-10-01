@@ -104,3 +104,36 @@ The CLI flushes stdout after each received chunk, so generated text becomes visi
     cargo clippy --all-targets -- -D warnings
 
 For low-level latency work, run release mode and compare TTFT and end-to-end elapsed time over multiple identical prompts rather than relying on a single sample.
+
+
+## Extended streaming support
+
+The client now exposes the major Chat Completions streaming controls without changing the hot path:
+
+- typed streamed tool-call deltas (tool_calls[].function.name/arguments)
+- refusal deltas
+- stream_options.include_usage and include_obfuscation
+- request controls for penalties, stop, tools, tool choice, response format, parallel tool calls, and seed
+- explicit cancellation through tokio_util::sync::CancellationToken
+- ChatStream::cancel() convenience cancellation
+- SSE id: tracking and last_event_id()
+- stream_with_resume(...), which sends Last-Event-ID for servers that implement SSE resume semantics
+- stream_with_reconnect(...), with bounded exponential backoff and automatic resume after transport/EOF failures
+- automatic reconnect is enabled only after a server-provided SSE id has been observed, preventing unsafe replay when the server cannot provide a resume cursor
+- generic ChatStream<S>; the normal reqwest body stream is no longer boxed, removing the previous dynamic-dispatch layer from the normal streaming hot path
+
+Resume is deliberately cursor-based: the SSE server must emit event IDs and support replay after Last-Event-ID. The reconnect API does not restart a partially consumed generation from scratch, because doing so could duplicate model output. This follows the SSE reconnection contract, where Last-Event-ID identifies the last successfully dispatched event.
+
+## Benchmarks and parser fuzz coverage
+
+Release benchmarks are available with:
+
+    cargo bench
+
+The benchmark suite covers single-line SSE, CRLF framing, and deliberately fragmented byte-at-a-time input.
+
+Property-based tests exercise arbitrary byte streams and all tested split points of valid SSE events:
+
+    cargo test --release --all-targets
+
+This combination is intended to catch parser panics, framing regressions, and incremental-boundary bugs while keeping the production parser free of fuzzing overhead.

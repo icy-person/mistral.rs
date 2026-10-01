@@ -24,6 +24,15 @@ async fn main() -> anyhow::Result<()> {
         max_tokens: Some(512),
         temperature: None,
         top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
+        seed: None,
+        stream_options: None,
     };
 
     let mut stream = client.stream(request).await?;

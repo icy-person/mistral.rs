@@ -16,6 +16,16 @@ reqwest = { version = "0.13.1", default-features = false, features = ["rustls", 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 url = "2.5"
 anyhow = "1.0"
+async-stream = "0.3"
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+proptest = "1.9"
+
+[[bench]]
+name = "sse_parser"
+harness = false

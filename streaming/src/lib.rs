@@ -1,5 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
-use futures_core::Stream;
+use futures_core::{Future, Stream};
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +40,32 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,7 +95,22 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(alias = "reasoning_content", alias = "reasoning")]
     pub reasoning: Option<String>,
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub refusal: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionCallDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,10 +150,38 @@ impl StreamStats {
         let seconds = self.elapsed()?.as_secs_f64();
         (seconds > 0.0).then_some(self.content_bytes as f64 / seconds)
     }
+
+    pub fn total_output_bytes(&self) -> u64 {
+        self.content_bytes + self.reasoning_bytes
+    }
+
+    pub fn total_output_bytes_per_second(&self) -> Option<f64> {
+        let seconds = self.elapsed()?.as_secs_f64();
+        (seconds > 0.0).then_some(self.total_output_bytes() as f64 / seconds)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReconnectPolicy {
+    pub max_retries: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(4),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum StreamingError {
+    #[error("stream cancelled")]
+    Cancelled,
     #[error("invalid base URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
     #[error("HTTP request failed: {0}")]
@@ -202,19 +272,262 @@ impl StreamingClient {
         StreamingClientBuilder::new()
     }
 
-    pub async fn stream(&self, mut request: ChatRequest) -> Result<ChatStream, StreamingError> {
+    pub async fn stream(
+        &self,
+        mut request: ChatRequest,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        self.stream_with_options(&mut request, None, None).await
+    }
+
+    pub async fn stream_with_cancellation(
+        &self,
+        mut request: ChatRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        self.stream_with_options(&mut request, Some(cancellation), None)
+            .await
+    }
+
+    pub async fn stream_with_resume(
+        &self,
+        mut request: ChatRequest,
+        last_event_id: impl AsRef<str>,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
+            .await
+    }
+
+    pub async fn stream_with_reconnect(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
+        self.stream_with_reconnect_internal(request, policy, None)
+            .await
+    }
+
+    pub async fn stream_with_reconnect_and_cancellation(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
+        self.stream_with_reconnect_internal(request, policy, Some(cancellation))
+            .await
+    }
+
+    async fn stream_with_reconnect_internal(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
+        let client = self.clone();
+        let stream = async_stream::try_stream! {
+        let mut last_event_id: Option<String> = None;
+        let mut retries = 0u32;
+        let mut delay = std::cmp::min(policy.initial_backoff, policy.max_backoff);
+
+        loop {
+            let result = match cancellation.as_ref() {
+                Some(token) => tokio::select! {
+                    _ = token.cancelled() => Err(StreamingError::Cancelled),
+                    result = client.stream_boxed_resume(
+                        request.clone(),
+                        last_event_id.as_deref().filter(|id| !id.is_empty()),
+                        cancellation.clone(),
+                    ) => result,
+                },
+                None => {
+                    client
+                        .stream_boxed_resume(
+                            request.clone(),
+                            last_event_id.as_deref().filter(|id| !id.is_empty()),
+                            None,
+                        )
+                        .await
+                }
+            };
+
+            let mut current = Box::pin(match result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let retryable = is_retryable_stream_error(&error);
+                    let resumable = last_event_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty());
+
+                    if !retryable || !resumable || retries >= policy.max_retries {
+                        Err(error)?;
+                    }
+
+                    retries += 1;
+                    let cancelled = match cancellation.as_ref() {
+                        Some(token) => tokio::select! {
+                            _ = token.cancelled() => true,
+                            _ = tokio::time::sleep(delay) => false,
+                        },
+                        None => {
+                            tokio::time::sleep(delay).await;
+                            false
+                        }
+                    };
+
+                    if cancelled {
+                        Err(StreamingError::Cancelled)?;
+                    }
+
+                    delay = std::cmp::min(
+                        delay.saturating_mul(2),
+                        policy.max_backoff,
+                    );
+                    continue;
+                }
+            });
+
+            loop {
+                match current.next().await {
+                    Some(Ok(event)) => {
+                        if let Some(id) = current.last_event_id() {
+                            last_event_id = Some(id.to_owned());
+                        }
+
+                        let done = matches!(&event, StreamEvent::Done);
+                        yield event;
+
+                        if done {
+                            return;
+                        }
+
+                        retries = 0;
+                        delay = std::cmp::min(
+                            policy.initial_backoff,
+                            policy.max_backoff,
+                        );
+                    }
+                    Some(Err(error)) => {
+                        let retryable = is_retryable_stream_error(&error);
+                        let resumable = last_event_id
+                            .as_deref()
+                            .is_some_and(|id| !id.is_empty());
+
+                        if !retryable || !resumable || retries >= policy.max_retries {
+                            Err(error)?;
+                        }
+
+                        retries += 1;
+                        let cancelled = match cancellation.as_ref() {
+                            Some(token) => tokio::select! {
+                                _ = token.cancelled() => true,
+                                _ = tokio::time::sleep(delay) => false,
+                            },
+                            None => {
+                                tokio::time::sleep(delay).await;
+                                false
+                            }
+                        };
+
+                        if cancelled {
+                            Err(StreamingError::Cancelled)?;
+                        }
+
+                        delay = std::cmp::min(
+                            delay.saturating_mul(2),
+                            policy.max_backoff,
+                        );
+                        break;
+                    }
+                    None => return,
+                }
+            }
+        }
+        };
+
+        Ok(stream)
+    }
+
+    async fn stream_boxed_resume(
+        &self,
+        request: ChatRequest,
+        last_event_id: Option<&str>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<ChatStream<DynBody>, StreamingError> {
+        let mut request = request;
         request.stream = true;
         let started = Instant::now();
 
-        let response = self
+        let mut builder = self
             .client
             .post(self.chat_url.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .json(&request)
-            .send()
-            .await?;
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+
+        if let Some(id) = last_event_id {
+            builder = builder.header("Last-Event-ID", id);
+        }
+
+        let response = match cancellation.as_ref() {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err(StreamingError::Cancelled),
+                result = builder.json(&request).send() => result?,
+            },
+            None => builder.json(&request).send().await?,
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StreamingError::HttpStatus { status, body });
+        }
+
+        let cancellation = cancellation.unwrap_or_default();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        Ok(ChatStream {
+            body: Some(Box::pin(response.bytes_stream())),
+            parser: SseParser::new(),
+            stats: StreamStats {
+                started: Some(started),
+                ..Default::default()
+            },
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+        })
+    }
+
+    async fn stream_with_options(
+        &self,
+        request: &mut ChatRequest,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+        last_event_id: Option<String>,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        request.stream = true;
+        let started = Instant::now();
+
+        let mut builder = self
+            .client
+            .post(self.chat_url.clone())
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+
+        if let Some(id) = last_event_id.as_deref().filter(|id| !id.is_empty()) {
+            builder = builder.header("Last-Event-ID", id);
+        }
+
+        let response = match cancellation.as_ref() {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err(StreamingError::Cancelled),
+                result = builder.json(request).send() => result?,
+            },
+            None => builder.json(request).send().await?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -222,82 +535,155 @@ impl StreamingClient {
             return Err(StreamingError::HttpStatus { status, body });
         }
 
+        let cancellation = cancellation.unwrap_or_default();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
         Ok(ChatStream {
-            body: Box::pin(response.bytes_stream()),
+            body: Some(response.bytes_stream()),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
                 ..Default::default()
             },
-            saw_done: false,
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: last_event_id.filter(|id| !id.is_empty()),
         })
     }
 }
 
-pub struct ChatStream {
-    body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    parser: SseParser,
-    stats: StreamStats,
-    saw_done: bool,
-}
+type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
-impl ChatStream {
-    pub fn stats(&self) -> &StreamStats {
-        &self.stats
+fn is_retryable_stream_error(error: &StreamingError) -> bool {
+    match error {
+        StreamingError::Http(error) => {
+            error.is_connect() || error.is_timeout() || error.is_request()
+        }
+        StreamingError::HttpStatus { status, .. } => {
+            matches!(status.as_u16(), 408 | 425 | 429 | 500..=599)
+        }
+        StreamingError::UnexpectedEof => true,
+        _ => false,
     }
 }
 
-impl Stream for ChatStream {
+pub struct ChatStream<S> {
+    body: Option<S>,
+    parser: SseParser,
+    stats: StreamStats,
+    cancellation: tokio_util::sync::CancellationToken,
+    cancelled: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    finished: bool,
+    last_event_id: Option<String>,
+}
+
+impl<S> ChatStream<S> {
+    pub fn stats(&self) -> &StreamStats {
+        &self.stats
+    }
+
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl<S> Stream for ChatStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
     type Item = Result<StreamEvent, StreamingError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
+        if Pin::as_mut(&mut this.cancelled).poll(cx).is_ready() {
+            this.stats.finished = Some(Instant::now());
+            this.finished = true;
+            this.body = None;
+            return Poll::Ready(Some(Err(StreamingError::Cancelled)));
+        }
+
         loop {
-            if let Some(result) = self.parser.next_event() {
+            if let Some(result) = this.parser.next_event() {
+                if let Some(id) = this.parser.last_event_id() {
+                    this.last_event_id = (!id.is_empty()).then_some(id.to_owned());
+                }
+
                 match result {
                     Ok(StreamEvent::Done) => {
-                        self.saw_done = true;
-                        self.stats.finished = Some(Instant::now());
+                        this.stats.finished = Some(Instant::now());
+                        this.finished = true;
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
-                        self.stats.chunks += 1;
+                        this.stats.chunks += 1;
 
                         for choice in &chunk.choices {
                             if let Some(text) = &choice.delta.content {
                                 if !text.is_empty() {
-                                    self.stats.first_output.get_or_insert_with(Instant::now);
-                                    self.stats.content_bytes += text.len() as u64;
-                                    self.stats.output_events += 1;
+                                    this.stats.first_output.get_or_insert_with(Instant::now);
+                                    this.stats.content_bytes += text.len() as u64;
+                                    this.stats.output_events += 1;
                                 }
                             }
 
                             if let Some(text) = &choice.delta.reasoning {
                                 if !text.is_empty() {
-                                    self.stats.first_output.get_or_insert_with(Instant::now);
-                                    self.stats.reasoning_bytes += text.len() as u64;
+                                    this.stats.first_output.get_or_insert_with(Instant::now);
+                                    this.stats.reasoning_bytes += text.len() as u64;
                                 }
                             }
                         }
 
                         return Poll::Ready(Some(Ok(StreamEvent::Chunk(chunk))));
                     }
-                    Err(error) => return Poll::Ready(Some(Err(error))),
+                    Err(error) => {
+                        this.stats.finished = Some(Instant::now());
+                        this.finished = true;
+                        return Poll::Ready(Some(Err(error)));
+                    }
                 }
             }
 
-            match self.body.as_mut().poll_next(cx) {
+            let poll = match this.body.as_mut() {
+                Some(body) => Pin::new(body).poll_next(cx),
+                None => {
+                    this.stats.finished = Some(Instant::now());
+                    this.finished = true;
+                    return Poll::Ready(None);
+                }
+            };
+
+            match poll {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Err(error) = self.parser.push(&bytes) {
+                    if let Err(error) = this.parser.push(&bytes) {
+                        this.stats.finished = Some(Instant::now());
+                        this.finished = true;
+                        this.body = None;
                         return Poll::Ready(Some(Err(error)));
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
+                    this.stats.finished = Some(Instant::now());
+                    this.finished = true;
+                    this.body = None;
                     return Poll::Ready(Some(Err(StreamingError::Http(error))));
                 }
                 Poll::Ready(None) => {
-                    self.stats.finished.get_or_insert_with(Instant::now);
-                    if self.saw_done {
-                        return Poll::Ready(None);
+                    this.stats.finished = Some(Instant::now());
+                    this.finished = true;
+                    this.body = None;
+                    if this.cancellation.is_cancelled() {
+                        return Poll::Ready(Some(Err(StreamingError::Cancelled)));
                     }
                     return Poll::Ready(Some(Err(StreamingError::UnexpectedEof)));
                 }
@@ -307,33 +693,59 @@ impl Stream for ChatStream {
     }
 }
 
-struct SseParser {
+pub struct SseParser {
     buffer: BytesMut,
     scan_pos: usize,
+    last_event_id: Option<String>,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SseParser {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             scan_pos: 0,
+            last_event_id: None,
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
-        if self.buffer.len().saturating_add(bytes.len()) > MAX_EVENT_BYTES {
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
+        let old_len = self.buffer.len();
+        self.buffer.extend_from_slice(bytes);
+
+        if self.trailing_incomplete_event_len() > MAX_EVENT_BYTES {
+            self.buffer.truncate(old_len);
             return Err(StreamingError::EventTooLarge);
         }
-        self.buffer.extend_from_slice(bytes);
+
         Ok(())
     }
 
-    fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
+    fn trailing_incomplete_event_len(&self) -> usize {
+        find_last_boundary_end(&self.buffer).map_or(self.buffer.len(), |end| {
+            self.buffer.len().saturating_sub(end)
+        })
+    }
+
+    pub fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
         loop {
             let (frame_len, separator_len) = find_boundary(&self.buffer, &mut self.scan_pos)?;
             let frame = self.buffer.split_to(frame_len);
             self.buffer.advance(separator_len);
             self.scan_pos = 0;
+
+            if let Some(event_id) = parse_event_id(&frame) {
+                self.last_event_id = Some(event_id);
+            }
 
             match parse_frame(&frame) {
                 None => continue,
@@ -348,8 +760,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut single_data: &[u8] = &[];
     let mut data_len = 0usize;
 
-    for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    for line in SseLineIter::new(frame) {
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -391,8 +802,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data = Vec::with_capacity(data_len + data_lines - 1);
     let mut first = true;
 
-    for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    for line in SseLineIter::new(frame) {
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -425,27 +835,128 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     }
 }
 
+fn parse_event_id(frame: &[u8]) -> Option<String> {
+    let mut event_id = None;
+
+    for line in SseLineIter::new(frame) {
+        let (field, value) = match line.iter().position(|b| *b == b':') {
+            Some(colon) => (&line[..colon], line.get(colon + 1..).unwrap_or_default()),
+            None => (line, &[][..]),
+        };
+
+        if field != b"id" {
+            continue;
+        }
+
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        if value.contains(&0) {
+            continue;
+        }
+
+        event_id = Some(String::from_utf8_lossy(value).into_owned());
+    }
+
+    event_id
+}
+
+struct SseLineIter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SseLineIter<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for SseLineIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+
+        let start = self.pos;
+        let mut i = start;
+
+        while i < self.bytes.len() && self.bytes[i] != b'\n' && self.bytes[i] != b'\r' {
+            i += 1;
+        }
+
+        let line = &self.bytes[start..i];
+        if i >= self.bytes.len() {
+            self.pos = i;
+            return Some(line);
+        }
+
+        self.pos = if self.bytes[i] == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+            i + 2
+        } else {
+            i + 1
+        };
+
+        Some(line)
+    }
+}
+
+fn find_last_boundary_end(buffer: &BytesMut) -> Option<usize> {
+    let bytes = buffer.as_ref();
+    let mut end = bytes.len();
+
+    while end > 0 {
+        if end >= 4 && bytes[end - 4..end] == *b"\r\n\r\n" {
+            return Some(end);
+        }
+        if end >= 3 && bytes[end - 3..end] == *b"\r\n\n" {
+            return Some(end);
+        }
+        if end >= 3 && bytes[end - 3..end] == *b"\n\r\n" {
+            return Some(end);
+        }
+        if end >= 2 && bytes[end - 2..end] == *b"\n\n" {
+            return Some(end);
+        }
+        if end >= 2 && bytes[end - 2..end] == *b"\r\r" {
+            return Some(end);
+        }
+        end -= 1;
+    }
+
+    None
+}
+
 fn find_boundary(buffer: &BytesMut, scan_pos: &mut usize) -> Option<(usize, usize)> {
     let bytes = buffer.as_ref();
     let mut i = (*scan_pos).min(bytes.len());
 
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+    while i < bytes.len() {
+        let first_eol = if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            2
+        } else if matches!(bytes[i], b'\r' | b'\n') {
+            1
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let second = i + first_eol;
+        if second < bytes.len() {
+            let second_eol = if bytes[second] == b'\r' && bytes.get(second + 1) == Some(&b'\n') {
+                2
+            } else if matches!(bytes[second], b'\r' | b'\n') {
+                1
+            } else {
+                i += first_eol;
+                continue;
+            };
+
             *scan_pos = i;
-            return Some((i, 2));
+            return Some((i, first_eol + second_eol));
         }
 
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\r'
-            && bytes[i + 1] == b'\n'
-            && bytes[i + 2] == b'\r'
-            && bytes[i + 3] == b'\n'
-        {
-            *scan_pos = i;
-            return Some((i, 4));
-        }
-
-        i += 1;
+        break;
     }
 
     *scan_pos = i.saturating_sub(1);
@@ -486,6 +997,65 @@ mod tests {
     }
 
     #[test]
+    fn tracks_and_clears_sse_event_id() {
+        let mut p = parser();
+        p.push(
+            br#"id: one
+data: {"id":"x","choices":[]}
+
+"#,
+        )
+        .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("one"));
+
+        p.push(b"data: {\"id\":\"x2\",\"choices\":[]}\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("one"));
+
+        p.push(b"id:\ndata: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.last_event_id(), Some(""));
+    }
+
+    #[test]
+    fn preserves_id_only_event_cursor() {
+        let mut p = parser();
+        p.push(b"id: cursor-only\n\n").unwrap();
+        assert!(p.next_event().is_none());
+        assert_eq!(p.last_event_id(), Some("cursor-only"));
+
+        p.push(b"data: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.last_event_id(), Some("cursor-only"));
+    }
+
+    #[test]
+    fn parses_lone_cr_and_mixed_line_endings() {
+        let mut p = parser();
+        p.push(b"id: 7\rdata: {\"id\":\"x\",\"choices\":[]}\r\r")
+            .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("7"));
+
+        p.push(b"data: [DONE]\r\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[test]
+    fn uses_last_id_field_and_ignores_null_id() {
+        let mut p = parser();
+        p.push(b"id: first\nid: second\ndata: {\"id\":\"x\",\"choices\":[]}\n\n")
+            .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("second"));
+
+        p.push(b"id: bad\0id\ndata: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.last_event_id(), Some("second"));
+    }
+
+    #[test]
     fn parses_crlf_and_done() {
         let mut p = parser();
         p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n")
@@ -522,6 +1092,21 @@ mod tests {
     }
 
     #[test]
+    fn allows_many_complete_events_beyond_event_limit() {
+        let mut p = parser();
+        let event = b"data: [DONE]\n\n";
+        let count = MAX_EVENT_BYTES / event.len() + 2;
+
+        for _ in 0..count {
+            p.push(event).unwrap();
+        }
+
+        for _ in 0..count {
+            assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        }
+    }
+
+    #[test]
     fn rejects_oversized_incomplete_event() {
         let mut p = parser();
         let data = vec![b'x'; MAX_EVENT_BYTES];
@@ -539,5 +1124,101 @@ mod tests {
             }
         }
         assert!(p.next_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_cancel_is_available_on_plain_stream() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        let body = futures_util::stream::empty::<Result<Bytes, reqwest::Error>>();
+        let mut stream = ChatStream {
+            body: Some(body),
+            parser: SseParser::new(),
+            stats: StreamStats::default(),
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: None,
+        };
+
+        stream.cancel();
+        let result = stream.next().await.unwrap();
+        assert!(matches!(result, Err(StreamingError::Cancelled)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_transport_immediately() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl Stream for DropProbe {
+            type Item = Result<Bytes, reqwest::Error>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(dropped.clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        let mut stream = ChatStream {
+            body: Some(probe),
+            parser: SseParser::new(),
+            stats: StreamStats::default(),
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: None,
+        };
+
+        stream.cancel();
+        assert!(matches!(stream.next().await, Some(Err(StreamingError::Cancelled))));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(stream.next().await.is_none());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic(input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8192)) {
+            let mut p = parser();
+            for chunk in input.chunks(37) {
+                let _ = p.push(chunk);
+                let _ = p.next_event();
+            }
+            let _ = p.next_event();
+        }
+
+        #[test]
+        fn valid_event_survives_all_split_points(split in 0usize..=70) {
+            const EVENT: &[u8] = br#"data: {"id":"x","choices":[{"index":0,"delta":{"content":"hello"}}]}
+
+"#;
+            let split = split.min(EVENT.len());
+            let mut p = parser();
+            p.push(&EVENT[..split]).unwrap();
+            if split < EVENT.len() {
+                assert!(p.next_event().is_none());
+            }
+            p.push(&EVENT[split..]).unwrap();
+            assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        }
     }
 }
