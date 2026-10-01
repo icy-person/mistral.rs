@@ -302,7 +302,7 @@ mod tests {
         assert!(matches!(args.output, OutputFormat::Jsonl));
         assert!(args.reconnect);
         assert_eq!(args.max_retries, 5);
-        assert_eq!(args.prompt, ["Explain", "mixture-of-experts"]);
+        assert_eq!(args.prompt, vec!["Explain".to_string(), "mixture-of-experts".to_string()]);
     }
 
     #[test]
