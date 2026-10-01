@@ -349,7 +349,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data_len = 0usize;
 
     for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(&[b'\r']).unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -369,7 +369,6 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
 
         if data_lines == 1 {
             single_data = value;
-        } else {
         }
     }
 
@@ -393,7 +392,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut first = true;
 
     for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(&[b'\r']).unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() || line[0] == b':' {
             continue;
         }
