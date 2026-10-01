@@ -1162,10 +1162,10 @@ data: {"id":"x","choices":[]}
     #[tokio::test]
     async fn chat_stream_preserves_empty_event_id_as_cursor_reset() {
         let body = futures_util::stream::iter(vec![
-            Ok(Bytes::from(
+            Ok(Bytes::from_static(
                 b"id: one\ndata: {\"id\":\"x\",\"choices\":[]}\n\n",
             )),
-            Ok(Bytes::from(b"id:\ndata: [DONE]\n\n")),
+            Ok(Bytes::from_static(b"id:\ndata: [DONE]\n\n")),
         ]);
 
         let cancellation = tokio_util::sync::CancellationToken::new();
