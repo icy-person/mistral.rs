@@ -322,8 +322,14 @@ impl MXFP4Layer {
         Ok(Self::from_parts(blocks, scales, bias))
     }
 
-    /// Check if the device supports MXFP4 operations
+    /// Check if the device supports MXFP4 operations.
+    ///
+    /// CPU support uses the blockwise dequantize + matmul fallback implemented
+    /// in forward_dequantize / gather_forward_dequantize.
     fn device_supported(_device: &Device) -> bool {
+        if _device.is_cpu() {
+            return true;
+        }
         #[cfg(feature = "cuda")]
         if matches!(_device, Device::Cuda(_)) {
             return ffi::HAVE_MXFP4_GEMM_KERNELS;
@@ -931,6 +937,11 @@ impl QuantizedSerde for MXFP4Layer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_device_support_is_enabled() {
+        assert!(MXFP4Layer::device_supported(&Device::Cpu));
+    }
+
     use super::*;
 
     const TEST_HIDDEN_SIZE: usize = 64;
