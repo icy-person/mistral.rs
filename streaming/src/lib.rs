@@ -393,9 +393,7 @@ impl StreamingClient {
             },
             saw_done: false,
             cancellation: None,
-            last_event_id: last_event_id
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned),
+            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
         })
     }
 
@@ -755,10 +753,13 @@ mod tests {
     #[test]
     fn tracks_and_clears_sse_event_id() {
         let mut p = parser();
-        p.push(br#"id: one
+        p.push(
+            br#"id: one
 data: {"id":"x","choices":[]}
 
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         assert_eq!(p.take_last_event_id().as_deref(), Some("one"));
 
