@@ -538,16 +538,19 @@ where
                 }
             }
 
-            if let Some(result) = self.parser.next_event() {
+            let parsed = self.parser.next_event();
+            if let Some(id) = self.parser.last_event_id() {
+                self.last_event_id = Some(id.to_owned());
+            }
+
+            if let Some(result) = parsed {
                 match result {
                     Ok(StreamEvent::Done) => {
-                        self.last_event_id = self.parser.last_event_id().map(str::to_owned);
                         self.saw_done = true;
                         self.stats.finished = Some(Instant::now());
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
-                        self.last_event_id = self.parser.last_event_id().map(str::to_owned);
                         self.stats.chunks += 1;
 
                         for choice in &chunk.choices {
@@ -844,6 +847,18 @@ data: {"id":"x","choices":[]}
         p.push(b"id:\ndata: [DONE]\n\n").unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
         assert_eq!(p.last_event_id(), Some(""));
+    }
+
+    #[test]
+    fn preserves_id_only_event_cursor() {
+        let mut p = parser();
+        p.push(b"id: cursor-only\n\n").unwrap();
+        assert!(p.next_event().is_none());
+        assert_eq!(p.last_event_id(), Some("cursor-only"));
+
+        p.push(b"data: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.last_event_id(), Some("cursor-only"));
     }
 
     #[test]
