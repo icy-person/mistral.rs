@@ -28,7 +28,7 @@ pub(crate) async fn run_stream(
     reconnect_max_backoff_ms: u64,
     resume_id: Option<String>,
     no_stats: bool,
-    _global: GlobalOptions,
+    global: GlobalOptions,
 ) -> Result<()> {
     if reconnect > 0 && resume_id.is_some() {
         anyhow::bail!(
@@ -62,7 +62,7 @@ pub(crate) async fn run_stream(
         tool_choice: None,
         parallel_tool_calls: None,
         response_format: None,
-        seed: None,
+        seed: global.seed,
         stream_options: Some(mistralrs_streaming::StreamOptions {
             include_usage: Some(true),
             include_obfuscation: None,
