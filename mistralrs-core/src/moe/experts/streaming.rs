@@ -654,31 +654,38 @@ struct PendingExpert {
 
 impl PendingExpert {
     fn wait(self, device: &Device) -> Result<Arc<dyn QuantMethod>> {
-        if let PendingSource::Ready(weight) = self.source {
-            return Ok(weight);
-        }
+        let PendingExpert {
+            key,
+            source,
+            format,
+            rows,
+            cols,
+            row_start,
+            bias,
+            cache,
+        } = self;
 
-        let bytes = match self.source {
+        let bytes = match source {
+            PendingSource::Ready(weight) => return Ok(weight),
             PendingSource::Io(receiver) => receiver
                 .recv()
                 .map_err(|_| candle_core::Error::Msg("MoE expert I/O worker stopped".to_string()))?
                 .map_err(|err| {
                     candle_core::Error::Msg(format!(
                         "MoE expert read failed for {} expert {}: {err}",
-                        self.key.source, self.key.expert
+                        key.source, key.expert
                     ))
                 })?,
-            PendingSource::Ready(_) => unreachable!(),
         };
 
-        let bias = self
+        let bias = bias
             .bias
             .as_ref()
             .map(|bias| {
-                let bias = bias.narrow(0, self.key.expert, 1)?;
+                let bias = bias.narrow(0, key.expert, 1)?;
                 let bias = bias.squeeze(0)?;
-                if bias.rank() == 1 && self.row_start.saturating_add(self.rows) <= bias.dim(0)? {
-                    bias.narrow(0, self.row_start, self.rows)
+                if bias.rank() == 1 && row_start.saturating_add(rows) <= bias.dim(0)? {
+                    bias.narrow(0, row_start, rows)
                 } else {
                     Ok(bias)
                 }
@@ -689,21 +696,20 @@ impl PendingExpert {
             ProjectionFormat::Gguf(dtype) => Arc::new(GgufMatMul::from_gguf_bytes(
                 dtype,
                 &bytes,
-                vec![self.rows, self.cols],
+                vec![rows, cols],
                 bias,
                 device,
             )?),
             ProjectionFormat::Mxfp4 => Arc::new(MXFP4Layer::from_gguf_bytes(
                 &bytes,
-                self.rows,
-                self.cols,
+                rows,
+                cols,
                 bias,
                 device,
             )?),
         };
 
-        self.cache
-            .insert(self.key, weight.clone(), bytes.len());
+        cache.insert(key, weight.clone(), bytes.len());
         Ok(weight)
     }
 }
