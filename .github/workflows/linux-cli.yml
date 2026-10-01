@@ -54,6 +54,7 @@ jobs:
         run: |
           file target/release/mistralrs
           ./target/release/mistralrs --help >/dev/null
+          ./target/release/mistralrs stream --help >/dev/null
           test -x target/release/mistralrs
 
       - name: Package CLI
