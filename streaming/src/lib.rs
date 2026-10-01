@@ -39,6 +39,32 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,7 +94,22 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(alias = "reasoning_content", alias = "reasoning")]
     pub reasoning: Option<String>,
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub refusal: Option<String>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub function: Option<FunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionCallDelta {
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,10 +149,21 @@ impl StreamStats {
         let seconds = self.elapsed()?.as_secs_f64();
         (seconds > 0.0).then_some(self.content_bytes as f64 / seconds)
     }
+
+    pub fn total_output_bytes(&self) -> u64 {
+        self.content_bytes + self.reasoning_bytes
+    }
+
+    pub fn total_output_bytes_per_second(&self) -> Option<f64> {
+        let seconds = self.elapsed()?.as_secs_f64();
+        (seconds > 0.0).then_some(self.total_output_bytes() as f64 / seconds)
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum StreamingError {
+    #[error("stream cancelled")]
+    Cancelled,
     #[error("invalid base URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
     #[error("HTTP request failed: {0}")]
@@ -202,19 +254,51 @@ impl StreamingClient {
         StreamingClientBuilder::new()
     }
 
-    pub async fn stream(&self, mut request: ChatRequest) -> Result<ChatStream, StreamingError> {
+    pub async fn stream(
+        &self,
+        mut request: ChatRequest,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+        self.stream_with_options(&mut request, None, None).await
+    }
+
+    pub async fn stream_with_cancellation(
+        &self,
+        mut request: ChatRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+        self.stream_with_options(&mut request, Some(cancellation), None).await
+    }
+
+    pub async fn stream_with_resume(
+        &self,
+        mut request: ChatRequest,
+        last_event_id: impl AsRef<str>,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+        self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
+            .await
+    }
+
+    async fn stream_with_options(
+        &self,
+        request: &mut ChatRequest,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+        last_event_id: Option<String>,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
         request.stream = true;
         let started = Instant::now();
 
-        let response = self
+        let mut builder = self
             .client
             .post(self.chat_url.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .json(&request)
-            .send()
-            .await?;
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+
+        if let Some(id) = last_event_id.as_deref() {
+            builder = builder.header("Last-Event-ID", id);
+        }
+
+        let response = builder.json(request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -223,43 +307,77 @@ impl StreamingClient {
         }
 
         Ok(ChatStream {
-            body: Box::pin(response.bytes_stream()),
+            body: response.bytes_stream(),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
                 ..Default::default()
             },
             saw_done: false,
+            cancellation,
+            last_event_id,
         })
     }
 }
 
-pub struct ChatStream {
-    body: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+pub struct ChatStream<S> {
+    body: S,
     parser: SseParser,
     stats: StreamStats,
     saw_done: bool,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    last_event_id: Option<String>,
 }
 
-impl ChatStream {
+impl<S> ChatStream<S> {
     pub fn stats(&self) -> &StreamStats {
         &self.stats
     }
+
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
+    }
+
+    pub fn cancel(&self) {
+        if let Some(token) = &self.cancellation {
+            token.cancel();
+        }
+    }
 }
 
-impl Stream for ChatStream {
+impl<S> Stream for ChatStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
     type Item = Result<StreamEvent, StreamingError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                self.stats.finished.get_or_insert_with(Instant::now);
+                return Poll::Ready(Some(Err(StreamingError::Cancelled)));
+            }
+
             if let Some(result) = self.parser.next_event() {
                 match result {
                     Ok(StreamEvent::Done) => {
+                        self.last_event_id = self
+                            .parser
+                            .take_last_event_id()
+                            .or_else(|| self.last_event_id.clone());
                         self.saw_done = true;
                         self.stats.finished = Some(Instant::now());
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
+                        self.last_event_id = self
+                            .parser
+                            .take_last_event_id()
+                            .or_else(|| self.last_event_id.clone());
                         self.stats.chunks += 1;
 
                         for choice in &chunk.choices {
@@ -310,6 +428,7 @@ impl Stream for ChatStream {
 struct SseParser {
     buffer: BytesMut,
     scan_pos: usize,
+    last_event_id: Option<String>,
 }
 
 impl SseParser {
@@ -317,7 +436,12 @@ impl SseParser {
         Self {
             buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             scan_pos: 0,
+            last_event_id: None,
         }
+    }
+
+    fn take_last_event_id(&mut self) -> Option<String> {
+        self.last_event_id.take()
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
@@ -334,6 +458,10 @@ impl SseParser {
             let frame = self.buffer.split_to(frame_len);
             self.buffer.advance(separator_len);
             self.scan_pos = 0;
+
+            if let Some(event_id) = parse_event_id(&frame) {
+                self.last_event_id = Some(event_id);
+            }
 
             match parse_frame(&frame) {
                 None => continue,
@@ -423,6 +551,17 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
         Ok(chunk) => Some(Ok(StreamEvent::Chunk(chunk))),
         Err(error) => Some(Err(StreamingError::Json(error))),
     }
+}
+
+fn parse_event_id(frame: &[u8]) -> Option<String> {
+    for raw_line in frame.split(|b| *b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if let Some(value) = line.strip_prefix(b"id:") {
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    None
 }
 
 fn find_boundary(buffer: &BytesMut, scan_pos: &mut usize) -> Option<(usize, usize)> {
