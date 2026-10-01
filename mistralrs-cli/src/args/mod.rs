@@ -688,7 +688,7 @@ pub struct RuntimeOptions {
     pub moe_io_threads: usize,
 
     /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
-    #[arg(long, env = "MISTRALRS_MOE_OVERLAP", default_value_t = true)]
+    #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
     #[serde(default = "default_moe_overlap")]
     pub moe_overlap: bool,
 
@@ -1074,7 +1074,7 @@ impl Default for RuntimeOptions {
             moe_cache_floor_mb: 1536,
             moe_cache_ceil_mb: Some(4096),
             moe_io_threads: 4,
-            moe_overlap: true,
+            moe_overlap: false,
             moe_o_direct: false,
             moe_stats: false,
             mcp_config: None,
@@ -1117,7 +1117,7 @@ fn default_moe_io_threads() -> usize {
 }
 
 fn default_moe_overlap() -> bool {
-    true
+    false
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
