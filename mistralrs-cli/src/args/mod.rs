@@ -650,6 +650,46 @@ pub struct RuntimeOptions {
     #[serde(default)]
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 
+    /// Stream routed MoE expert weights from GGUF instead of materializing the full expert stack.
+    #[arg(long)]
+    #[serde(default)]
+    pub moe_stream: bool,
+
+    /// Expert-cache budget in MiB, or auto to derive it from MemAvailable.
+    #[arg(long = "cache-mb", default_value = "auto")]
+    #[serde(default = "default_moe_cache_mb")]
+    pub moe_cache_mb: String,
+
+    /// Memory to leave available when auto-sizing the expert cache.
+    #[arg(long = "cache-floor-mb", default_value_t = 1536)]
+    #[serde(default = "default_moe_cache_floor_mb")]
+    pub moe_cache_floor_mb: usize,
+
+    /// Hard ceiling for an auto-sized expert cache. Omit to disable the ceiling.
+    #[arg(long = "cache-ceil-mb")]
+    #[serde(default)]
+    pub moe_cache_ceil_mb: Option<usize>,
+
+    /// Number of parallel expert-read lanes.
+    #[arg(long = "io-threads", default_value_t = 4)]
+    #[serde(default = "default_moe_io_threads")]
+    pub moe_io_threads: usize,
+
+    /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
+    #[arg(long)]
+    #[serde(default = "default_moe_overlap")]
+    pub moe_overlap: bool,
+
+    /// Try Linux O_DIRECT for expert reads; falls back to buffered I/O when unsupported.
+    #[arg(long = "o-direct")]
+    #[serde(default)]
+    pub moe_o_direct: bool,
+
+    /// Emit periodic MoE cache/I/O telemetry to the log.
+    #[arg(long = "moe-stats")]
+    #[serde(default)]
+    pub moe_stats: bool,
+
     /// Path to an MCP client configuration JSON. Also reads `MCP_CONFIG_PATH` if unset.
     #[arg(long)]
     #[serde(default)]
@@ -911,6 +951,23 @@ pub struct MatformerSelection {
 }
 
 impl RuntimeOptions {
+    pub fn apply_moe_stream_env(&self) {
+        std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
+        std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
+        match self.moe_cache_ceil_mb {
+            Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
+            None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
+        }
+        std::env::set_var(
+            "MISTRALRS_MOE_IO_THREADS",
+            self.moe_io_threads.clamp(1, 32).to_string(),
+        );
+        std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
+    }
+
     pub fn matformer_selection(&self) -> MatformerSelection {
         MatformerSelection {
             config_path: self.matformer_config_path.clone(),
@@ -1000,6 +1057,14 @@ impl Default for RuntimeOptions {
             mtp_model: None,
             mtp_n_predict: None,
             mtp_draft_sampling: MtpDraftSamplingArg::default(),
+            moe_stream: false,
+            moe_cache_mb: "auto".to_string(),
+            moe_cache_floor_mb: 1536,
+            moe_cache_ceil_mb: Some(4096),
+            moe_io_threads: 4,
+            moe_overlap: true,
+            moe_o_direct: false,
+            moe_stats: false,
             mcp_config: None,
             agent: false,
             enable_search: false,
@@ -1025,6 +1090,22 @@ impl Default for RuntimeOptions {
             code_exec_permission: CodeExecPermissionArg::Auto,
         }
     }
+}
+
+fn default_moe_cache_mb() -> String {
+    "auto".to_string()
+}
+
+fn default_moe_cache_floor_mb() -> usize {
+    1536
+}
+
+fn default_moe_io_threads() -> usize {
+    4
+}
+
+fn default_moe_overlap() -> bool {
+    true
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
