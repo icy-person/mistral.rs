@@ -353,7 +353,7 @@ impl StreamingClient {
                 }
             };
 
-            let mut current = match result {
+            let mut current = Box::pin(match result {
                 Ok(stream) => stream,
                 Err(error) => {
                     let retryable = is_retryable_stream_error(&error);
@@ -387,7 +387,7 @@ impl StreamingClient {
                     );
                     continue;
                 }
-            };
+            });
 
             loop {
                 match current.next().await {
@@ -497,7 +497,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()),
+            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
         })
     }
 
