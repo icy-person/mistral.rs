@@ -356,7 +356,8 @@ impl MXFP4Layer {
         }
 
         let blocks_per_row = cols / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row * (1 + MXFP4_BLOCK_SIZE / 2);
+        let packed_bytes_per_block = MXFP4_BLOCK_SIZE / 2;
+        let row_bytes = blocks_per_row * (1 + packed_bytes_per_block);
         let expected = rows
             .checked_mul(row_bytes)
             .ok_or_else(|| candle_core::Error::Msg("MXFP4 byte-size overflow".to_string()))?;
@@ -368,17 +369,29 @@ impl MXFP4Layer {
             );
         }
 
-        let mut blocks = Vec::with_capacity(rows * (cols / 2));
+        let mut blocks = Vec::with_capacity(rows * packed_bytes_per_block * blocks_per_row);
         let mut scales = Vec::with_capacity(rows * blocks_per_row);
 
         for row in 0..rows {
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             for block in 0..blocks_per_row {
-                let start = block * (1 + MXFP4_BLOCK_SIZE / 2);
-                scales.push(row_data[start]);
-                blocks.extend_from_slice(
-                    &row_data[start + 1..start + 1 + MXFP4_BLOCK_SIZE / 2],
-                );
+                let start = block * (1 + packed_bytes_per_block);
+                let scale = row_data[start];
+                let packed = &row_data[start + 1..start + 1 + packed_bytes_per_block];
+
+                scales.push(scale);
+                // GGUF MXFP4 packs 32 FP4 values as 16 bytes. Candle's MXFP4Layer expects
+                // those 16 bytes in the same pairwise logical order used by materialize_mxfp4_component.
+                for pair in 0..(MXFP4_BLOCK_SIZE / 2) {
+                    let source = if pair < packed_bytes_per_block / 2 {
+                        let i = pair * 2;
+                        (packed[i] & 0x0f) | ((packed[i + 1] & 0x0f) << 4)
+                    } else {
+                        let i = (pair - packed_bytes_per_block / 2) * 2;
+                        (packed[i] >> 4) | ((packed[i + 1] >> 4) << 4)
+                    };
+                    blocks.push(source);
+                }
             }
         }
 
