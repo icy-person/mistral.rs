@@ -408,7 +408,7 @@ where
                 }
             }
 
-            match self.body.as_mut().poll_next(cx) {
+            match Pin::new(&mut self.body).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Err(error) = self.parser.push(&bytes) {
                         return Poll::Ready(Some(Err(error)));
