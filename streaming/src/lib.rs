@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
-use futures_core::Stream;
+use futures_core::{Future, Stream};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
