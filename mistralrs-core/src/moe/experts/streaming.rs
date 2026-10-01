@@ -647,6 +647,7 @@ struct PendingExpert {
     format: ProjectionFormat,
     rows: usize,
     cols: usize,
+    row_start: usize,
     bias: Option<Arc<Tensor>>,
     cache: Arc<MoeStreamCache>,
 }
@@ -673,9 +674,15 @@ impl PendingExpert {
         let bias = self
             .bias
             .as_ref()
-            .map(|bias| bias.narrow(0, self.key.expert, 1))
-            .transpose()?
-            .map(|bias| bias.squeeze(0))
+            .map(|bias| {
+                let bias = bias.narrow(0, self.key.expert, 1)?;
+                let bias = bias.squeeze(0)?;
+                if bias.rank() == 1 && self.row_start.saturating_add(self.rows) <= bias.dim(0)? {
+                    bias.narrow(0, self.row_start, self.rows)
+                } else {
+                    Ok(bias)
+                }
+            })
             .transpose()?;
 
         let weight: Arc<dyn QuantMethod> = match self.format {
@@ -849,6 +856,7 @@ impl StreamedProjection {
                 format: self.format,
                 rows: self.rows,
                 cols: self.cols,
+                row_start: self.row_start,
                 bias: self.bias.clone(),
                 cache: self.cache.clone(),
             });
