@@ -275,7 +275,7 @@ impl StreamingClient {
     pub async fn stream(
         &self,
         mut request: ChatRequest,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError>
     {
         self.stream_with_options(&mut request, None, None).await
     }
@@ -284,7 +284,7 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError>
     {
         self.stream_with_options(&mut request, Some(cancellation), None)
             .await
@@ -294,7 +294,7 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         last_event_id: impl AsRef<str>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError>
     {
         self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
             .await
@@ -305,7 +305,7 @@ impl StreamingClient {
         mut request: ChatRequest,
         last_event_id: impl AsRef<str>,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError>
     {
         self.stream_with_options(
             &mut request,
@@ -473,7 +473,7 @@ impl StreamingClient {
         request: ChatRequest,
         last_event_id: Option<&str>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<ChatStream<DynBody>, StreamingError> {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         let mut request = request;
         request.stream = true;
         let started = Instant::now();
@@ -524,7 +524,7 @@ impl StreamingClient {
         request: &mut ChatRequest,
         cancellation: Option<tokio_util::sync::CancellationToken>,
         last_event_id: Option<String>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError>
     {
         request.stream = true;
         let started = Instant::now();
@@ -558,7 +558,7 @@ impl StreamingClient {
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
-            body: Some(response.bytes_stream()),
+            body: Some(Box::pin(response.bytes_stream())),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
@@ -572,7 +572,7 @@ impl StreamingClient {
     }
 }
 
-type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+pub type ChatByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
