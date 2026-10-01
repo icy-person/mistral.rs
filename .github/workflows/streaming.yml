@@ -25,4 +25,5 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --release --all-targets
       - run: cargo bench --no-run
+      - run: cargo bench --bench sse_parser -- --noplot
       - run: cargo clippy --all-targets -- -D warnings
