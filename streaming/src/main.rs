@@ -28,7 +28,11 @@ struct Args {
     prompt: Vec<String>,
 
     /// OpenAI-compatible API base URL.
-    #[arg(long, env = "MISTRALRS_BASE_URL", default_value = "http://127.0.0.1:1234/v1")]
+    #[arg(
+        long,
+        env = "MISTRALRS_BASE_URL",
+        default_value = "http://127.0.0.1:1234/v1"
+    )]
     base_url: String,
 
     /// Model identifier accepted by the server.
