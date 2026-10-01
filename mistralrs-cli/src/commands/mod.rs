@@ -10,6 +10,7 @@ pub(crate) mod quant;
 mod quantize;
 mod run;
 pub(crate) mod serve;
+mod stream;
 mod tune;
 mod uqff;
 
@@ -22,6 +23,7 @@ pub use manage::{run_uninstall, run_update};
 pub use quantize::run_quantize;
 pub use run::run_interactive;
 pub use serve::run_server;
+pub use stream::run_stream;
 pub use tune::run_tune;
 pub use uqff::run_uqff;
 
