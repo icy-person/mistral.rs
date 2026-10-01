@@ -341,7 +341,8 @@ mod tests {
     #[test]
     fn rejects_invalid_generation_ranges() {
         assert!(
-            Args::try_parse_from(["mistralrs-streaming", "--temperature", "3.0", "hello",]).is_err()
+            Args::try_parse_from(["mistralrs-streaming", "--temperature", "3.0", "hello",])
+                .is_err()
         );
 
         assert!(
