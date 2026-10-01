@@ -108,13 +108,10 @@ fn install_ctrl_c_cancellation(cancellation: CancellationToken) {
     });
 }
 
-async fn consume_chat_stream<S>(
-    stream: &mut mistralrs_streaming::ChatStream<S>,
+async fn consume_chat_stream(
+    stream: &mut mistralrs_streaming::ChatStream<mistralrs_streaming::ChatByteStream>,
     no_stats: bool,
-) -> Result<()>
-where
-    S: futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
-{
+) -> Result<()> {
     while let Some(event) = stream.next().await {
         match event? {
             StreamEvent::Chunk(chunk) => print_chunk(&chunk),
