@@ -49,7 +49,7 @@ impl Default for MoeStreamConfig {
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
             io_threads: 4,
-            overlap: true,
+            overlap: false,
             o_direct: false,
             stats: false,
         }
@@ -212,7 +212,7 @@ pub(super) struct MoeStreamCache {
     last_logged_lookups: AtomicU64,
 }
 
-static CACHE_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<MoeStreamCache>>>> = OnceLock::new();
+static CACHE_REGISTRY: OnceLock<Mutex<HashMap<(usize, MoeStreamConfig), Weak<MoeStreamCache>>>> = OnceLock::new();
 
 impl MoeStreamCache {
     pub(super) fn for_archive(archive: Arc<GgufArchive>, config: MoeStreamConfig) -> Arc<Self> {
@@ -222,7 +222,7 @@ impl MoeStreamCache {
         if let Some(existing) = registry
             .lock()
             .expect("MoE stream cache registry poisoned")
-            .get(&key)
+            .get(&(key, config))
             .and_then(Weak::upgrade)
         {
             return existing;
@@ -263,7 +263,7 @@ impl MoeStreamCache {
         registry
             .lock()
             .expect("MoE stream cache registry poisoned")
-            .insert(key, Arc::downgrade(&cache));
+            .insert((key, config), Arc::downgrade(&cache));
 
         tracing::info!(
             cache_mb = cache.budget_bytes / MIB,
