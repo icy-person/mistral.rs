@@ -18,7 +18,6 @@ const READ_BUFFER_CAPACITY: usize = 16 * 1024;
 pub struct StreamingClient {
     client: Client,
     chat_url: Url,
-
 }
 
 #[derive(Clone)]
@@ -258,7 +257,9 @@ impl StreamingClient {
     pub async fn stream(
         &self,
         mut request: ChatRequest,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+    )
+        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
         self.stream_with_options(&mut request, None, None).await
     }
 
@@ -266,15 +267,20 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
-        self.stream_with_options(&mut request, Some(cancellation), None).await
+    )
+        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        self.stream_with_options(&mut request, Some(cancellation), None)
+            .await
     }
 
     pub async fn stream_with_resume(
         &self,
         mut request: ChatRequest,
         last_event_id: impl AsRef<str>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+    )
+        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
         self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
             .await
     }
@@ -284,7 +290,9 @@ impl StreamingClient {
         request: &mut ChatRequest,
         cancellation: Option<tokio_util::sync::CancellationToken>,
         last_event_id: Option<String>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+    )
+        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
         request.stream = true;
         let started = Instant::now();
 
@@ -679,7 +687,8 @@ mod tests {
             }
         }
         assert!(p.next_event().is_none());
-    }    
+    }
+
     proptest::proptest! {
         #[test]
         fn arbitrary_bytes_never_panic(input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..8192)) {
