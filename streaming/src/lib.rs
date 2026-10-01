@@ -755,7 +755,10 @@ mod tests {
     #[test]
     fn tracks_and_clears_sse_event_id() {
         let mut p = parser();
-        p.push(b"id: one\ndata: {"id":"x","choices":[]}\n\n")
+        p.push(br#"id: one
+data: {"id":"x","choices":[]}
+
+"#
             .unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         assert_eq!(p.take_last_event_id().as_deref(), Some("one"));
