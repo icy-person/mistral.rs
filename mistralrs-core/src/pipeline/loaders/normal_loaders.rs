@@ -5656,6 +5656,7 @@ impl DeviceMappedModelLoader for GptOssLoader {
                 + q_proj
                 + k_proj
                 + v_proj
+                + o_proj
                 + expert_weight_elems
                 + gate_up_bias
                 + down_bias
