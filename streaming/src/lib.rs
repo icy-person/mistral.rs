@@ -436,6 +436,12 @@ pub struct SseParser {
     last_event_id: Option<String>,
 }
 
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseParser {
     pub fn new() -> Self {
         Self {
