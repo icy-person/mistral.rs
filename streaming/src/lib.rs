@@ -1181,10 +1181,7 @@ data: {"id":"x","choices":[]}
         impl Stream for DropProbe {
             type Item = Result<Bytes, reqwest::Error>;
 
-            fn poll_next(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<Option<Self::Item>> {
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
                 Poll::Pending
             }
         }
@@ -1205,7 +1202,10 @@ data: {"id":"x","choices":[]}
         };
 
         stream.cancel();
-        assert!(matches!(stream.next().await, Some(Err(StreamingError::Cancelled))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(StreamingError::Cancelled))
+        ));
         assert!(dropped.load(Ordering::SeqCst));
         assert!(stream.next().await.is_none());
     }
