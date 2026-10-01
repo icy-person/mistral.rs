@@ -27,6 +27,7 @@ pub struct LoaderBuilder {
     hf_config_overrides: Option<HfConfigOverrides>,
     mtp: bool,
     encoder_cache_memory_bytes: Option<usize>,
+    moe_streaming: bool,
 }
 
 impl LoaderBuilder {
@@ -40,12 +41,19 @@ impl LoaderBuilder {
             hf_config_overrides: None,
             mtp: false,
             encoder_cache_memory_bytes: None,
+            moe_streaming: false,
         }
     }
 
     /// Load the MTP head built into the checkpoint so it can drive speculative decoding.
     pub fn with_mtp(mut self, mtp: bool) -> Self {
         self.mtp = mtp;
+        self
+    }
+
+    /// Enable BigMoe-style routed-expert streaming for supported GGUF MoE models.
+    pub fn with_moe_streaming(mut self, enabled: bool) -> Self {
+        self.moe_streaming = enabled;
         self
     }
 
@@ -723,7 +731,8 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 args.no_kv_cache,
                 args.jinja_explicit,
             )
-            .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes);
+            .with_encoder_cache_memory_bytes(args.encoder_cache_memory_bytes)
+            .with_moe_streaming(args.moe_streaming);
             if let Some(mmproj_filename) = mmproj_filename {
                 builder = builder.with_mmproj_files(
                     mmproj_filename
