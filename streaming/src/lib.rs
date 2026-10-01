@@ -1130,7 +1130,7 @@ data: {"id":"x","choices":[]}
     #[test]
     fn rejects_oversized_complete_event() {
         let mut p = parser();
-        let mut data = vec![b'x'; MAX_EVENT_BYTES];
+        let mut data = vec![b'x'; MAX_EVENT_BYTES + 1];
         data.extend_from_slice(b"\n\n");
         p.push(&data).unwrap();
         assert!(matches!(
