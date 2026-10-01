@@ -266,7 +266,8 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
         self.stream_with_options(&mut request, Some(cancellation), None)
             .await
     }
