@@ -204,17 +204,19 @@ async fn reconnects_with_last_event_id_without_restarting_output() {
         .build()
         .unwrap();
 
-    let mut stream = client
-        .stream_with_reconnect(
-            request(),
-            ReconnectPolicy {
-                max_retries: 2,
-                initial_backoff: Duration::from_millis(1),
-                max_backoff: Duration::from_millis(2),
-            },
-        )
-        .await
-        .unwrap();
+    let mut stream = Box::pin(
+        client
+            .stream_with_reconnect(
+                request(),
+                ReconnectPolicy {
+                    max_retries: 2,
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(2),
+                },
+            )
+            .await
+            .unwrap(),
+    );
 
     let mut output = String::new();
     while let Some(event) = timeout(Duration::from_secs(2), stream.next())
@@ -273,17 +275,19 @@ async fn retries_retryable_http_status_after_a_resumable_event() {
         .build()
         .unwrap();
 
-    let mut stream = client
-        .stream_with_reconnect(
-            request(),
-            ReconnectPolicy {
-                max_retries: 3,
-                initial_backoff: Duration::from_millis(1),
-                max_backoff: Duration::from_millis(2),
-            },
-        )
-        .await
-        .unwrap();
+    let mut stream = Box::pin(
+        client
+            .stream_with_reconnect(
+                request(),
+                ReconnectPolicy {
+                    max_retries: 3,
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(2),
+                },
+            )
+            .await
+            .unwrap(),
+    );
 
     let mut output = String::new();
     while let Some(event) = timeout(Duration::from_secs(2), stream.next())
