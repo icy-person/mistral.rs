@@ -304,10 +304,7 @@ impl StreamingClient {
         &self,
         request: ChatRequest,
         policy: ReconnectPolicy,
-    ) -> Result<
-        impl Stream<Item = Result<StreamEvent, StreamingError>>,
-        StreamingError,
-    > {
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
         let client = self.clone();
         let stream = async_stream::try_stream! {
             let mut last_event_id: Option<String> = None;
