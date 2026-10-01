@@ -310,6 +310,94 @@ async fn retries_retryable_http_status_after_a_resumable_event() {
     assert_eq!(output, "AB");
 }
 
+
+#[tokio::test]
+async fn cancellation_interrupts_initial_http_response_wait() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_headers(&mut socket).await.unwrap();
+        sleep(Duration::from_secs(10)).await;
+    });
+
+    let client = StreamingClient::builder()
+        .base_url(format!("http://{address}/v1"))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let future = client.stream_with_cancellation(request(), cancellation.clone());
+    tokio::pin!(future);
+
+    sleep(Duration::from_millis(20)).await;
+    cancellation.cancel();
+
+    let result = timeout(Duration::from_secs(2), future).await.unwrap();
+    assert!(matches!(result, Err(StreamingError::Cancelled)));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconnect_cancellation_interrupts_backoff() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_headers(&mut socket).await.unwrap();
+        write_sse_headers(&mut socket).await.unwrap();
+        socket.write_all(chunk(1, "A").as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let client = StreamingClient::builder()
+        .base_url(format!("http://{address}/v1"))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let mut stream = Box::pin(
+        client
+            .stream_with_reconnect_and_cancellation(
+                request(),
+                ReconnectPolicy {
+                    max_retries: 5,
+                    initial_backoff: Duration::from_secs(5),
+                    max_backoff: Duration::from_secs(5),
+                },
+                cancellation.clone(),
+            )
+            .await
+            .unwrap(),
+    );
+
+    match timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+    {
+        Some(Ok(StreamEvent::Chunk(chunk))) => {
+            assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("A"));
+        }
+        other => panic!("unexpected first event: {other:?}"),
+    }
+
+    let pending = timeout(Duration::from_secs(2), stream.next());
+    tokio::pin!(pending);
+    sleep(Duration::from_millis(20)).await;
+    cancellation.cancel();
+
+    let result = pending.await.unwrap();
+    assert!(matches!(result, Some(Err(StreamingError::Cancelled))));
+    assert!(stream.next().await.is_none());
+
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn cancellation_wakes_a_pending_stream_and_is_terminal() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
