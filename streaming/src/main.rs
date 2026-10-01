@@ -48,11 +48,11 @@ struct Args {
     max_tokens: u32,
 
     /// Sampling temperature.
-    #[arg(long, value_parser = clap::value_parser!(f32).range(0.0..=2.0))]
+    #[arg(long, value_parser = parse_temperature)]
     temperature: Option<f32>,
 
     /// Nucleus sampling probability.
-    #[arg(long, value_parser = clap::value_parser!(f32).range(0.0..=1.0))]
+    #[arg(long, value_parser = parse_top_p)]
     top_p: Option<f32>,
 
     /// Display reasoning deltas as they arrive (hidden by default).
@@ -75,6 +75,33 @@ struct Args {
     /// Maximum reconnect attempts (only used with --reconnect).
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32))]
     max_retries: u32,
+}
+
+fn parse_positive_u32(value: &str) -> Result<u32, String> {
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|error| format!("invalid integer: {error}"))?;
+    (parsed > 0)
+        .then_some(parsed)
+        .ok_or_else(|| "value must be greater than zero".to_string())
+}
+
+fn parse_temperature(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|error| format!("invalid float: {error}"))?;
+    (parsed.is_finite() && (0.0..=2.0).contains(&parsed))
+        .then_some(parsed)
+        .ok_or_else(|| "temperature must be between 0.0 and 2.0".to_string())
+}
+
+fn parse_top_p(value: &str) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|error| format!("invalid float: {error}"))?;
+    (parsed.is_finite() && (0.0..=1.0).contains(&parsed))
+        .then_some(parsed)
+        .ok_or_else(|| "top-p must be between 0.0 and 1.0".to_string())
 }
 
 fn build_request(args: &Args) -> ChatRequest {
