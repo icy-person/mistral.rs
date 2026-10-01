@@ -22,8 +22,8 @@ jobs:
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo test --release --all-targets
-      - run: cargo bench --no-run
-      - run: cargo bench --bench sse_parser -- --noplot
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check -p mistralrs-streaming
+      - run: cargo test --release --all-targets -p mistralrs-streaming
+      - run: cargo bench --no-run -p mistralrs-streaming
+      - run: cargo bench -p mistralrs-streaming --bench sse_parser -- --noplot
+      - run: cargo clippy --all-targets -p mistralrs-streaming -- -D warnings
