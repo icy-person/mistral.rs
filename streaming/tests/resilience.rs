@@ -310,7 +310,6 @@ async fn retries_retryable_http_status_after_a_resumable_event() {
     assert_eq!(output, "AB");
 }
 
-
 #[tokio::test]
 async fn cancellation_interrupts_initial_http_response_wait() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
