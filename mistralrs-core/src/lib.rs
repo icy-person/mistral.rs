@@ -2740,6 +2740,7 @@ impl MistralRs {
             .with_max_model_len(loader_config.max_model_len)
             .with_hf_config_overrides(loader_config.hf_config_overrides.clone())
             .with_no_kv_cache(unloaded_state.engine_config.no_kv_cache)
+            .with_moe_streaming(loader_config.moe_streaming)
             .with_mtp(
                 loader_config
                     .mtp_config
