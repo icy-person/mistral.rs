@@ -1441,6 +1441,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_command_parses_streaming_controls() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "stream",
+            "-m",
+            "gpt-oss-20b",
+            "-i",
+            "hello",
+            "--max-tokens",
+            "256",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+            "--reconnect",
+            "5",
+            "--reconnect-backoff-ms",
+            "100",
+            "--reconnect-max-backoff-ms",
+            "2000",
+            "--resume-id",
+            "event-7",
+            "--no-stats",
+        ]);
+
+        assert!(cli.is_err(), "--resume-id + --reconnect should be rejected at runtime, not parser-level");
+    }
+
+    #[test]
     fn run_parses_explicit_lora_preloads_and_request_selection() {
         let cli = Cli::try_parse_from([
             "mistralrs",
