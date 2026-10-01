@@ -1114,6 +1114,27 @@ mod tests {
     }
 
     #[test]
+    fn cpu_forward_matches_dequantized_matmul() -> Result<()> {
+        let layer = test_layer()?;
+        let input = Tensor::from_vec(
+            (0..2 * TEST_HIDDEN_SIZE)
+                .map(|i| ((i % 11) as f32 - 5.0) / 7.0)
+                .collect::<Vec<_>>(),
+            (2, TEST_HIDDEN_SIZE),
+            &Device::Cpu,
+        )?;
+
+        let actual = layer.forward(&input)?;
+        let weights = layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let expected = input
+            .matmul(&weights.t()?)?
+            .to_dtype(DType::F32)?;
+
+        assert_eq!(actual.dims(), &[2, TEST_VOCAB_SIZE]);
+        assert_close(&actual, &expected, 1e-3)
+    }
+
+    #[test]
     fn embedding_selects_quantized_rows() -> Result<()> {
         let layer = test_layer()?;
         let ids = Tensor::from_vec(vec![6u32, 1, 6, 3, 0, 4], (2, 3), &Device::Cpu)?;
