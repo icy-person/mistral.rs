@@ -257,9 +257,7 @@ impl StreamingClient {
     pub async fn stream(
         &self,
         mut request: ChatRequest,
-    )
-        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
         self.stream_with_options(&mut request, None, None).await
     }
 
@@ -713,5 +711,4 @@ mod tests {
             assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         }
     }
-
 }
