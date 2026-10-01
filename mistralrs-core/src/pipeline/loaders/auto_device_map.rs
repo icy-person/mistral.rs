@@ -386,7 +386,9 @@ pub fn get_device_layers(
     }
     // On unified memory systems (iGPUs), GPU and CPU share the same physical RAM.
     // Don't add CPU as a fallback device since it would double-count memory.
-    if !has_unified_memory {
+    // The same rule applies when the primary device is already CPU: there is
+    // only one physical host-memory pool.
+    if !has_unified_memory && !devices.iter().any(Device::is_cpu) {
         let a = MemoryUsage.query(&Device::Cpu)?.available();
         avail.push((a, Device::Cpu));
     }
