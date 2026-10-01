@@ -758,8 +758,7 @@ mod tests {
         p.push(br#"id: one
 data: {"id":"x","choices":[]}
 
-"#
-            .unwrap();
+"#).unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         assert_eq!(p.take_last_event_id().as_deref(), Some("one"));
 
