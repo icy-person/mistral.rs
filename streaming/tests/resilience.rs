@@ -1,4 +1,3 @@
-
 use futures_util::StreamExt;
 use mistralrs_streaming::{
     ChatRequest, Message, ReconnectPolicy, StreamEvent, StreamingClient, StreamingError,
