@@ -728,29 +728,55 @@ impl MXFP4Layer {
 
         let x_f32 = x_2d.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let (m, k) = x_f32.dims2()?;
+        if !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "MXFP4 CPU fallback requires K ({k}) divisible by block size ({MXFP4_BLOCK_SIZE})"
+            );
+        }
 
         let blocks_dims = self.blocks.dims();
-        let n = if blocks_dims.len() == 3 {
-            blocks_dims[1]
+        let (n, weight_k_half) = if blocks_dims.len() == 3 {
+            (blocks_dims[1], blocks_dims[2])
+        } else if blocks_dims.len() == 2 {
+            (blocks_dims[0], blocks_dims[1])
         } else {
-            blocks_dims[0]
+            candle_core::bail!("MXFP4 CPU fallback expects rank-2 or rank-3 packed weights");
         };
+        let expected_k = weight_k_half * 2;
+        if k != expected_k {
+            candle_core::bail!(
+                "MXFP4 CPU fallback input K {k} does not match packed weight K {expected_k}"
+            );
+        }
+
         let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
         let half_block = MXFP4_BLOCK_SIZE / 2;
 
         let (blocks_storage, blocks_layout) = self.blocks.storage_and_layout();
         let (scales_storage, scales_layout) = self.scales.storage_and_layout();
-        if !blocks_layout.is_contiguous() || !scales_layout.is_contiguous() {
-            candle_core::bail!("MXFP4 CPU fallback requires contiguous packed weights");
-        }
+        let (blocks_start, blocks_end) = blocks_layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg(
+                "MXFP4 CPU fallback requires contiguous packed weights".into(),
+            ))?;
+        let (scales_start, scales_end) = scales_layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg(
+                "MXFP4 CPU fallback requires contiguous scales".into(),
+            ))?;
         let blocks_data = match &*blocks_storage {
-            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            Storage::Cpu(storage) => &storage.as_slice::<u8>()?[blocks_start..blocks_end],
             _ => candle_core::bail!("MXFP4 CPU fallback requires CPU packed weights"),
         };
         let scales_data = match &*scales_storage {
-            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            Storage::Cpu(storage) => &storage.as_slice::<u8>()?[scales_start..scales_end],
             _ => candle_core::bail!("MXFP4 CPU fallback requires CPU scales"),
         };
+        if scales_data.len() != n * num_blocks_per_row {
+            candle_core::bail!(
+                "MXFP4 CPU fallback scales shape does not match packed weights"
+            );
+        }
         let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
 
         // output: [m, n], accumulate x @ W^T in blocks of 32 columns
@@ -814,25 +840,54 @@ impl MXFP4Layer {
             (x_dims[0], x_dims[1], x_dims[2], true)
         };
 
+        if !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "MXFP4 CPU MoE fallback requires K ({k}) divisible by block size ({MXFP4_BLOCK_SIZE})"
+            );
+        }
+
         let blocks_dims = self.blocks.dims();
-        let n = blocks_dims[1];
-        let k_half = k / 2;
+        let (n, weight_k_half) = if blocks_dims.len() == 3 {
+            (blocks_dims[1], blocks_dims[2])
+        } else {
+            candle_core::bail!("MXFP4 CPU MoE fallback expects rank-3 packed weights");
+        };
+        let expected_k = weight_k_half * 2;
+        if k != expected_k {
+            candle_core::bail!(
+                "MXFP4 CPU MoE fallback input K {k} does not match packed weight K {expected_k}"
+            );
+        }
+
         let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
+        let k_half = k / 2;
         let half_block = MXFP4_BLOCK_SIZE / 2;
 
         let (blocks_storage, blocks_layout) = self.blocks.storage_and_layout();
         let (scales_storage, scales_layout) = self.scales.storage_and_layout();
-        if !blocks_layout.is_contiguous() || !scales_layout.is_contiguous() {
-            candle_core::bail!("MXFP4 CPU MoE fallback requires contiguous packed weights");
-        }
+        let (blocks_start, blocks_end) = blocks_layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg(
+                "MXFP4 CPU MoE fallback requires contiguous packed weights".into(),
+            ))?;
+        let (scales_start, scales_end) = scales_layout
+            .contiguous_offsets()
+            .ok_or_else(|| candle_core::Error::Msg(
+                "MXFP4 CPU MoE fallback requires contiguous scales".into(),
+            ))?;
         let blocks_data = match &*blocks_storage {
-            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            Storage::Cpu(storage) => &storage.as_slice::<u8>()?[blocks_start..blocks_end],
             _ => candle_core::bail!("MXFP4 CPU MoE fallback requires CPU packed weights"),
         };
         let scales_data = match &*scales_storage {
-            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            Storage::Cpu(storage) => &storage.as_slice::<u8>()?[scales_start..scales_end],
             _ => candle_core::bail!("MXFP4 CPU MoE fallback requires CPU scales"),
         };
+        if scales_data.len() != self.blocks.dims()[0] * n * num_blocks_per_row {
+            candle_core::bail!(
+                "MXFP4 CPU MoE fallback scales shape does not match packed weights"
+            );
+        }
 
         let x_f32 = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
