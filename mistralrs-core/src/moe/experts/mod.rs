@@ -113,7 +113,7 @@ impl MoEExperts {
     ) -> Result<Self> {
         let experts_vb = vb.pp("experts").set_device(layer_device.clone());
         if let Some(streamed) =
-            StreamedExpertsWeights::try_new(cfg, &experts_vb, &layer_device, loading_isq)?
+            StreamedExpertsWeights::try_new(cfg, &experts_vb, &layer_device, comm, loading_isq)?
         {
             return Ok(Self::from_backend(
                 MoEExpertsBackendImpl::Streamed(streamed),
@@ -215,7 +215,7 @@ impl MoEExperts {
         act: Activation,
     ) -> Result<Self> {
         if let Some(streamed) =
-            StreamedExpertsWeights::try_new(cfg, &experts_vb, &experts_vb.device().clone(), loading_isq)?
+            StreamedExpertsWeights::try_new(cfg, &experts_vb, &experts_vb.device().clone(), comm, loading_isq)?
         {
             return Ok(Self::from_backend(
                 MoEExpertsBackendImpl::Streamed(streamed),
