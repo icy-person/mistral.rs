@@ -1,6 +1,6 @@
 use std::sync::{atomic::AtomicUsize, Arc};
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Storage, Tensor};
 use safetensors::tensor::Dtype;
 
 use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
@@ -712,9 +712,9 @@ impl MXFP4Layer {
             .to_dtype(DType::BF16)
     }
 
-    /// CPU forward pass: blocked dequant + matmul to avoid full weight allocation.
+    /// CPU forward pass: zero-copy packed-weight access + blocked dequant/matmul.
     /// Processes MXFP4_BLOCK_SIZE (32) input columns at a time, dequantizing only
-    /// the needed weight slice before accumulating partial results.
+    /// the current weight block before accumulating partial results.
     fn forward_dequantize(&self, x: &Tensor) -> Result<Tensor> {
         let orig_dims = x.dims().to_vec();
 
@@ -738,10 +738,19 @@ impl MXFP4Layer {
         let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
         let half_block = MXFP4_BLOCK_SIZE / 2;
 
-        let blocks_cpu = self.blocks.to_device(&Device::Cpu)?;
-        let scales_cpu = self.scales.to_device(&Device::Cpu)?;
-        let blocks_data: Vec<u8> = blocks_cpu.flatten_all()?.to_vec1()?;
-        let scales_data: Vec<u8> = scales_cpu.flatten_all()?.to_vec1()?;
+        let (blocks_storage, blocks_layout) = self.blocks.storage_and_layout();
+        let (scales_storage, scales_layout) = self.scales.storage_and_layout();
+        if !blocks_layout.is_contiguous() || !scales_layout.is_contiguous() {
+            candle_core::bail!("MXFP4 CPU fallback requires contiguous packed weights");
+        }
+        let blocks_data = match &*blocks_storage {
+            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            _ => candle_core::bail!("MXFP4 CPU fallback requires CPU packed weights"),
+        };
+        let scales_data = match &*scales_storage {
+            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            _ => candle_core::bail!("MXFP4 CPU fallback requires CPU scales"),
+        };
         let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
 
         // output: [m, n], accumulate x @ W^T in blocks of 32 columns
@@ -793,8 +802,8 @@ impl MXFP4Layer {
         Ok(result)
     }
 
-    /// CPU MoE forward: blocked dequant per (token, expert) pair.
-    /// Avoids dequantizing all experts, only touches the needed weight blocks.
+    /// CPU MoE forward: zero-copy packed-weight access and blocked dequant per
+    /// (token, expert) pair. Only the selected expert blocks are traversed.
     fn gather_forward_dequantize(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
         let x_dims = x.dims();
         let indices_dims = indices.dims();
@@ -811,10 +820,19 @@ impl MXFP4Layer {
         let num_blocks_per_row = k / MXFP4_BLOCK_SIZE;
         let half_block = MXFP4_BLOCK_SIZE / 2;
 
-        let blocks_cpu = self.blocks.to_device(&Device::Cpu)?;
-        let scales_cpu = self.scales.to_device(&Device::Cpu)?;
-        let blocks_data: Vec<u8> = blocks_cpu.flatten_all()?.to_vec1()?;
-        let scales_data: Vec<u8> = scales_cpu.flatten_all()?.to_vec1()?;
+        let (blocks_storage, blocks_layout) = self.blocks.storage_and_layout();
+        let (scales_storage, scales_layout) = self.scales.storage_and_layout();
+        if !blocks_layout.is_contiguous() || !scales_layout.is_contiguous() {
+            candle_core::bail!("MXFP4 CPU MoE fallback requires contiguous packed weights");
+        }
+        let blocks_data = match &*blocks_storage {
+            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            _ => candle_core::bail!("MXFP4 CPU MoE fallback requires CPU packed weights"),
+        };
+        let scales_data = match &*scales_storage {
+            Storage::Cpu(storage) => storage.as_slice::<u8>()?,
+            _ => candle_core::bail!("MXFP4 CPU MoE fallback requires CPU scales"),
+        };
 
         let x_f32 = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
         let x_data: Vec<f32> = x_f32.flatten_all()?.to_vec1()?;
