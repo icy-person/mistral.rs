@@ -77,6 +77,7 @@ struct Args {
     max_retries: u32,
 }
 
+#[allow(dead_code)]
 fn parse_positive_u32(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
