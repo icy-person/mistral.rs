@@ -159,7 +159,7 @@ impl MxFp4StreamingExpertLayer {
             .checked_add(expert_bytes)
             .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert range overflow".into()))?;
 
-        if end > data.len() || end > info.data_len()? {
+        if end > data.len() {
             candle_core::bail!(
                 "GPT-OSS MXFP4 streamed expert range {start}..{end} exceeds tensor {name}"
             );
@@ -234,7 +234,14 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         }
 
         let (num_tokens, topk, k, x_has_topk) = match x_dims {
-            [tokens, cols] => (*tokens, index_dims[1], *cols, false),
+            [tokens, cols] => {
+                if *tokens != index_dims[0] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
+                    );
+                }
+                (*tokens, index_dims[1], *cols, false)
+            }
             [tokens, x_topk, cols] => {
                 if *tokens != index_dims[0] || *x_topk != index_dims[1] {
                     candle_core::bail!(
@@ -283,13 +290,19 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
 
                 for component in 0..self.raw_weights.len() {
                     let expert = self.raw_expert_bytes(component, expert_idx)?;
-                    let out_offset = component * self.component_out_dim;
                     for row in 0..self.component_out_dim {
+                        // Native GPT-OSS gate/up tensors are interleaved along the
+                        // output dimension: gate0, up0, gate1, up1, ...
+                        let out_index = if self.raw_weights.len() == 2 {
+                            row * 2 + component
+                        } else {
+                            row
+                        };
                         Self::dot_row(
                             x_row,
                             expert,
                             row,
-                            out_offset,
+                            out_index,
                             &mut output,
                             route_row,
                             self.out_dim,
