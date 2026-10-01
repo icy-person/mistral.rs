@@ -1,0 +1,31 @@
+name: repair-streaming-lock
+
+on:
+  push:
+    branches:
+      - feat/streaming-complete
+
+permissions:
+  contents: write
+
+jobs:
+  repair-lock:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+      - name: Regenerate Cargo.lock
+        run: cargo generate-lockfile
+      - name: Commit regenerated lockfile
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock is already canonical."
+            exit 0
+          fi
+          git add Cargo.lock
+          git commit -m "build: regenerate Cargo.lock"
+          git push origin HEAD:feat/streaming-complete
