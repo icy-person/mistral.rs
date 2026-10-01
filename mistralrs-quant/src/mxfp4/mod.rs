@@ -335,11 +335,11 @@ impl MXFP4Layer {
         false
     }
 
-    /// Construct one logical [rows, cols] MXFP4 matrix from a raw GGUF byte range.
+    /// Construct one logical [rows, cols] MXFP4 matrix from canonical GGUF bytes.
     ///
-    /// GGUF MXFP4 stores every 32-value block as one E8M0 scale byte followed by 16 packed
-    /// FP4 bytes. The streamed expert reader slices on complete rows, so converting a single
-    /// expert never requires loading the whole [experts, rows, cols] tensor.
+    /// GGUF dtype 39 stores each 32-value block as one E8M0 scale byte followed by 16 packed
+    /// FP4 bytes. Candle uses the same low-nibble/high-nibble ordering, so the raw payload can
+    /// be copied into its packed [rows, cols/2] representation without a dequantize/requantize step.
     pub fn from_gguf_bytes(
         data: &[u8],
         rows: usize,
@@ -369,29 +369,17 @@ impl MXFP4Layer {
             );
         }
 
-        let mut blocks = Vec::with_capacity(rows * packed_bytes_per_block * blocks_per_row);
+        let mut blocks = Vec::with_capacity(rows * cols / 2);
         let mut scales = Vec::with_capacity(rows * blocks_per_row);
 
         for row in 0..rows {
             let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
             for block in 0..blocks_per_row {
                 let start = block * (1 + packed_bytes_per_block);
-                let scale = row_data[start];
-                let packed = &row_data[start + 1..start + 1 + packed_bytes_per_block];
-
-                scales.push(scale);
-                // GGUF MXFP4 packs 32 FP4 values as 16 bytes. Candle's MXFP4Layer expects
-                // those 16 bytes in the same pairwise logical order used by materialize_mxfp4_component.
-                for pair in 0..(MXFP4_BLOCK_SIZE / 2) {
-                    let source = if pair < packed_bytes_per_block / 2 {
-                        let i = pair * 2;
-                        (packed[i] & 0x0f) | ((packed[i + 1] & 0x0f) << 4)
-                    } else {
-                        let i = (pair - packed_bytes_per_block / 2) * 2;
-                        (packed[i] >> 4) | ((packed[i + 1] >> 4) << 4)
-                    };
-                    blocks.push(source);
-                }
+                scales.push(row_data[start]);
+                blocks.extend_from_slice(
+                    &row_data[start + 1..start + 1 + packed_bytes_per_block],
+                );
             }
         }
 
