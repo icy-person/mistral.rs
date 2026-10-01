@@ -328,34 +328,88 @@ impl StreamingClient {
     ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
         let client = self.clone();
         let stream = async_stream::try_stream! {
-            let mut last_event_id: Option<String> = None;
-            let mut retries = 0u32;
-            let mut delay = std::cmp::min(policy.initial_backoff, policy.max_backoff);
+        let mut last_event_id: Option<String> = None;
+        let mut retries = 0u32;
+        let mut delay = std::cmp::min(policy.initial_backoff, policy.max_backoff);
 
-            loop {
-                let result = match cancellation.as_ref() {
-                    Some(token) => tokio::select! {
-                        _ = token.cancelled() => Err(StreamingError::Cancelled),
-                        result = client.stream_boxed_resume(
+        loop {
+            let result = match cancellation.as_ref() {
+                Some(token) => tokio::select! {
+                    _ = token.cancelled() => Err(StreamingError::Cancelled),
+                    result = client.stream_boxed_resume(
+                        request.clone(),
+                        last_event_id.as_deref().filter(|id| !id.is_empty()),
+                        cancellation.clone(),
+                    ) => result,
+                },
+                None => {
+                    client
+                        .stream_boxed_resume(
                             request.clone(),
                             last_event_id.as_deref().filter(|id| !id.is_empty()),
-                            cancellation.clone(),
-                        ) => result,
-                    },
-                    None => {
-                        client
-                            .stream_boxed_resume(
-                                request.clone(),
-                                last_event_id.as_deref().filter(|id| !id.is_empty()),
-                                None,
-                            )
-                            .await
-                    }
-                };
+                            None,
+                        )
+                        .await
+                }
+            };
 
-                let mut current = match result {
-                    Ok(stream) => stream,
-                    Err(error) => {
+            let mut current = match result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let retryable = is_retryable_stream_error(&error);
+                    let resumable = last_event_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty());
+
+                    if !retryable || !resumable || retries >= policy.max_retries {
+                        Err(error)?;
+                    }
+
+                    retries += 1;
+                    let cancelled = match cancellation.as_ref() {
+                        Some(token) => tokio::select! {
+                            _ = token.cancelled() => true,
+                            _ = tokio::time::sleep(delay) => false,
+                        },
+                        None => {
+                            tokio::time::sleep(delay).await;
+                            false
+                        }
+                    };
+
+                    if cancelled {
+                        Err(StreamingError::Cancelled)?;
+                    }
+
+                    delay = std::cmp::min(
+                        delay.saturating_mul(2),
+                        policy.max_backoff,
+                    );
+                    continue;
+                }
+            };
+
+            loop {
+                match current.next().await {
+                    Some(Ok(event)) => {
+                        if let Some(id) = current.last_event_id() {
+                            last_event_id = Some(id.to_owned());
+                        }
+
+                        let done = matches!(&event, StreamEvent::Done);
+                        yield event;
+
+                        if done {
+                            return;
+                        }
+
+                        retries = 0;
+                        delay = std::cmp::min(
+                            policy.initial_backoff,
+                            policy.max_backoff,
+                        );
+                    }
+                    Some(Err(error)) => {
                         let retryable = is_retryable_stream_error(&error);
                         let resumable = last_event_id
                             .as_deref()
@@ -385,97 +439,13 @@ impl StreamingClient {
                             delay.saturating_mul(2),
                             policy.max_backoff,
                         );
-                        continue;
+                        break;
                     }
-                };
-
-                loop {
-                    match current.next().await {
-                        Some(Ok(event)) => {
-                            if let Some(id) = current.last_event_id() {
-                                last_event_id = Some(id.to_owned());
-                            }
-
-                            let done = matches!(&event, StreamEvent::Done);
-                            yield event;
-
-                            if done {
-                                return;
-                            }
-
-                            retries = 0;
-                            delay = std::cmp::min(
-                                policy.initial_backoff,
-                                policy.max_backoff,
-                            );
-                        }
-                        Some(Err(error)) => {
-                            let retryable = is_retryable_stream_error(&error);
-                            let resumable = last_event_id
-                                .as_deref()
-                                .is_some_and(|id| !id.is_empty());
-
-                            if !retryable || !resumable || retries >= policy.max_retries {
-                                Err(error)?;
-                            }
-
-                            retries += 1;
-                            let cancelled = match cancellation.as_ref() {
-                                Some(token) => tokio::select! {
-                                    _ = token.cancelled() => true,
-                                    _ = tokio::time::sleep(delay) => false,
-                                },
-                                None => {
-                                    tokio::time::sleep(delay).await;
-                                    false
-                                }
-                            };
-
-                            if cancelled {
-                                Err(StreamingError::Cancelled)?;
-                            }
-
-                            delay = std::cmp::min(
-                                delay.saturating_mul(2),
-                                policy.max_backoff,
-                            );
-                            break;
-                        }
-                        None => {
-                            if current.last_event_id().is_none() {
-                                return;
-                            }
-
-                            let error = StreamingError::UnexpectedEof;
-                            if retries >= policy.max_retries {
-                                Err(error)?;
-                            }
-
-                            retries += 1;
-                            let cancelled = match cancellation.as_ref() {
-                                Some(token) => tokio::select! {
-                                    _ = token.cancelled() => true,
-                                    _ = tokio::time::sleep(delay) => false,
-                                },
-                                None => {
-                                    tokio::time::sleep(delay).await;
-                                    false
-                                }
-                            };
-
-                            if cancelled {
-                                Err(StreamingError::Cancelled)?;
-                            }
-
-                            delay = std::cmp::min(
-                                delay.saturating_mul(2),
-                                policy.max_backoff,
-                            );
-                            break;
-                        }
-                    }
+                    None => return,
                 }
-            }        };
+            }
+        }
+        };
 
         Ok(stream)
     }
@@ -501,7 +471,13 @@ impl StreamingClient {
             builder = builder.header("Last-Event-ID", id);
         }
 
-        let response = builder.json(&request).send().await?;
+        let response = match cancellation.as_ref() {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err(StreamingError::Cancelled),
+                result = builder.json(&request).send() => result?,
+            },
+            None => builder.json(&request).send().await?,
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -548,7 +524,13 @@ impl StreamingClient {
             builder = builder.header("Last-Event-ID", id);
         }
 
-        let response = builder.json(request).send().await?;
+        let response = match cancellation.as_ref() {
+            Some(token) => tokio::select! {
+                _ = token.cancelled() => return Err(StreamingError::Cancelled),
+                result = builder.json(request).send() => result?,
+            },
+            None => builder.json(request).send().await?,
+        };
 
         if !response.status().is_success() {
             let status = response.status();
