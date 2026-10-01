@@ -943,6 +943,7 @@ impl MistralRsForServerBuilder {
             hf_config_overrides: hf_config_overrides_for_config,
             mtp_config: self.mtp_config.clone(),
             encoder_cache_memory_bytes: self.encoder_cache_memory_bytes,
+            moe_streaming: self.moe_streaming,
         };
 
         let mut builder = MistralRsBuilder::new(
@@ -1161,6 +1162,7 @@ impl MistralRsForServerBuilder {
             hf_config_overrides: first_hf_config_overrides,
             mtp_config: self.mtp_config.clone(),
             encoder_cache_memory_bytes: first_encoder_cache_memory_bytes,
+            moe_streaming: self.moe_streaming,
         };
 
         // Create the first MistralRs instance with the first model
@@ -1328,6 +1330,7 @@ impl MistralRsForServerBuilder {
                     .encoder_cache_memory_bytes
                     .map(NonZeroUsize::get)
                     .or(self.encoder_cache_memory_bytes),
+                moe_streaming: self.moe_streaming,
             };
             let mut add_model_config = mistralrs_core::AddModelConfig::new(engine_config)
                 .with_loader_config(loader_config);
