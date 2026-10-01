@@ -876,6 +876,7 @@ impl MistralRsForServerBuilder {
 
         // Configure this last to prevent arg moves
         let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+            .with_moe_streaming(self.moe_streaming)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(self.chat_template)
             .with_jinja_explicit(self.jinja_explicit)
@@ -1024,6 +1025,7 @@ impl MistralRsForServerBuilder {
             .map(NonZeroUsize::get)
             .or(self.encoder_cache_memory_bytes);
         let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+            .with_moe_streaming(self.moe_streaming)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(first_chat_template.clone())
             .with_jinja_explicit(first_jinja_explicit.clone())
