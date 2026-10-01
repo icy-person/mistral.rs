@@ -425,14 +425,14 @@ where
     }
 }
 
-struct SseParser {
+pub struct SseParser {
     buffer: BytesMut,
     scan_pos: usize,
     last_event_id: Option<String>,
 }
 
 impl SseParser {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
             scan_pos: 0,
@@ -444,7 +444,7 @@ impl SseParser {
         self.last_event_id.take()
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
         if self.buffer.len().saturating_add(bytes.len()) > MAX_EVENT_BYTES {
             return Err(StreamingError::EventTooLarge);
         }
@@ -452,7 +452,7 @@ impl SseParser {
         Ok(())
     }
 
-    fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
+    pub fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
         loop {
             let (frame_len, separator_len) = find_boundary(&self.buffer, &mut self.scan_pos)?;
             let frame = self.buffer.split_to(frame_len);
