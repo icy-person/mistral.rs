@@ -482,7 +482,7 @@ fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
         StreamingError::Http(error) => {
             error.is_connect() || error.is_timeout() || error.is_request()
-        },
+        }
         StreamingError::HttpStatus { status, .. } => {
             matches!(status.as_u16(), 408 | 425 | 429 | 500..=599)
         }
@@ -876,7 +876,8 @@ data: {"id":"x","choices":[]}
     #[test]
     fn uses_last_id_field_and_ignores_null_id() {
         let mut p = parser();
-        p.push(b"id: first\nid: second\ndata: {\"id\":\"x\",\"choices\":[]}\n\n").unwrap();
+        p.push(b"id: first\nid: second\ndata: {\"id\":\"x\",\"choices\":[]}\n\n")
+            .unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
         assert_eq!(p.last_event_id(), Some("second"));
 
