@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -305,6 +306,16 @@ impl StreamingClient {
         request: ChatRequest,
         policy: ReconnectPolicy,
     ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
+        self.stream_with_reconnect_and_cancellation(request, policy, None)
+            .await
+    }
+
+    pub async fn stream_with_reconnect_and_cancellation(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
         let client = self.clone();
         let stream = async_stream::try_stream! {
             let mut last_event_id: Option<String> = None;
@@ -312,9 +323,14 @@ impl StreamingClient {
             let mut delay = policy.initial_backoff;
 
             loop {
-                let mut current = client
-                    .stream_boxed_resume(request.clone(), last_event_id.as_deref())
-                    .await?;
+                let mut current = tokio::select! {
+                    _ = cancellation.cancelled() => Err(StreamingError::Cancelled)?,
+                    result = client.stream_boxed_resume(
+                        request.clone(),
+                        last_event_id.as_deref().filter(|id| !id.is_empty()),
+                        Some(cancellation.clone()),
+                    ) => result?,
+                };
 
                 loop {
                     match current.next().await {
@@ -322,26 +338,32 @@ impl StreamingClient {
                             if let Some(id) = current.last_event_id() {
                                 last_event_id = Some(id.to_owned());
                             }
+
                             let done = matches!(&event, StreamEvent::Done);
                             yield event;
+
                             if done {
                                 return;
                             }
+
+                            retries = 0;
+                            delay = policy.initial_backoff;
                         }
                         Some(Err(error)) => {
-                            let retryable = matches!(
-                                error,
-                                StreamingError::Http(_) | StreamingError::UnexpectedEof
-                            );
-                            if !retryable
-                                || last_event_id.is_none()
-                                || retries >= policy.max_retries
-                            {
+                            let retryable = is_retryable_stream_error(&error);
+                            let resumable = last_event_id
+                                .as_deref()
+                                .is_some_and(|id| !id.is_empty());
+
+                            if !retryable || !resumable || retries >= policy.max_retries {
                                 Err(error)?;
                             }
 
                             retries += 1;
-                            tokio::time::sleep(delay).await;
+                            tokio::select! {
+                                _ = cancellation.cancelled() => Err(StreamingError::Cancelled)?,
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                             delay = std::cmp::min(
                                 delay.saturating_mul(2),
                                 policy.max_backoff,
@@ -361,6 +383,7 @@ impl StreamingClient {
         &self,
         request: ChatRequest,
         last_event_id: Option<&str>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ChatStream<DynBody>, StreamingError> {
         let mut request = request;
         request.stream = true;
@@ -384,6 +407,10 @@ impl StreamingClient {
             return Err(StreamingError::HttpStatus { status, body });
         }
 
+        let cancelled = cancellation
+            .as_ref()
+            .map(|token| Box::pin(token.clone().cancelled_owned()) as CancelFuture);
+
         Ok(ChatStream {
             body: Box::pin(response.bytes_stream()),
             parser: SseParser::new(),
@@ -392,8 +419,10 @@ impl StreamingClient {
                 ..Default::default()
             },
             saw_done: false,
-            cancellation: None,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            cancellation,
+            cancelled,
+            cancellation_emitted: false,
+            last_event_id: last_event_id.map(str::to_owned),
         })
     }
 
@@ -426,6 +455,10 @@ impl StreamingClient {
             return Err(StreamingError::HttpStatus { status, body });
         }
 
+        let cancelled = cancellation
+            .as_ref()
+            .map(|token| Box::pin(token.clone().cancelled_owned()) as CancelFuture);
+
         Ok(ChatStream {
             body: response.bytes_stream(),
             parser: SseParser::new(),
@@ -435,12 +468,29 @@ impl StreamingClient {
             },
             saw_done: false,
             cancellation,
+            cancelled,
+            cancellation_emitted: false,
             last_event_id,
         })
     }
 }
 
 type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+type CancelFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+fn is_retryable_stream_error(error: &StreamingError) -> bool {
+    match error {
+        StreamingError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+        StreamingError::HttpStatus { status, .. } => {
+            matches!(
+                status.as_u16(),
+                408 | 425 | 429 | 500..=599
+            )
+        }
+        StreamingError::UnexpectedEof => true,
+        _ => false,
+    }
+}
 
 pub struct ChatStream<S> {
     body: S,
@@ -448,6 +498,8 @@ pub struct ChatStream<S> {
     stats: StreamStats,
     saw_done: bool,
     cancellation: Option<tokio_util::sync::CancellationToken>,
+    cancelled: Option<CancelFuture>,
+    cancellation_emitted: bool,
     last_event_id: Option<String>,
 }
 
@@ -475,29 +527,28 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if self
-                .cancellation
-                .as_ref()
-                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-            {
-                self.stats.finished.get_or_insert_with(Instant::now);
-                return Poll::Ready(Some(Err(StreamingError::Cancelled)));
+            if self.cancellation_emitted {
+                return Poll::Ready(None);
+            }
+
+            if let Some(cancelled) = self.cancelled.as_mut() {
+                if cancelled.as_mut().poll(cx).is_ready() {
+                    self.stats.finished.get_or_insert_with(Instant::now);
+                    self.cancellation_emitted = true;
+                    return Poll::Ready(Some(Err(StreamingError::Cancelled)));
+                }
             }
 
             if let Some(result) = self.parser.next_event() {
                 match result {
                     Ok(StreamEvent::Done) => {
-                        if let Some(id) = self.parser.take_last_event_id() {
-                            self.last_event_id = (!id.is_empty()).then_some(id);
-                        }
+                        self.last_event_id = self.parser.last_event_id().map(str::to_owned);
                         self.saw_done = true;
                         self.stats.finished = Some(Instant::now());
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
-                        if let Some(id) = self.parser.take_last_event_id() {
-                            self.last_event_id = (!id.is_empty()).then_some(id);
-                        }
+                        self.last_event_id = self.parser.last_event_id().map(str::to_owned);
                         self.stats.chunks += 1;
 
                         for choice in &chunk.choices {
@@ -566,8 +617,8 @@ impl SseParser {
         }
     }
 
-    fn take_last_event_id(&mut self) -> Option<String> {
-        self.last_event_id.take()
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.last_event_id.as_deref()
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
@@ -680,37 +731,61 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
 }
 
 fn parse_event_id(frame: &[u8]) -> Option<String> {
+    let mut event_id = None;
+
     for raw_line in frame.split(|b| *b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        if let Some(value) = line.strip_prefix(b"id:") {
-            let value = value.strip_prefix(b" ").unwrap_or(value);
-            return Some(String::from_utf8_lossy(value).into_owned());
+
+        let (field, value) = match line.iter().position(|b| *b == b':') {
+            Some(colon) => (&line[..colon], line.get(colon + 1..).unwrap_or_default()),
+            None => (line, &[][..]),
+        };
+
+        if field != b"id" {
+            continue;
         }
+
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        if value.contains(&0) {
+            continue;
+        }
+
+        event_id = Some(String::from_utf8_lossy(value).into_owned());
     }
-    None
+
+    event_id
 }
 
 fn find_boundary(buffer: &BytesMut, scan_pos: &mut usize) -> Option<(usize, usize)> {
     let bytes = buffer.as_ref();
     let mut i = (*scan_pos).min(bytes.len());
 
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+    while i < bytes.len() {
+        let first_eol = if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            2
+        } else if matches!(bytes[i], b'\r' | b'\n') {
+            1
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let second = i + first_eol;
+        if second < bytes.len() {
+            let second_eol = if bytes[second] == b'\r' && bytes.get(second + 1) == Some(&b'\n') {
+                2
+            } else if matches!(bytes[second], b'\r' | b'\n') {
+                1
+            } else {
+                i += first_eol;
+                continue;
+            };
+
             *scan_pos = i;
-            return Some((i, 2));
+            return Some((i, first_eol + second_eol));
         }
 
-        if i + 3 < bytes.len()
-            && bytes[i] == b'\r'
-            && bytes[i + 1] == b'\n'
-            && bytes[i + 2] == b'\r'
-            && bytes[i + 3] == b'\n'
-        {
-            *scan_pos = i;
-            return Some((i, 4));
-        }
-
-        i += 1;
+        break;
     }
 
     *scan_pos = i.saturating_sub(1);
@@ -761,11 +836,38 @@ data: {"id":"x","choices":[]}
         )
         .unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
-        assert_eq!(p.take_last_event_id().as_deref(), Some("one"));
+        assert_eq!(p.last_event_id(), Some("one"));
+
+        p.push(b"data: {\"id\":\"x2\",\"choices\":[]}\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("one"));
 
         p.push(b"id:\ndata: [DONE]\n\n").unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
-        assert_eq!(p.take_last_event_id().as_deref(), Some(""));
+        assert_eq!(p.last_event_id(), Some(""));
+    }
+
+    #[test]
+    fn parses_lone_cr_and_mixed_line_endings() {
+        let mut p = parser();
+        p.push(b"id: 7\rdata: {\"id\":\"x\",\"choices\":[]}\r\r").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("7"));
+
+        p.push(b"data: [DONE]\r\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[test]
+    fn uses_last_id_field_and_ignores_null_id() {
+        let mut p = parser();
+        p.push(b"id: first\nid: second\ndata: {\"id\":\"x\",\"choices\":[]}\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.last_event_id(), Some("second"));
+
+        p.push(b"id: bad\0id\ndata: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.last_event_id(), Some("second"));
     }
 
     #[test]
