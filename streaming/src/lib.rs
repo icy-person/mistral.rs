@@ -90,6 +90,8 @@ pub struct StreamStats {
     pub finished: Option<Instant>,
     pub chunks: u64,
     pub content_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub output_events: u64,
 }
 
 impl StreamStats {
@@ -99,6 +101,11 @@ impl StreamStats {
 
     pub fn elapsed(&self) -> Option<Duration> {
         Some(self.finished?.duration_since(self.started?))
+    }
+
+    pub fn output_bytes_per_second(&self) -> Option<f64> {
+        let seconds = self.elapsed()?.as_secs_f64();
+        (seconds > 0.0).then_some(self.content_bytes as f64 / seconds)
     }
 }
 
@@ -238,13 +245,20 @@ impl Stream for ChatStream {
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
                         self.stats.chunks += 1;
-                        let output = chunk.choices.iter().map(|choice| {
-                            choice.delta.content.as_deref().unwrap_or("")
-                        }).collect::<String>();
-                        if !output.is_empty() && self.stats.first_output.is_none() {
-                            self.stats.first_output = Some(Instant::now());
+                        for choice in &chunk.choices {
+                            if let Some(text) = &choice.delta.content {
+                                if !text.is_empty() {
+                                    if self.stats.first_output.is_none() {
+                                        self.stats.first_output = Some(Instant::now());
+                                    }
+                                    self.stats.content_bytes += text.len() as u64;
+                                    self.stats.output_events += 1;
+                                }
+                            }
+                            if let Some(text) = &choice.delta.reasoning {
+                                self.stats.reasoning_bytes += text.len() as u64;
+                            }
                         }
-                        self.stats.content_bytes += output.len() as u64;
                         return Poll::Ready(Some(Ok(StreamEvent::Chunk(chunk))));
                     }
                     Err(error) => return Poll::Ready(Some(Err(error))),
@@ -300,6 +314,7 @@ impl SseParser {
         self.buffer.advance(separator_len);
 
         let mut data = String::new();
+        let mut event_name: Option<&[u8]> = None;
         for raw_line in frame.split(|b| *b == b'\n') {
             let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
             if line.is_empty() || line[0] == b':' {
@@ -308,10 +323,15 @@ impl SseParser {
             let Some(colon) = line.iter().position(|b| *b == b':') else {
                 continue;
             };
-            if &line[..colon] != b"data" {
+            let field = &line[..colon];
+            let value = line.get(colon + 1..).unwrap_or_default();
+            if field == b"event" {
+                event_name = Some(value.strip_prefix(b" ").unwrap_or(value));
                 continue;
             }
-            let value = line.get(colon + 1..).unwrap_or_default();
+            if field != b"data" {
+                continue;
+            }
             let value = value.strip_prefix(b" ").unwrap_or(value);
             if !data.is_empty() {
                 data.push('\n');
@@ -383,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_crlf_and_done() {
+    fn ignores_comments_and_parses_multiline_data() {\n        let mut p = parser();\n        p.push(b": heartbeat\\n event: message\\n data: {\\"id\\":\\"x\\",\\n data: \\n data: \\n data: {\\"choices\\":[]}\\n\\n");\n        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));\n    }\n\n    #[test]\n    fn parses_crlf_and_done() {
         let mut p = parser();
         p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n");
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
