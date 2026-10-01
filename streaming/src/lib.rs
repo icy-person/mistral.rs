@@ -312,10 +312,9 @@ impl StreamingClient {
             let mut delay = policy.initial_backoff;
 
             loop {
-                let mut current = match last_event_id.as_deref() {
-                    Some(id) => client.stream_with_resume(request.clone(), id).await?,
-                    None => client.stream(request.clone()).await?,
-                };
+                let mut current = client
+                    .stream_boxed_resume(request.clone(), last_event_id.as_deref())
+                    .await?;
 
                 loop {
                     match current.next().await {
@@ -356,6 +355,46 @@ impl StreamingClient {
         };
 
         Ok(stream)
+    }
+
+    async fn stream_boxed_resume(
+        &self,
+        request: ChatRequest,
+        last_event_id: Option<&str>,
+    ) -> Result<ChatStream<DynBody>, StreamingError> {
+        let mut request = request;
+        request.stream = true;
+        let started = Instant::now();
+
+        let mut builder = self
+            .client
+            .post(self.chat_url.clone())
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+
+        if let Some(id) = last_event_id {
+            builder = builder.header("Last-Event-ID", id);
+        }
+
+        let response = builder.json(&request).send().await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(StreamingError::HttpStatus { status, body });
+        }
+
+        Ok(ChatStream {
+            body: Box::pin(response.bytes_stream()),
+            parser: SseParser::new(),
+            stats: StreamStats {
+                started: Some(started),
+                ..Default::default()
+            },
+            saw_done: false,
+            cancellation: None,
+            last_event_id: last_event_id.map(str::to_owned),
+        })
     }
 
     async fn stream_with_options(
@@ -400,6 +439,8 @@ impl StreamingClient {
         })
     }
 }
+
+type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 pub struct ChatStream<S> {
     body: S,
