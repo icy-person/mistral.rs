@@ -45,6 +45,7 @@ pub async fn run_interactive(
     let request_adapter = normalize_requested_adapter(&model_type, request_adapter.as_deref())?;
 
     agent_options.apply_to(&mut runtime);
+    runtime.apply_moe_stream_env();
     apply_agent_mode(&mut runtime);
     validate_agent_options(&runtime)?;
     log_agent_runtime(&runtime, None);
