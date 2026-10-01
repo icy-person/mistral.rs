@@ -40,7 +40,7 @@ jobs:
       - name: Fetch Rust dependencies
         run: |
           for i in 1 2 3 4 5; do
-            cargo fetch --locked && break
+            cargo fetch && break
             if [ "$i" = 5 ]; then
               exit 1
             fi
