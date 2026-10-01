@@ -487,7 +487,7 @@ impl StreamingClient {
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
-            body: Box::pin(response.bytes_stream()),
+            body: Some(Box::pin(response.bytes_stream())),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
@@ -539,7 +539,7 @@ impl StreamingClient {
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
-            body: response.bytes_stream(),
+            body: Some(response.bytes_stream()),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
@@ -569,7 +569,7 @@ fn is_retryable_stream_error(error: &StreamingError) -> bool {
 }
 
 pub struct ChatStream<S> {
-    body: S,
+    body: Option<S>,
     parser: SseParser,
     stats: StreamStats,
     cancellation: tokio_util::sync::CancellationToken,
@@ -608,6 +608,7 @@ where
         if Pin::as_mut(&mut this.cancelled).poll(cx).is_ready() {
             this.stats.finished = Some(Instant::now());
             this.finished = true;
+            this.body = None;
             return Poll::Ready(Some(Err(StreamingError::Cancelled)));
         }
 
@@ -653,22 +654,34 @@ where
                 }
             }
 
-            match Pin::new(&mut this.body).poll_next(cx) {
+            let poll = match this.body.as_mut() {
+                Some(body) => Pin::new(body).poll_next(cx),
+                None => {
+                    this.stats.finished = Some(Instant::now());
+                    this.finished = true;
+                    return Poll::Ready(None);
+                }
+            };
+
+            match poll {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Err(error) = this.parser.push(&bytes) {
                         this.stats.finished = Some(Instant::now());
                         this.finished = true;
+                        this.body = None;
                         return Poll::Ready(Some(Err(error)));
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
                     this.stats.finished = Some(Instant::now());
                     this.finished = true;
+                    this.body = None;
                     return Poll::Ready(Some(Err(StreamingError::Http(error))));
                 }
                 Poll::Ready(None) => {
                     this.stats.finished = Some(Instant::now());
                     this.finished = true;
+                    this.body = None;
                     if this.cancellation.is_cancelled() {
                         return Poll::Ready(Some(Err(StreamingError::Cancelled)));
                     }
@@ -1120,7 +1133,7 @@ data: {"id":"x","choices":[]}
 
         let body = futures_util::stream::empty::<Result<Bytes, reqwest::Error>>();
         let mut stream = ChatStream {
-            body,
+            body: Some(body),
             parser: SseParser::new(),
             stats: StreamStats::default(),
             cancellation,
@@ -1132,6 +1145,53 @@ data: {"id":"x","choices":[]}
         stream.cancel();
         let result = stream.next().await.unwrap();
         assert!(matches!(result, Err(StreamingError::Cancelled)));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_transport_immediately() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        impl Stream for DropProbe {
+            type Item = Result<Bytes, reqwest::Error>;
+
+            fn poll_next(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(dropped.clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        let mut stream = ChatStream {
+            body: Some(probe),
+            parser: SseParser::new(),
+            stats: StreamStats::default(),
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: None,
+        };
+
+        stream.cancel();
+        assert!(matches!(stream.next().await, Some(Err(StreamingError::Cancelled))));
+        assert!(dropped.load(Ordering::SeqCst));
         assert!(stream.next().await.is_none());
     }
 
