@@ -40,19 +40,12 @@ jobs:
       - name: Fetch Rust dependencies
         run: |
           for i in 1 2 3 4 5; do
-            cargo fetch && break
+            cargo fetch --locked && break
             if [ "$i" = 5 ]; then
               exit 1
             fi
             sleep $((i * 20))
           done
-
-      - name: Capture resolved Cargo.lock
-        uses: actions/upload-artifact@v4
-        with:
-          name: resolved-cargo-lock
-          path: Cargo.lock
-          if-no-files-found: error
 
       - name: Build Linux CLI
         run: cargo build --release --locked --offline -p mistralrs-cli
