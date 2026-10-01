@@ -2,7 +2,6 @@
 
 use std::{
     io::{self, Write},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -147,7 +146,7 @@ fn print_chunk(chunk: &mistralrs_streaming::ChatChunk) {
 }
 
 async fn consume_reconnect_stream(
-    stream: impl futures_core::Stream<Item = Result<StreamEvent, StreamingError>>,
+    stream: impl futures_util::Stream<Item = Result<StreamEvent, StreamingError>>,
     no_stats: bool,
 ) -> Result<()> {
     let started = Instant::now();
