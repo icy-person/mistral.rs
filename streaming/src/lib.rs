@@ -122,7 +122,6 @@ pub struct Usage {
 }
 
 #[derive(Debug, Clone)]
-#[derive(Debug, Clone)]
 pub enum StreamEvent {
     Chunk(ChatChunk),
     Done,
@@ -483,7 +482,7 @@ fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
         StreamingError::Http(error) => {
             error.is_connect() || error.is_timeout() || error.is_request()
-        },
+        },,
         StreamingError::HttpStatus { status, .. } => {
             matches!(status.as_u16(), 408 | 425 | 429 | 500..=599)
         }
