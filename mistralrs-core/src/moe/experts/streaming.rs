@@ -884,6 +884,7 @@ impl StreamedProjection {
             format: self.format,
             rows: self.rows,
             cols: self.cols,
+            row_start: self.row_start,
             bias: self.bias.clone(),
             cache: self.cache.clone(),
         })
