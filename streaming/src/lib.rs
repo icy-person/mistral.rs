@@ -1161,9 +1161,12 @@ data: {"id":"x","choices":[]}
 
     #[tokio::test]
     async fn chat_stream_preserves_empty_event_id_as_cursor_reset() {
-        let body = futures_util::stream::iter(vec![Ok(Bytes::from(
-            b"id: one\ndata: {\"id\":\"x\",\"choices\":[]}\n\n",
-        )), Ok(Bytes::from(b"id:\ndata: [DONE]\n\n"))]);
+        let body = futures_util::stream::iter(vec![
+            Ok(Bytes::from(
+                b"id: one\ndata: {\"id\":\"x\",\"choices\":[]}\n\n",
+            )),
+            Ok(Bytes::from(b"id:\ndata: [DONE]\n\n")),
+        ]);
 
         let cancellation = tokio_util::sync::CancellationToken::new();
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
@@ -1178,7 +1181,10 @@ data: {"id":"x","choices":[]}
             last_event_id: None,
         };
 
-        assert!(matches!(stream.next().await, Some(Ok(StreamEvent::Chunk(_)))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamEvent::Chunk(_)))
+        ));
         assert_eq!(stream.last_event_id(), Some("one"));
 
         assert!(matches!(stream.next().await, Some(Ok(StreamEvent::Done))));
