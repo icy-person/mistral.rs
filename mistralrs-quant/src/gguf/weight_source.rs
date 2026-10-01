@@ -768,6 +768,82 @@ impl QuantizedWeightSource for GgufWeightSource {
         self.bindings.contains_key(name)
     }
 
+    fn load_moe_streaming_linear(
+        &self,
+        key: &str,
+        device: &Device,
+        shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        if !device.is_cpu() || shard != Shard::default() {
+            return Ok(None);
+        }
+
+        let key = key.strip_suffix(".weight").unwrap_or(key);
+        let Some(rest) = key.strip_prefix("model.layers.") else {
+            return Ok(None);
+        };
+        let Some((layer_str, projection)) = rest.split_once(".mlp.experts.") else {
+            return Ok(None);
+        };
+        let Ok(layer) = layer_str.parse::<usize>() else {
+            return Ok(None);
+        };
+
+        let raw_names = match projection {
+            "gate_up_proj" => vec![
+                format!("blk.{layer}.ffn_gate_exps.weight"),
+                format!("blk.{layer}.ffn_up_exps.weight"),
+            ],
+            "down_proj" => vec![format!("blk.{layer}.ffn_down_exps.weight")],
+            _ => return Ok(None),
+        };
+
+        for raw_name in &raw_names {
+            if !self.archive.tensors().contains_key(raw_name) {
+                return Ok(None);
+            }
+        }
+
+        let first_info = self.archive.tensor_info(&raw_names[0])?;
+        if first_info.dtype().raw() != 39 {
+            return Ok(None);
+        }
+        let first_shape = first_info.shape();
+        if first_shape.len() != 3 {
+            return Ok(None);
+        }
+
+        for raw_name in raw_names.iter().skip(1) {
+            let info = self.archive.tensor_info(raw_name)?;
+            if info.dtype().raw() != 39 || info.shape() != first_shape {
+                return Ok(None);
+            }
+        }
+
+        let num_experts = first_shape[0];
+        let component_out_dim = first_shape[1];
+        let in_dim = first_shape[2];
+        let out_dim = if raw_names.len() == 2 {
+            component_out_dim
+                .checked_mul(2)
+                .ok_or_else(|| Error::msg("GPT-OSS streamed gate/up output size overflow"))?
+        } else {
+            component_out_dim
+        };
+
+        let bias = self.load_bias(key, &Device::Cpu, None, 3)?;
+        let layer = crate::MxFp4StreamingExpertLayer::from_gguf(
+            self.archive.clone(),
+            raw_names,
+            num_experts,
+            in_dim,
+            out_dim,
+            bias,
+        )?;
+
+        Ok(Some(Arc::new(layer)))
+    }
+
     fn load_linear(
         &self,
         key: &str,
