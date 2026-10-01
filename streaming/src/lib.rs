@@ -497,9 +497,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id
-                .filter(|id| !id.is_empty())
-                .map(str::to_owned),
+            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
         })
     }
 
@@ -686,7 +684,6 @@ where
     }
 }
 
-
 pub struct SseParser {
     buffer: BytesMut,
     scan_pos: usize,
@@ -725,8 +722,9 @@ impl SseParser {
     }
 
     fn trailing_incomplete_event_len(&self) -> usize {
-        find_last_boundary_end(&self.buffer)
-            .map_or(self.buffer.len(), |end| self.buffer.len().saturating_sub(end))
+        find_last_boundary_end(&self.buffer).map_or(self.buffer.len(), |end| {
+            self.buffer.len().saturating_sub(end)
+        })
     }
 
     pub fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
