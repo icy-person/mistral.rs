@@ -180,8 +180,6 @@ impl StreamingClientBuilder {
 
         if let Some(timeout) = self.request_timeout {
             builder = builder.timeout(timeout);
-        } else {
-            builder = builder.timeout(None);
         }
 
         if let Some(token) = self.bearer_token {
@@ -351,7 +349,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data_len = 0usize;
 
     for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b'\r').unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -371,7 +369,6 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
 
         if data_lines == 1 {
             single_data = value;
-        } else {
         }
     }
 
@@ -395,7 +392,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut first = true;
 
     for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b'\r').unwrap_or(raw_line);
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -482,25 +479,18 @@ mod tests {
     #[test]
     fn ignores_comments_and_parses_multiline_data() {
         let mut p = parser();
-        p.push(
-            b": heartbeat\nevent: message\ndata: {\"id\":\"x\",\ndata: \"choices\":[]}\n\n",
-        )
-        .unwrap();
+        p.push(b": heartbeat\nevent: message\ndata: {\"id\":\"x\",\ndata: \"choices\":[]}\n\n")
+            .unwrap();
 
-        assert!(matches!(
-            p.next_event(),
-            Some(Ok(StreamEvent::Chunk(_)))
-        ));
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
     }
 
     #[test]
     fn parses_crlf_and_done() {
         let mut p = parser();
-        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n").unwrap();
-        assert!(matches!(
-            p.next_event(),
-            Some(Ok(StreamEvent::Chunk(_)))
-        ));
+        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n")
+            .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
 
         p.push(b"data: [DONE]\r\n\r\n").unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
