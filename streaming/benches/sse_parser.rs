@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::hint::black_box;
 use mistralrs_streaming::SseParser;
+use std::hint::black_box;
 
 const EVENT: &[u8] =
     br#"data: {"id":"chatcmpl-bench","choices":[{"index":0,"delta":{"content":"hello world"}}]}
