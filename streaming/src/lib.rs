@@ -124,8 +124,8 @@ pub enum StreamingError {
     EventTooLarge,
     #[error("SSE stream ended before [DONE]")]
     UnexpectedEof,
-    #[error("SSE data is not valid UTF-8")]
-    InvalidUtf8,
+    #[error("invalid HTTP header value")]
+    InvalidHeader,
 }
 
 impl Default for StreamingClientBuilder {
@@ -184,6 +184,14 @@ impl StreamingClientBuilder {
             builder = builder.timeout(None);
         }
 
+        if let Some(token) = self.bearer_token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| StreamingError::InvalidHeader)?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+
         Ok(StreamingClient {
             client: builder.build()?,
             chat_url,
@@ -200,20 +208,15 @@ impl StreamingClient {
         request.stream = true;
         let started = Instant::now();
 
-        let mut request_builder = self
+        let response = self
             .client
             .post(self.chat_url.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
-            .header(reqwest::header::ACCEPT_ENCODING, "identity");
-
-        // Authorization is intentionally attached per request so the client itself
-        // remains cloneable without exposing credentials through Debug.
-        if let Some(token) = self.client.default_headers().get(reqwest::header::AUTHORIZATION) {
-            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, token);
-        }
-
-        let response = request_builder.json(&request).send().await?;
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .json(&request)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -345,7 +348,6 @@ impl SseParser {
 fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data_lines = 0usize;
     let mut single_data: &[u8] = &[];
-    let mut multiline = false;
     let mut data_len = 0usize;
 
     for raw_line in frame.split(|b| *b == b'\n') {
@@ -370,7 +372,6 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
         if data_lines == 1 {
             single_data = value;
         } else {
-            multiline = true;
         }
     }
 
@@ -417,7 +418,6 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
         data.extend_from_slice(value);
     }
 
-    let _ = multiline;
     if data == b"[DONE]" {
         return Some(Ok(StreamEvent::Done));
     }
