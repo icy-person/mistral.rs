@@ -3,8 +3,8 @@ use mistralrs_streaming::{ChatRequest, Message, StreamEvent, StreamingClient};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let base_url = std::env::var("MISTRALRS_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
+    let base_url =
+        std::env::var("MISTRALRS_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
     let model = std::env::var("MODEL").unwrap_or_else(|_| "default".into());
     let prompt = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {
