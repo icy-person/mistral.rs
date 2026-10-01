@@ -511,7 +511,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            last_event_id: last_event_id.map(str::to_owned),
         })
     }
 
@@ -754,6 +754,12 @@ impl SseParser {
     pub fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
         loop {
             let (frame_len, separator_len) = find_boundary(&self.buffer, &mut self.scan_pos)?;
+            if frame_len > MAX_EVENT_BYTES {
+                self.buffer.advance(frame_len + separator_len);
+                self.scan_pos = 0;
+                return Some(Err(StreamingError::EventTooLarge));
+            }
+
             let frame = self.buffer.split_to(frame_len);
             self.buffer.advance(separator_len);
             self.scan_pos = 0;
@@ -1119,6 +1125,18 @@ data: {"id":"x","choices":[]}
         for _ in 0..count {
             assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
         }
+    }
+
+    #[test]
+    fn rejects_oversized_complete_event() {
+        let mut p = parser();
+        let mut data = vec![b'x'; MAX_EVENT_BYTES];
+        data.extend_from_slice(b"\n\n");
+        p.push(&data).unwrap();
+        assert!(matches!(
+            p.next_event(),
+            Some(Err(StreamingError::EventTooLarge))
+        ));
     }
 
     #[test]
