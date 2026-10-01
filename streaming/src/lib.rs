@@ -630,7 +630,7 @@ where
         loop {
             if let Some(result) = this.parser.next_event() {
                 if let Some(id) = this.parser.last_event_id() {
-                    this.last_event_id = (!id.is_empty()).then_some(id.to_owned());
+                    this.last_event_id = Some(id.to_owned());
                 }
 
                 match result {
@@ -1157,6 +1157,32 @@ data: {"id":"x","choices":[]}
             }
         }
         assert!(p.next_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_preserves_empty_event_id_as_cursor_reset() {
+        let body = futures_util::stream::iter(vec![Ok(Bytes::from(
+            b"id: one\ndata: {\"id\":\"x\",\"choices\":[]}\n\n",
+        )), Ok(Bytes::from(b"id:\ndata: [DONE]\n\n"))]);
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        let mut stream = ChatStream {
+            body: Some(body),
+            parser: SseParser::new(),
+            stats: StreamStats::default(),
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: None,
+        };
+
+        assert!(matches!(stream.next().await, Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(stream.last_event_id(), Some("one"));
+
+        assert!(matches!(stream.next().await, Some(Ok(StreamEvent::Done))));
+        assert_eq!(stream.last_event_id(), Some(""));
     }
 
     #[tokio::test]
