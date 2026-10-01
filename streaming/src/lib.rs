@@ -18,6 +18,35 @@ const READ_BUFFER_CAPACITY: usize = 16 * 1024;
 pub struct StreamingClient {
     client: Client,
     chat_url: Url,
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic(input in proptest::collection::vec(any::<u8>(), 0..8192)) {
+            let mut p = parser();
+            for chunk in input.chunks(37) {
+                let _ = p.push(chunk);
+                let _ = p.next_event();
+            }
+            let _ = p.next_event();
+        }
+
+        #[test]
+        fn valid_event_survives_all_split_points(split in 0usize..=EVENT.len()) {
+            const EVENT: &[u8] = br#"data: {"id":"x","choices":[{"index":0,"delta":{"content":"hello"}}]}
+
+"#;
+            let split = split.min(EVENT.len());
+            let mut p = parser();
+            p.push(&EVENT[..split]).unwrap();
+            let first = p.next_event();
+            p.push(&EVENT[split..]).unwrap();
+            let second = p.next_event();
+
+            prop_assert!(first.is_none() || first.is_some());
+            prop_assert!(matches!(second, Some(Ok(StreamEvent::Chunk(_)))));
+        }
+    }
+
 }
 
 #[derive(Clone)]
