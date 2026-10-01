@@ -65,10 +65,7 @@ Connection: close\r\n\
         .await
 }
 
-async fn write_sse_status(
-    socket: &mut TcpStream,
-    status: &str,
-) -> std::io::Result<()> {
+async fn write_sse_status(socket: &mut TcpStream, status: &str) -> std::io::Result<()> {
     socket
         .write_all(
             format!(
@@ -247,7 +244,10 @@ async fn cancellation_wakes_a_pending_stream_and_is_terminal() {
         .await
         .unwrap();
 
-    match timeout(Duration::from_secs(2), stream.next()).await.unwrap() {
+    match timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+    {
         Some(Ok(StreamEvent::Chunk(chunk))) => {
             assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("A"));
         }
@@ -260,10 +260,7 @@ async fn cancellation_wakes_a_pending_stream_and_is_terminal() {
     cancellation.cancel();
 
     let result = pending.await.unwrap();
-    assert!(matches!(
-        result,
-        Some(Err(StreamingError::Cancelled))
-    ));
+    assert!(matches!(result, Some(Err(StreamingError::Cancelled))));
     assert!(stream.next().await.is_none());
 
     server.abort();
