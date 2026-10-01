@@ -118,9 +118,11 @@ The client now exposes the major Chat Completions streaming controls without cha
 - ChatStream::cancel() convenience cancellation
 - SSE id: tracking and last_event_id()
 - stream_with_resume(...), which sends Last-Event-ID for servers that implement SSE resume semantics
+- stream_with_reconnect(...), with bounded exponential backoff and automatic resume after transport/EOF failures
+- automatic reconnect is enabled only after a server-provided SSE id has been observed, preventing unsafe replay when the server cannot provide a resume cursor
 - generic ChatStream<S>; the normal reqwest body stream is no longer boxed, removing the previous dynamic-dispatch layer from the normal streaming hot path
 
-Resume is deliberately opt-in because the server must support replaying events after Last-Event-ID. The client never silently replays a request, which would risk duplicated model output.
+Resume is deliberately cursor-based: the SSE server must emit event IDs and support replay after Last-Event-ID. The reconnect API does not restart a partially consumed generation from scratch, because doing so could duplicate model output. This follows the SSE reconnection contract, where Last-Event-ID identifies the last successfully dispatched event.
 
 ## Benchmarks and parser fuzz coverage
 
