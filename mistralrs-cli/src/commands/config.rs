@@ -50,6 +50,7 @@ async fn run_serve_config(cfg: crate::config::ServeConfig) -> Result<()> {
         install_prometheus_recorder();
     }
     let global = global.to_global_options()?;
+    runtime.apply_moe_stream_env();
     apply_agent_mode(&mut runtime);
     validate_agent_options(&runtime)?;
     log_agent_runtime(&runtime, server.max_tool_rounds);
@@ -223,6 +224,7 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
     mistralrs_core::resolve_reasoning_controls(thinking, reasoning_effort)?;
 
     let global = global.to_global_options()?;
+    runtime.apply_moe_stream_env();
     apply_agent_mode(&mut runtime);
     validate_agent_options(&runtime)?;
     log_agent_runtime(&runtime, None);
