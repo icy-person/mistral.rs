@@ -300,6 +300,21 @@ impl StreamingClient {
             .await
     }
 
+    pub async fn stream_with_resume_and_cancellation(
+        &self,
+        mut request: ChatRequest,
+        last_event_id: impl AsRef<str>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
+    {
+        self.stream_with_options(
+            &mut request,
+            Some(cancellation),
+            Some(last_event_id.as_ref().to_owned()),
+        )
+        .await
+    }
+
     pub async fn stream_with_reconnect(
         &self,
         request: ChatRequest,
