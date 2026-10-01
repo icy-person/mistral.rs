@@ -160,9 +160,10 @@ pub struct GGUFLoader {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    moe_streaming: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default)
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
@@ -487,6 +488,7 @@ impl GGUFLoader {
             config,
             jinja_explicit,
             encoder_cache_memory_bytes: None,
+            moe_streaming: false,
         }
     }
 
