@@ -424,6 +424,10 @@ impl StreamingClient {
                         );
                     }
                     Some(Err(error)) => {
+                        if let Some(id) = current.last_event_id() {
+                            last_event_id = Some(id.to_owned());
+                        }
+
                         let retryable = is_retryable_stream_error(&error);
                         let resumable = last_event_id
                             .as_deref()
