@@ -1464,9 +1464,36 @@ mod tests {
             "--resume-id",
             "event-7",
             "--no-stats",
-        ]);
+        ])
+        .unwrap();
 
-        assert!(cli.is_err(), "--resume-id + --reconnect should be rejected at runtime, not parser-level");
+        let Command::Stream {
+            model,
+            input,
+            max_tokens,
+            temperature,
+            top_p,
+            reconnect,
+            reconnect_backoff_ms,
+            reconnect_max_backoff_ms,
+            resume_id,
+            no_stats,
+            ..
+        } = cli.command
+        else {
+            panic!("expected stream command");
+        };
+
+        assert_eq!(model, "gpt-oss-20b");
+        assert_eq!(input, "hello");
+        assert_eq!(max_tokens, 256);
+        assert_eq!(temperature, Some(0.2));
+        assert_eq!(top_p, Some(0.9));
+        assert_eq!(reconnect, 5);
+        assert_eq!(reconnect_backoff_ms, 100);
+        assert_eq!(reconnect_max_backoff_ms, 2000);
+        assert_eq!(resume_id.as_deref(), Some("event-7"));
+        assert!(no_stats);
     }
 
     #[test]
