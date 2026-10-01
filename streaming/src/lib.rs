@@ -688,8 +688,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut single_data: &[u8] = &[];
     let mut data_len = 0usize;
 
-    for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    for line in SseLineIter::new(frame) {
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -731,8 +730,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
     let mut data = Vec::with_capacity(data_len + data_lines - 1);
     let mut first = true;
 
-    for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+    for line in SseLineIter::new(frame) {
         if line.is_empty() || line[0] == b':' {
             continue;
         }
@@ -768,9 +766,7 @@ fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
 fn parse_event_id(frame: &[u8]) -> Option<String> {
     let mut event_id = None;
 
-    for raw_line in frame.split(|b| *b == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-
+    for line in SseLineIter::new(frame) {
         let (field, value) = match line.iter().position(|b| *b == b':') {
             Some(colon) => (&line[..colon], line.get(colon + 1..).unwrap_or_default()),
             None => (line, &[][..]),
@@ -789,6 +785,48 @@ fn parse_event_id(frame: &[u8]) -> Option<String> {
     }
 
     event_id
+}
+
+struct SseLineIter<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SseLineIter<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for SseLineIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.bytes.len() {
+            return None;
+        }
+
+        let start = self.pos;
+        let mut i = start;
+
+        while i < self.bytes.len() && self.bytes[i] != b'\n' && self.bytes[i] != b'\r' {
+            i += 1;
+        }
+
+        let line = &self.bytes[start..i];
+        if i >= self.bytes.len() {
+            self.pos = i;
+            return Some(line);
+        }
+
+        self.pos = if self.bytes[i] == b'\r' && self.bytes.get(i + 1) == Some(&b'\n') {
+            i + 2
+        } else {
+            i + 1
+        };
+
+        Some(line)
+    }
 }
 
 fn find_boundary(buffer: &BytesMut, scan_pos: &mut usize) -> Option<(usize, usize)> {
