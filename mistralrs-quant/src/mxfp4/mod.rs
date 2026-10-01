@@ -470,7 +470,7 @@ impl MXFP4Layer {
         vb: ShardedVarBuilder,
     ) -> Result<Arc<dyn QuantMethod>> {
         if !Self::device_supported(vb.device()) {
-            candle_core::bail!("MXFP4Layer requires CUDA or Metal device.");
+            candle_core::bail!("MXFP4Layer requires a supported CPU, CUDA, or Metal device.");
         }
 
         let QuantizedConfig::MXFP4 {} = config else {
@@ -735,12 +735,12 @@ impl MXFP4Layer {
         }
 
         let blocks_dims = self.blocks.dims();
-        let (n, weight_k_half) = if blocks_dims.len() == 3 {
-            (blocks_dims[1], blocks_dims[2])
-        } else if blocks_dims.len() == 2 {
-            (blocks_dims[0], blocks_dims[1])
-        } else {
-            candle_core::bail!("MXFP4 CPU fallback expects rank-2 or rank-3 packed weights");
+        let (n, weight_k_half) = match blocks_dims {
+            [n, k_half] => (*n, *k_half),
+            _ => candle_core::bail!(
+                "MXFP4 CPU forward expects rank-2 packed weights, got rank {}",
+                blocks_dims.len()
+            ),
         };
         let expected_k = weight_k_half * 2;
         if k != expected_k {
@@ -833,11 +833,25 @@ impl MXFP4Layer {
     fn gather_forward_dequantize(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
         let x_dims = x.dims();
         let indices_dims = indices.dims();
+        if indices_dims.len() != 2 {
+            candle_core::bail!(
+                "MXFP4 CPU MoE fallback expects rank-2 expert indices, got rank {}",
+                indices_dims.len()
+            );
+        }
 
         let (num_tokens, topk, k, x_has_topk) = if x_dims.len() == 2 {
             (x_dims[0], indices_dims[1], x_dims[1], false)
-        } else {
+        } else if x_dims.len() == 3 {
+            if x_dims[0] != indices_dims[0] || x_dims[1] != indices_dims[1] {
+                candle_core::bail!("MXFP4 CPU MoE input and indices shapes do not agree");
+            }
             (x_dims[0], x_dims[1], x_dims[2], true)
+        } else {
+            candle_core::bail!(
+                "MXFP4 CPU MoE fallback expects rank-2 or rank-3 input, got rank {}",
+                x_dims.len()
+            );
         };
 
         if !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
@@ -906,12 +920,32 @@ impl MXFP4Layer {
             })
             .transpose()?;
 
+        if let Some(bias) = &bias_data {
+            let expected = self.blocks.dims()[0] * n;
+            if bias.len() != expected {
+                candle_core::bail!(
+                    "MXFP4 CPU MoE bias has {} elements, expected {}",
+                    bias.len(),
+                    expected
+                );
+            }
+        }
+
+        let num_experts = self.blocks.dims()[0];
+
         // output: [num_tokens * topk, n]
         let mut output = vec![0f32; num_tokens * topk * n];
 
         for token_idx in 0..num_tokens {
             for slot_idx in 0..topk {
                 let expert_idx = indices_data[token_idx * topk + slot_idx] as usize;
+                if expert_idx >= num_experts {
+                    candle_core::bail!(
+                        "MXFP4 CPU MoE expert index {} out of range for {} experts",
+                        expert_idx,
+                        num_experts
+                    );
+                }
                 let out_row = token_idx * topk + slot_idx;
 
                 // Get input row
