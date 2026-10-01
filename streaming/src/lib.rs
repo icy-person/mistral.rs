@@ -306,7 +306,7 @@ impl StreamingClient {
         request: ChatRequest,
         policy: ReconnectPolicy,
     ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
-        self.stream_with_reconnect_and_cancellation(request, policy, None)
+        self.stream_with_reconnect_internal(request, policy, None)
             .await
     }
 
@@ -316,21 +316,43 @@ impl StreamingClient {
         policy: ReconnectPolicy,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
+        self.stream_with_reconnect_internal(request, policy, Some(cancellation))
+            .await
+    }
+
+    async fn stream_with_reconnect_internal(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<impl Stream<Item = Result<StreamEvent, StreamingError>>, StreamingError> {
         let client = self.clone();
         let stream = async_stream::try_stream! {
             let mut last_event_id: Option<String> = None;
             let mut retries = 0u32;
-            let mut delay = policy.initial_backoff;
+            let mut delay = std::cmp::min(policy.initial_backoff, policy.max_backoff);
 
             loop {
-                let mut current = tokio::select! {
-                    _ = cancellation.cancelled() => Err(StreamingError::Cancelled)?,
-                    result = client.stream_boxed_resume(
-                        request.clone(),
-                        last_event_id.as_deref().filter(|id| !id.is_empty()),
-                        Some(cancellation.clone()),
-                    ) => result?,
+                let result = match cancellation.as_ref() {
+                    Some(token) => tokio::select! {
+                        _ = token.cancelled() => Err(StreamingError::Cancelled),
+                        result = client.stream_boxed_resume(
+                            request.clone(),
+                            last_event_id.as_deref().filter(|id| !id.is_empty()),
+                            cancellation.clone(),
+                        ) => result,
+                    },
+                    None => {
+                        client
+                            .stream_boxed_resume(
+                                request.clone(),
+                                last_event_id.as_deref().filter(|id| !id.is_empty()),
+                                None,
+                            )
+                            .await
+                    }
                 };
+                let mut current = result?;
 
                 loop {
                     match current.next().await {
@@ -347,7 +369,7 @@ impl StreamingClient {
                             }
 
                             retries = 0;
-                            delay = policy.initial_backoff;
+                            delay = std::cmp::min(policy.initial_backoff, policy.max_backoff);
                         }
                         Some(Err(error)) => {
                             let retryable = is_retryable_stream_error(&error);
@@ -360,10 +382,21 @@ impl StreamingClient {
                             }
 
                             retries += 1;
-                            tokio::select! {
-                                _ = cancellation.cancelled() => Err(StreamingError::Cancelled)?,
-                                _ = tokio::time::sleep(delay) => {}
+                            let cancelled = match cancellation.as_ref() {
+                                Some(token) => tokio::select! {
+                                    _ = token.cancelled() => true,
+                                    _ = tokio::time::sleep(delay) => false,
+                                },
+                                None => {
+                                    tokio::time::sleep(delay).await;
+                                    false
+                                }
+                            };
+
+                            if cancelled {
+                                Err(StreamingError::Cancelled)?;
                             }
+
                             delay = std::cmp::min(
                                 delay.saturating_mul(2),
                                 policy.max_backoff,
