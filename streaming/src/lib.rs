@@ -497,7 +497,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            last_event_id: last_event_id.filter(|id| !id.is_empty()),
         })
     }
 
@@ -554,6 +554,8 @@ impl StreamingClient {
     }
 }
 
+type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
 fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
         StreamingError::Http(error) => {
@@ -609,7 +611,7 @@ where
         }
 
         if this.cancelled.as_mut().poll(cx).is_ready() {
-            *this.stats.finished = Some(Instant::now());
+            this.stats.finished = Some(Instant::now());
             *this.finished = true;
             return Poll::Ready(Some(Err(StreamingError::Cancelled)));
         }
@@ -624,26 +626,26 @@ where
             if let Some(result) = parsed {
                 match result {
                     Ok(StreamEvent::Done) => {
-                        *this.stats.finished = Some(Instant::now());
+                        this.stats.finished = Some(Instant::now());
                         *this.finished = true;
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
-                        *this.stats.chunks += 1;
+                        this.stats.chunks += 1;
 
                         for choice in &chunk.choices {
                             if let Some(text) = &choice.delta.content {
                                 if !text.is_empty() {
                                     this.stats.first_output.get_or_insert_with(Instant::now);
-                                    *this.stats.content_bytes += text.len() as u64;
-                                    *this.stats.output_events += 1;
+                                    this.stats.content_bytes += text.len() as u64;
+                                    this.stats.output_events += 1;
                                 }
                             }
 
                             if let Some(text) = &choice.delta.reasoning {
                                 if !text.is_empty() {
                                     this.stats.first_output.get_or_insert_with(Instant::now);
-                                    *this.stats.reasoning_bytes += text.len() as u64;
+                                    this.stats.reasoning_bytes += text.len() as u64;
                                 }
                             }
                         }
@@ -651,7 +653,7 @@ where
                         return Poll::Ready(Some(Ok(StreamEvent::Chunk(chunk))));
                     }
                     Err(error) => {
-                        *this.stats.finished = Some(Instant::now());
+                        this.stats.finished = Some(Instant::now());
                         *this.finished = true;
                         return Poll::Ready(Some(Err(error)));
                     }
@@ -661,18 +663,18 @@ where
             match this.body.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
                     if let Err(error) = this.parser.push(&bytes) {
-                        *this.stats.finished = Some(Instant::now());
+                        this.stats.finished = Some(Instant::now());
                         *this.finished = true;
                         return Poll::Ready(Some(Err(error)));
                     }
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    *this.stats.finished = Some(Instant::now());
+                    this.stats.finished = Some(Instant::now());
                     *this.finished = true;
                     return Poll::Ready(Some(Err(StreamingError::Http(error))));
                 }
                 Poll::Ready(None) => {
-                    *this.stats.finished = Some(Instant::now());
+                    this.stats.finished = Some(Instant::now());
                     *this.finished = true;
                     return Poll::Ready(Some(Err(StreamingError::UnexpectedEof)));
                 }
