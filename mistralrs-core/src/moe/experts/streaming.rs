@@ -29,7 +29,7 @@ use std::os::unix::fs::OpenOptionsExt;
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct MoeStreamConfig {
     pub enabled: bool,
     pub cache_mb: Option<usize>,
