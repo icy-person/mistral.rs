@@ -680,7 +680,6 @@ where
     }
 }
 
-
 pub struct SseParser {
     buffer: BytesMut,
     scan_pos: usize,
