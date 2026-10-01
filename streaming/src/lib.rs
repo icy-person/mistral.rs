@@ -414,7 +414,7 @@ impl StreamingClient {
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-        if let Some(id) = last_event_id.filter(|id| !id.is_empty()).as_deref() {
+        if let Some(id) = last_event_id.as_deref().filter(|id| !id.is_empty()) {
             builder = builder.header("Last-Event-ID", id);
         }
 
