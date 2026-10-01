@@ -1235,7 +1235,7 @@ impl MistralRsForServerBuilder {
                     .clone()
                     .or(self.num_device_layers.clone()),
                 &auto_device_map_params,
-                self.cpu,
+                self.cpu || device.is_cpu(),
             );
             let mapper_for_config = mapper.clone();
 
@@ -1420,7 +1420,7 @@ fn init_mapper(
     auto_device_map_params: &AutoDeviceMapParams,
     force_cpu: bool,
 ) -> DeviceMapSetting {
-    // A forced CPU run has exactly one physical execution device. Avoid the
+    // A CPU-backed run has exactly one physical execution device. Avoid the
     // automatic layer mapper here: it cannot improve placement and its
     // available-memory check would reject models that intentionally rely on
     // host virtual memory (for example a large GGUF with swap/zram).
