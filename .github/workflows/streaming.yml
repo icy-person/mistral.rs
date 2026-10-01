@@ -1,0 +1,27 @@
+name: streaming
+
+on:
+  push:
+    paths:
+      - "streaming/**"
+      - ".github/workflows/streaming.yml"
+  pull_request:
+    paths:
+      - "streaming/**"
+      - ".github/workflows/streaming.yml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: streaming
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo test --release
+      - run: cargo clippy --all-targets -- -D warnings
