@@ -1,11 +1,13 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use mistralrs_streaming::SseParser;
 
-const EVENT: &[u8] = br#"data: {"id":"chatcmpl-bench","choices":[{"index":0,"delta":{"content":"hello world"}}]}
+const EVENT: &[u8] =
+    br#"data: {"id":"chatcmpl-bench","choices":[{"index":0,"delta":{"content":"hello world"}}]}
 
 "#;
 
-const CRLF_EVENT: &[u8] = br#"data: {"id":"chatcmpl-bench","choices":[{"index":0,"delta":{"content":"hello world"}}]}
+const CRLF_EVENT: &[u8] =
+    br#"data: {"id":"chatcmpl-bench","choices":[{"index":0,"delta":{"content":"hello world"}}]}
 
 "#;
 
