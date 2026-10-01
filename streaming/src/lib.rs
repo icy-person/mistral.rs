@@ -314,7 +314,6 @@ impl SseParser {
         self.buffer.advance(separator_len);
 
         let mut data = String::new();
-        let mut event_name: Option<&[u8]> = None;
         for raw_line in frame.split(|b| *b == b'\n') {
             let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
             if line.is_empty() || line[0] == b':' {
@@ -326,7 +325,6 @@ impl SseParser {
             let field = &line[..colon];
             let value = line.get(colon + 1..).unwrap_or_default();
             if field == b"event" {
-                event_name = Some(value.strip_prefix(b" ").unwrap_or(value));
                 continue;
             }
             if field != b"data" {
