@@ -1066,7 +1066,10 @@ impl StreamedExpertsWeights {
             return Ok(None);
         };
 
-        if gate.cols != cfg.hidden_size
+        if gate.expert_count != cfg.num_experts
+            || up.expert_count != cfg.num_experts
+            || down.expert_count != cfg.num_experts
+            || gate.cols != cfg.hidden_size
             || up.cols != cfg.hidden_size
             || down.cols != cfg.moe_intermediate_size
             || gate.rows != cfg.moe_intermediate_size
