@@ -8,8 +8,10 @@ The hot path is deliberately small:
 
 1. `reqwest::Response::bytes_stream()` receives network chunks incrementally.
 2. `BytesMut` buffers only incomplete SSE frames.
-3. SSE framing supports both `LF` and `CRLF`, comments, and multiple `data:` lines.
-4. Complete JSON payloads are deserialized into structured `ChatChunk` values.
+3. A scan cursor prevents repeatedly rescanning the same incomplete bytes.
+4. SSE framing supports both `LF` and `CRLF`, comments, and multiple `data:` lines.
+5. Single-line `data:` frames go directly from bytes into `serde_json`, avoiding an intermediate `String`; multiline frames are assembled only when required.
+6. Complete JSON payloads are deserialized into structured `ChatChunk` values.
 5. The async `Stream` yields immediately; no polling thread or per-token task is created.
 
 The client is independent from the main mistral.rs workspace, so it can be benchmarked or integrated without changing the existing server path.
@@ -23,8 +25,10 @@ The client is independent from the main mistral.rs workspace, so it can be bench
 - 8 MiB maximum incomplete SSE frame to bound memory use.
 - Backpressure comes naturally from the consumer: the next network chunk is not polled until the caller asks for the next event.
 - Dropping `ChatStream` drops the response body and cancels the HTTP request.
-- TTFT starts at request dispatch and is recorded on the first non-empty generated text.
-- No token-by-token `String` allocation in the stream hot path for statistics.
+- TTFT starts at request dispatch and is recorded on the first non-empty content or reasoning delta.
+- No token-by-token `String` allocation in the parser hot path for ordinary single-line SSE frames.
+- `stream` is enforced to `true` by the streaming API, preventing accidental non-stream requests.
+- Optional Bearer authentication is supported by the builder.
 
 ## API
 
@@ -67,6 +71,8 @@ The CLI flushes stdout after each received chunk, so generated text becomes visi
 
     let client = StreamingClient::builder()
         .base_url("http://127.0.0.1:1234/v1")
+        // Optional for OpenAI-compatible servers that require authentication.
+        // .bearer_token(std::env::var("OPENAI_API_KEY")?)
         .build()?;
 
     let request = ChatRequest {
