@@ -306,6 +306,7 @@ pub struct GGUFLoaderBuilder {
     config: GGUFSpecificConfig,
     jinja_explicit: Option<String>,
     encoder_cache_memory_bytes: Option<usize>,
+    moe_streaming: bool,
 }
 
 impl GGUFLoaderBuilder {
@@ -345,6 +346,12 @@ impl GGUFLoaderBuilder {
 
     pub fn with_tokenizer_json(mut self, tokenizer_json: String) -> Self {
         self.tokenizer_json = Some(tokenizer_json);
+        self
+    }
+
+    /// Enable routed-expert streaming for supported native GGUF MoE models.
+    pub fn with_moe_streaming(mut self, enabled: bool) -> Self {
+        self.moe_streaming = enabled;
         self
     }
 
@@ -433,6 +440,7 @@ impl GGUFLoaderBuilder {
             config: self.config,
             jinja_explicit: self.jinja_explicit,
             encoder_cache_memory_bytes: self.encoder_cache_memory_bytes,
+            moe_streaming: self.moe_streaming,
         })
     }
 }
@@ -689,7 +697,9 @@ impl GGUFLoader {
             &bindings,
             internal_dtype,
         )?);
-        let weights = source.sharded_var_builder(Device::Cpu);
+        let weights = source
+            .sharded_var_builder(Device::Cpu)
+            .with_moe_streaming(self.moe_streaming);
 
         let tokenizer = self.resolve_tokenizer(paths, archive.metadata())?;
         let generation_config = self.resolve_generation_config(paths, &tokenizer);
