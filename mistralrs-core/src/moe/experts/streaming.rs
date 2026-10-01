@@ -902,9 +902,10 @@ impl StreamedProjection {
         let mut output = Tensor::zeros((x.dim(0)?, self.rows), x.dtype(), device)?;
 
         for entry in plan.entries {
-            let pending = entry
-                .pending
-                .unwrap_or(self.schedule(entry.expert)?);
+            let pending = match entry.pending {
+                Some(pending) => pending,
+                None => self.schedule(entry.expert)?,
+            };
             let weight = pending.wait(device)?;
 
             let input = if input_is_routed {
