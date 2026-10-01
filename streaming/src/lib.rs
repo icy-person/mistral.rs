@@ -25,6 +25,7 @@ pub struct StreamingClientBuilder {
     base_url: String,
     connect_timeout: Duration,
     request_timeout: Option<Duration>,
+    bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,8 +124,8 @@ pub enum StreamingError {
     EventTooLarge,
     #[error("SSE stream ended before [DONE]")]
     UnexpectedEof,
-    #[error("server error: {0}")]
-    Server(String),
+    #[error("SSE data is not valid UTF-8")]
+    InvalidUtf8,
 }
 
 impl Default for StreamingClientBuilder {
@@ -133,6 +134,7 @@ impl Default for StreamingClientBuilder {
             base_url: DEFAULT_BASE_URL.to_owned(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: None,
+            bearer_token: None,
         }
     }
 }
@@ -154,6 +156,11 @@ impl StreamingClientBuilder {
 
     pub fn request_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    pub fn bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
         self
     }
 
@@ -189,16 +196,24 @@ impl StreamingClient {
         StreamingClientBuilder::new()
     }
 
-    pub async fn stream(&self, request: ChatRequest) -> Result<ChatStream, StreamingError> {
+    pub async fn stream(&self, mut request: ChatRequest) -> Result<ChatStream, StreamingError> {
+        request.stream = true;
         let started = Instant::now();
-        let response = self
+
+        let mut request_builder = self
             .client
             .post(self.chat_url.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
-            .json(&request)
-            .send()
-            .await?;
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+
+        // Authorization is intentionally attached per request so the client itself
+        // remains cloneable without exposing credentials through Debug.
+        if let Some(token) = self.client.default_headers().get(reqwest::header::AUTHORIZATION) {
+            request_builder = request_builder.header(reqwest::header::AUTHORIZATION, token);
+        }
+
+        let response = request_builder.json(&request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -245,20 +260,24 @@ impl Stream for ChatStream {
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
                         self.stats.chunks += 1;
+
                         for choice in &chunk.choices {
                             if let Some(text) = &choice.delta.content {
                                 if !text.is_empty() {
-                                    if self.stats.first_output.is_none() {
-                                        self.stats.first_output = Some(Instant::now());
-                                    }
+                                    self.stats.first_output.get_or_insert_with(Instant::now);
                                     self.stats.content_bytes += text.len() as u64;
                                     self.stats.output_events += 1;
                                 }
                             }
+
                             if let Some(text) = &choice.delta.reasoning {
-                                self.stats.reasoning_bytes += text.len() as u64;
+                                if !text.is_empty() {
+                                    self.stats.first_output.get_or_insert_with(Instant::now);
+                                    self.stats.reasoning_bytes += text.len() as u64;
+                                }
                             }
                         }
+
                         return Poll::Ready(Some(Ok(StreamEvent::Chunk(chunk))));
                     }
                     Err(error) => return Poll::Ready(Some(Err(error))),
@@ -275,7 +294,7 @@ impl Stream for ChatStream {
                     return Poll::Ready(Some(Err(StreamingError::Http(error))));
                 }
                 Poll::Ready(None) => {
-                    self.stats.finished = Some(Instant::now());
+                    self.stats.finished.get_or_insert_with(Instant::now);
                     if self.saw_done {
                         return Poll::Ready(None);
                     }
@@ -289,91 +308,150 @@ impl Stream for ChatStream {
 
 struct SseParser {
     buffer: BytesMut,
+    scan_pos: usize,
 }
 
 impl SseParser {
     fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(READ_BUFFER_CAPACITY),
+            scan_pos: 0,
         }
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<(), StreamingError> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() > MAX_EVENT_BYTES {
+        if self.buffer.len().saturating_add(bytes.len()) > MAX_EVENT_BYTES {
             return Err(StreamingError::EventTooLarge);
         }
+        self.buffer.extend_from_slice(bytes);
         Ok(())
     }
 
     fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
-        let boundary = find_boundary(&self.buffer)?;
-        let frame_len = boundary.0;
-        let separator_len = boundary.1;
-        let frame = self.buffer.split_to(frame_len);
-        self.buffer.advance(separator_len);
+        loop {
+            let (frame_len, separator_len) = find_boundary(&self.buffer, &mut self.scan_pos)?;
+            let frame = self.buffer.split_to(frame_len);
+            self.buffer.advance(separator_len);
+            self.scan_pos = 0;
 
-        let mut data = String::new();
-        for raw_line in frame.split(|b| *b == b'\n') {
-            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-            if line.is_empty() || line[0] == b':' {
-                continue;
+            match parse_frame(&frame) {
+                None => continue,
+                Some(result) => return Some(result),
             }
-            let Some(colon) = line.iter().position(|b| *b == b':') else {
-                continue;
-            };
-            let field = &line[..colon];
-            let value = line.get(colon + 1..).unwrap_or_default();
-            if field == b"event" {
-                continue;
-            }
-            if field != b"data" {
-                continue;
-            }
-            let value = value.strip_prefix(b" ").unwrap_or(value);
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            match std::str::from_utf8(value) {
-                Ok(value) => data.push_str(value),
-                Err(_) => {
-                    return Some(Err(StreamingError::Server(
-                        "SSE data is not UTF-8".into(),
-                    )))
-                }
-            }
-        }
-
-        if data.is_empty() {
-            return self.next_event();
-        }
-
-        if data == "[DONE]" {
-            return Some(Ok(StreamEvent::Done));
-        }
-
-        match serde_json::from_str::<ChatChunk>(&data) {
-            Ok(chunk) => Some(Ok(StreamEvent::Chunk(chunk))),
-            Err(error) => Some(Err(error.into())),
         }
     }
 }
 
-fn find_boundary(buffer: &BytesMut) -> Option<(usize, usize)> {
+fn parse_frame(frame: &[u8]) -> Option<Result<StreamEvent, StreamingError>> {
+    let mut data_lines = 0usize;
+    let mut single_data: &[u8] = &[];
+    let mut multiline = false;
+    let mut data_len = 0usize;
+
+    for raw_line in frame.split(|b| *b == b'\n') {
+        let line = raw_line.strip_suffix(b'\r').unwrap_or(raw_line);
+        if line.is_empty() || line[0] == b':' {
+            continue;
+        }
+
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+
+        if &line[..colon] != b"data" {
+            continue;
+        }
+
+        let value = line.get(colon + 1..).unwrap_or_default();
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        data_lines += 1;
+        data_len += value.len();
+
+        if data_lines == 1 {
+            single_data = value;
+        } else {
+            multiline = true;
+        }
+    }
+
+    if data_lines == 0 {
+        return None;
+    }
+
+    if data_lines == 1 {
+        if single_data == b"[DONE]" {
+            return Some(Ok(StreamEvent::Done));
+        }
+
+        return Some(
+            serde_json::from_slice::<ChatChunk>(single_data)
+                .map(StreamEvent::Chunk)
+                .map_err(StreamingError::Json),
+        );
+    }
+
+    let mut data = Vec::with_capacity(data_len + data_lines - 1);
+    let mut first = true;
+
+    for raw_line in frame.split(|b| *b == b'\n') {
+        let line = raw_line.strip_suffix(b'\r').unwrap_or(raw_line);
+        if line.is_empty() || line[0] == b':' {
+            continue;
+        }
+
+        let Some(colon) = line.iter().position(|b| *b == b':') else {
+            continue;
+        };
+
+        if &line[..colon] != b"data" {
+            continue;
+        }
+
+        let value = line.get(colon + 1..).unwrap_or_default();
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+
+        if !first {
+            data.push(b'\n');
+        }
+        first = false;
+        data.extend_from_slice(value);
+    }
+
+    let _ = multiline;
+    if data == b"[DONE]" {
+        return Some(Ok(StreamEvent::Done));
+    }
+
+    match serde_json::from_slice::<ChatChunk>(&data) {
+        Ok(chunk) => Some(Ok(StreamEvent::Chunk(chunk))),
+        Err(error) => Some(Err(StreamingError::Json(error))),
+    }
+}
+
+fn find_boundary(buffer: &BytesMut, scan_pos: &mut usize) -> Option<(usize, usize)> {
     let bytes = buffer.as_ref();
-    for i in 0..bytes.len().saturating_sub(1) {
+    let mut i = (*scan_pos).min(bytes.len());
+
+    while i + 1 < bytes.len() {
         if bytes[i] == b'\n' && bytes[i + 1] == b'\n' {
+            *scan_pos = i;
             return Some((i, 2));
         }
+
         if i + 3 < bytes.len()
             && bytes[i] == b'\r'
             && bytes[i + 1] == b'\n'
             && bytes[i + 2] == b'\r'
             && bytes[i + 3] == b'\n'
         {
+            *scan_pos = i;
             return Some((i, 4));
         }
+
+        i += 1;
     }
+
+    *scan_pos = i.saturating_sub(1);
     None
 }
 
@@ -388,24 +466,88 @@ mod tests {
     #[test]
     fn parses_split_frame() {
         let mut p = parser();
-        p.push(b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel");
+        p.push(b"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel")
+            .unwrap();
         assert!(p.next_event().is_none());
-        p.push(b"lo\"}}]}\n\n");
+
+        p.push(b"lo\"}}]}\n\n").unwrap();
         match p.next_event().unwrap().unwrap() {
-            StreamEvent::Chunk(chunk) => assert_eq!(
-                chunk.choices[0].delta.content.as_deref(),
-                Some("hello")
-            ),
+            StreamEvent::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hello"));
+            }
             StreamEvent::Done => panic!(),
         }
     }
 
     #[test]
-    fn ignores_comments_and_parses_multiline_data() {\n        let mut p = parser();\n        p.push(b": heartbeat\\n event: message\\n data: {\\"id\\":\\"x\\",\\n data: \\n data: \\n data: {\\"choices\\":[]}\\n\\n");\n        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));\n    }\n\n    #[test]\n    fn parses_crlf_and_done() {
+    fn ignores_comments_and_parses_multiline_data() {
         let mut p = parser();
-        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n");
-        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
-        p.push(b"data: [DONE]\r\n\r\n");
+        p.push(
+            b": heartbeat\nevent: message\ndata: {\"id\":\"x\",\ndata: \"choices\":[]}\n\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            p.next_event(),
+            Some(Ok(StreamEvent::Chunk(_)))
+        ));
+    }
+
+    #[test]
+    fn parses_crlf_and_done() {
+        let mut p = parser();
+        p.push(b"data: {\"id\":\"x\",\"choices\":[]}\r\n\r\n").unwrap();
+        assert!(matches!(
+            p.next_event(),
+            Some(Ok(StreamEvent::Chunk(_)))
+        ));
+
+        p.push(b"data: [DONE]\r\n\r\n").unwrap();
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[test]
+    fn skips_empty_and_comment_only_frames_without_recursion() {
+        let mut p = parser();
+        p.push(b": one\n\n: two\n\ndata: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+    }
+
+    #[test]
+    fn parses_usage_only_chunk() {
+        let mut p = parser();
+        p.push(
+            br#"data: {"id":"x","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
+
+"#,
+        )
+        .unwrap();
+
+        match p.next_event().unwrap().unwrap() {
+            StreamEvent::Chunk(chunk) => {
+                assert_eq!(chunk.usage.unwrap().total_tokens, Some(15));
+            }
+            StreamEvent::Done => panic!(),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_incomplete_event() {
+        let mut p = parser();
+        let data = vec![b'x'; MAX_EVENT_BYTES];
+        assert!(p.push(&data).is_ok());
+        assert!(matches!(p.push(b"x"), Err(StreamingError::EventTooLarge)));
+    }
+
+    #[test]
+    fn boundary_scan_survives_incremental_pushes() {
+        let mut p = parser();
+        for byte in b"data: [DONE]\n\n" {
+            p.push(std::slice::from_ref(byte)).unwrap();
+            if *byte == b'\n' {
+                let _ = p.next_event();
+            }
+        }
+        assert!(p.next_event().is_none());
     }
 }
