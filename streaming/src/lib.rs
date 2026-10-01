@@ -393,7 +393,9 @@ impl StreamingClient {
             },
             saw_done: false,
             cancellation: None,
-            last_event_id: last_event_id.map(str::to_owned),
+            last_event_id: last_event_id
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned),
         })
     }
 
@@ -414,7 +416,7 @@ impl StreamingClient {
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .header(reqwest::header::ACCEPT_ENCODING, "identity");
 
-        if let Some(id) = last_event_id.as_deref() {
+        if let Some(id) = last_event_id.filter(|id| !id.is_empty()).as_deref() {
             builder = builder.header("Last-Event-ID", id);
         }
 
@@ -487,19 +489,17 @@ where
             if let Some(result) = self.parser.next_event() {
                 match result {
                     Ok(StreamEvent::Done) => {
-                        self.last_event_id = self
-                            .parser
-                            .take_last_event_id()
-                            .or_else(|| self.last_event_id.clone());
+                        if let Some(id) = self.parser.take_last_event_id() {
+                            self.last_event_id = (!id.is_empty()).then_some(id);
+                        }
                         self.saw_done = true;
                         self.stats.finished = Some(Instant::now());
                         return Poll::Ready(Some(Ok(StreamEvent::Done)));
                     }
                     Ok(StreamEvent::Chunk(chunk)) => {
-                        self.last_event_id = self
-                            .parser
-                            .take_last_event_id()
-                            .or_else(|| self.last_event_id.clone());
+                        if let Some(id) = self.parser.take_last_event_id() {
+                            self.last_event_id = (!id.is_empty()).then_some(id);
+                        }
                         self.stats.chunks += 1;
 
                         for choice in &chunk.choices {
@@ -750,6 +750,19 @@ mod tests {
             .unwrap();
 
         assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+    }
+
+    #[test]
+    fn tracks_and_clears_sse_event_id() {
+        let mut p = parser();
+        p.push(b"id: one\ndata: {"id":"x","choices":[]}\n\n")
+            .unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Chunk(_)))));
+        assert_eq!(p.take_last_event_id().as_deref(), Some("one"));
+
+        p.push(b"id:\ndata: [DONE]\n\n").unwrap();
+        assert!(matches!(p.next_event(), Some(Ok(StreamEvent::Done))));
+        assert_eq!(p.take_last_event_id().as_deref(), Some(""));
     }
 
     #[test]
