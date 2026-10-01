@@ -8,8 +8,7 @@ use std::{
 use anyhow::Result;
 use futures_util::StreamExt;
 use mistralrs_streaming::{
-    ChatRequest, Message, ReconnectPolicy, StreamEvent, StreamingClient,
-    StreamingError,
+    ChatRequest, Message, ReconnectPolicy, StreamEvent, StreamingClient, StreamingError,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -32,7 +31,9 @@ pub(crate) async fn run_stream(
     _global: GlobalOptions,
 ) -> Result<()> {
     if reconnect > 0 && resume_id.is_some() {
-        anyhow::bail!("--resume-id cannot be combined with --reconnect; reconnect resumes automatically from SSE event ids");
+        anyhow::bail!(
+            "--resume-id cannot be combined with --reconnect; reconnect resumes automatically              from SSE event ids"
+        );
     }
 
     let mut builder = StreamingClient::builder()
