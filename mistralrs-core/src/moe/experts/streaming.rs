@@ -418,18 +418,27 @@ fn io_worker(
     io: &IoState,
     direct_requested: bool,
 ) {
-    let mut files = paths
-        .iter()
-        .map(|path| open_io_file(path, direct_requested).ok())
-        .collect::<Vec<_>>();
-    let mut direct_modes = vec![direct_requested; paths.len()];
+    let mut files = Vec::with_capacity(paths.len());
+    let mut direct_modes = Vec::with_capacity(paths.len());
 
-    if direct_requested {
-        for (index, file) in files.iter().enumerate() {
-            if file.is_none() {
-                direct_modes[index] = false;
-                io.effective_o_direct.store(false, Ordering::Relaxed);
+    for path in paths {
+        if direct_requested {
+            match open_io_file(path, true) {
+                Ok(file) => {
+                    files.push(Some(file));
+                    direct_modes.push(true);
+                }
+                Err(_) => {
+                    // O_DIRECT is best-effort. Some filesystems (or mounts) reject it.
+                    // Fall back to buffered reads for that shard instead of disabling the lane.
+                    files.push(open_io_file(path, false).ok());
+                    direct_modes.push(false);
+                    io.effective_o_direct.store(false, Ordering::Relaxed);
+                }
             }
+        } else {
+            files.push(open_io_file(path, false).ok());
+            direct_modes.push(false);
         }
     }
 
