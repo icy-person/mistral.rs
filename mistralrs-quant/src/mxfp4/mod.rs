@@ -335,6 +335,63 @@ impl MXFP4Layer {
         false
     }
 
+    /// Construct one logical [rows, cols] MXFP4 matrix from a raw GGUF byte range.
+    ///
+    /// GGUF MXFP4 stores every 32-value block as one E8M0 scale byte followed by 16 packed
+    /// FP4 bytes. The streamed expert reader slices on complete rows, so converting a single
+    /// expert never requires loading the whole [experts, rows, cols] tensor.
+    pub fn from_gguf_bytes(
+        data: &[u8],
+        rows: usize,
+        cols: usize,
+        bias: Option<Tensor>,
+        device: &Device,
+    ) -> Result<Self> {
+        if cols == 0 || !cols.is_multiple_of(MXFP4_BLOCK_SIZE) {
+            candle_core::bail!(
+                "MXFP4 streamed matrix requires cols divisible by {}, got {}",
+                MXFP4_BLOCK_SIZE,
+                cols
+            );
+        }
+
+        let blocks_per_row = cols / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (1 + MXFP4_BLOCK_SIZE / 2);
+        let expected = rows
+            .checked_mul(row_bytes)
+            .ok_or_else(|| candle_core::Error::Msg("MXFP4 byte-size overflow".to_string()))?;
+        if data.len() != expected {
+            candle_core::bail!(
+                "MXFP4 streamed matrix has {} bytes, expected {}",
+                data.len(),
+                expected
+            );
+        }
+
+        let mut blocks = Vec::with_capacity(rows * (cols / 2));
+        let mut scales = Vec::with_capacity(rows * blocks_per_row);
+
+        for row in 0..rows {
+            let row_data = &data[row * row_bytes..(row + 1) * row_bytes];
+            for block in 0..blocks_per_row {
+                let start = block * (1 + MXFP4_BLOCK_SIZE / 2);
+                scales.push(row_data[start]);
+                blocks.extend_from_slice(
+                    &row_data[start + 1..start + 1 + MXFP4_BLOCK_SIZE / 2],
+                );
+            }
+        }
+
+        let blocks = Tensor::from_vec(blocks, (rows, cols / 2), &Device::Cpu)?
+            .to_dtype(DType::U8)?
+            .to_device(device)?;
+        let scales = Tensor::from_vec(scales, (rows, blocks_per_row), &Device::Cpu)?
+            .to_dtype(DType::U8)?
+            .to_device(device)?;
+
+        Ok(Self::from_parts(blocks, scales, bias))
+    }
+
     /// Quantize an unquantized weight tensor to MXFP4 format.
     /// weight shape: `[N, K]`, bias shape: `[N]` (optional)
     pub fn quantize(
