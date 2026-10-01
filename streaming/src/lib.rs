@@ -1,5 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
 use futures_core::Stream;
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -160,6 +161,23 @@ impl StreamStats {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReconnectPolicy {
+    pub max_retries: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(4),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StreamingError {
     #[error("stream cancelled")]
@@ -280,6 +298,67 @@ impl StreamingClient {
     {
         self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
             .await
+    }
+
+    pub async fn stream_with_reconnect(
+        &self,
+        request: ChatRequest,
+        policy: ReconnectPolicy,
+    ) -> Result<
+        impl Stream<Item = Result<StreamEvent, StreamingError>>,
+        StreamingError,
+    > {
+        let client = self.clone();
+        let stream = async_stream::try_stream! {
+            let mut last_event_id: Option<String> = None;
+            let mut retries = 0u32;
+            let mut delay = policy.initial_backoff;
+
+            loop {
+                let mut current = match last_event_id.as_deref() {
+                    Some(id) => client.stream_with_resume(request.clone(), id).await?,
+                    None => client.stream(request.clone()).await?,
+                };
+
+                loop {
+                    match current.next().await {
+                        Some(Ok(event)) => {
+                            if let Some(id) = current.last_event_id() {
+                                last_event_id = Some(id.to_owned());
+                            }
+                            let done = matches!(&event, StreamEvent::Done);
+                            yield event;
+                            if done {
+                                return;
+                            }
+                        }
+                        Some(Err(error)) => {
+                            let retryable = matches!(
+                                error,
+                                StreamingError::Http(_) | StreamingError::UnexpectedEof
+                            );
+                            if !retryable
+                                || last_event_id.is_none()
+                                || retries >= policy.max_retries
+                            {
+                                Err(error)?;
+                            }
+
+                            retries += 1;
+                            tokio::time::sleep(delay).await;
+                            delay = std::cmp::min(
+                                delay.saturating_mul(2),
+                                policy.max_backoff,
+                            );
+                            break;
+                        }
+                        None => return,
+                    }
+                }
+            }
+        };
+
+        Ok(stream)
     }
 
     async fn stream_with_options(
