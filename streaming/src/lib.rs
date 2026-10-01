@@ -275,9 +275,7 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         last_event_id: impl AsRef<str>,
-    )
-        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
         self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
             .await
     }
@@ -287,9 +285,7 @@ impl StreamingClient {
         request: &mut ChatRequest,
         cancellation: Option<tokio_util::sync::CancellationToken>,
         last_event_id: Option<String>,
-    )
-        -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError> {
         request.stream = true;
         let started = Instant::now();
 
