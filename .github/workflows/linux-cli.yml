@@ -1,0 +1,73 @@
+name: Linux CLI
+
+on:
+  push:
+    branches:
+      - linux-cli-only
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUSTFLAGS: "-C target-cpu=generic"
+
+jobs:
+  build-linux-cli:
+    name: Linux x86_64 CLI
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Rust dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            cargo fetch --locked && break
+            if [ "$i" = 5 ]; then
+              exit 1
+            fi
+            sleep $((i * 20))
+          done
+
+      - name: Build Linux CLI
+        run: cargo build --release --locked --offline -p mistralrs-cli
+
+      - name: Verify executable
+        run: |
+          file target/release/mistralrs
+          ./target/release/mistralrs --help >/dev/null
+          test -x target/release/mistralrs
+
+      - name: Package CLI
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf dist/mistralrs-linux-x86_64.tar.gz mistralrs
+          sha256sum dist/mistralrs-linux-x86_64.tar.gz > dist/mistralrs-linux-x86_64.tar.gz.sha256
+
+      - name: Upload Linux CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mistralrs-linux-x86_64
+          path: |
+            dist/mistralrs-linux-x86_64.tar.gz
+            dist/mistralrs-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          overwrite: true
