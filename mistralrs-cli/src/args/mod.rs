@@ -111,6 +111,12 @@ pub enum Command {
         #[arg(long, requires = "input")]
         audio: Vec<String>,
 
+        /// Enable BigMoe-style routed-expert streaming for supported GGUF MoE models.
+        /// This keeps GPT-OSS MXFP4 expert banks file-backed and loads only routed experts.
+        /// Requires CPU execution.
+        #[arg(long)]
+        moe_stream: bool,
+
         /// LoRA adapter alias to use for requests. Omit to run the base model.
         #[arg(long)]
         adapter: Option<String>,
