@@ -134,6 +134,12 @@ mistralrs run -m google/gemma-4-E4B-it --image photo.jpg -i "Describe this image
 mistralrs run -f /path/to/model.gguf
 mistralrs run -m unsloth/Qwen3.5-4B-GGUF --quant 4
 
+# BigMoeOnEdge-style CPU MoE expert streaming.
+# Only routed expert slices are read from GGUF on demand; the rest stay off-RAM.
+mistralrs run --cpu -f /path/to/qwen-moe.gguf \
+  --moe-stream --cache-mb auto --cache-floor-mb 1536 \
+  --cache-ceil-mb 4096 --io-threads 4 --moe-overlap --moe-stats
+
 # Agentic REPL: search + code execution + shell from the terminal
 mistralrs run --agent -m Qwen/Qwen3-4B
 
@@ -142,6 +148,28 @@ mistralrs serve -m google/gemma-4-E4B-it
 ```
 
 For the server command, visit `http://localhost:1234/ui` for the web chat interface. OpenAI-compatible clients use `http://localhost:1234/v1`; Anthropic-compatible clients use `http://localhost:1234`.
+
+
+### CPU MoE expert streaming
+
+For large GGUF Mixture-of-Experts models that do not fit comfortably in RAM, the CPU runtime can
+stream routed expert weights from the GGUF file instead of materializing the complete expert stack.
+The implementation keeps a bounded shared LRU cache, uses parallel I/O workers, and can queue all
+unique experts needed by a layer before CPU expert compute begins so storage I/O overlaps with the
+MoE forward pass. Linux O_DIRECT is available as a best-effort option and automatically falls back
+to buffered reads when the filesystem cannot satisfy it.
+
+```bash
+mistralrs run --cpu -f /path/to/model.gguf \
+  --moe-stream --cache-mb auto --cache-floor-mb 1536 \
+  --cache-ceil-mb 4096 --io-threads 4 --moe-overlap \
+  --moe-stats
+```
+
+The cache is sized once at model initialization for `--cache-mb auto`; `--cache-floor-mb` reserves
+memory for the rest of the process/system and `--cache-ceil-mb` caps the resulting budget. The
+streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
+resident expert layers, and dynamic LoRA, where resident backends remain authoritative.
 
 ### The `mistralrs` CLI
 
