@@ -399,6 +399,34 @@ impl MxFp4StreamCache {
         if let Some(old) = guard.entries.remove(&key) {
             guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
         }
+
+        // Preserve a small layer-local working set. A global LRU thrashes because
+        // GPT-OSS walks layers serially while autoregressive decoding revisits the
+        // same layer-specific experts on the next token. Keeping five recent experts
+        // per tensor source matches the common top-4 routing footprint.
+        let source = key.source.clone();
+        while guard
+            .entries
+            .iter()
+            .filter(|(entry_key, _)| entry_key.source == source)
+            .count()
+            >= self.config.cache_per_source
+        {
+            let Some(victim) = guard
+                .entries
+                .iter()
+                .filter(|(entry_key, _)| entry_key.source == source)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(entry_key, _)| entry_key.clone())
+            else {
+                break;
+            };
+            if let Some(old) = guard.entries.remove(&victim) {
+                guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         while guard.used_bytes.saturating_add(len) > capacity {
             let Some(victim) = guard
                 .entries
