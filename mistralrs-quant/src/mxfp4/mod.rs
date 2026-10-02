@@ -476,7 +476,13 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 })?;
                 let route_x_offsets: Vec<usize> = routes
                     .iter()
-                    .map(|&route_row| route_row * self.in_dim)
+                    .map(|&route_row| {
+                        if x_has_topk {
+                            route_row * self.in_dim
+                        } else {
+                            (route_row / topk) * self.in_dim
+                        }
+                    })
                     .collect();
 
                 let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
