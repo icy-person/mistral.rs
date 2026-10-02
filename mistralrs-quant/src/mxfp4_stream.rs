@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io,
     ops::Deref,
@@ -543,27 +543,24 @@ impl MxFp4StreamCache {
     pub(crate) fn prefetch(
         &self,
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
-    ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
-        let mut result = HashMap::with_capacity(requests.len());
+    ) -> crate::Result<VecDeque<MxFp4StreamHandle>> {
+        let mut result = VecDeque::with_capacity(requests.len());
 
-        for (key, range) in requests.iter().cloned() {
-            if let Some(data) = self.lookup(&key) {
-                result.insert(key, MxFp4StreamHandle::Ready(data));
+        for (key, range) in requests {
+            if let Some(data) = self.lookup(key) {
+                result.push_back(MxFp4StreamHandle::Ready(data));
                 continue;
             }
 
             self.stats.misses.fetch_add(1, Ordering::Relaxed);
 
-            if let Some(data) = self.mapped_range(range) {
+            if let Some(data) = self.mapped_range(*range) {
                 self.insert(key.clone(), data.clone());
-                result.insert(key, MxFp4StreamHandle::Ready(data));
+                result.push_back(MxFp4StreamHandle::Ready(data));
                 continue;
             }
 
-            result.insert(
-                key,
-                MxFp4StreamHandle::Pending(self.submit(range)?),
-            );
+            result.push_back(MxFp4StreamHandle::Pending(self.submit(*range)?));
         }
 
         Ok(result)
