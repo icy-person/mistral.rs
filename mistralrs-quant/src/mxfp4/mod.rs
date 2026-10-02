@@ -5,10 +5,12 @@ use std::{
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
-    _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cvtepu8_epi32,
-    _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps, _mm256_loadu_ps,
-    _mm256_mul_ps, _mm256_permutevar8x32_ps, _mm256_set1_epi16, _mm256_set1_epi32,
-    _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_slli_epi32, _mm256_xor_ps, _mm_add_ss,
+    _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cmpgt_epi32,
+    _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps,
+    _mm256_loadu_ps, _mm256_mul_ps, _mm256_or_si256, _mm256_permutevar8x32_ps,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_ps,
+    _mm256_setzero_ps, _mm256_slli_epi32, _mm256_srli_epi32, _mm256_xor_ps,
+    _mm_add_ss,
     _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_packus_epi16, _mm_setzero_si128,
     _mm_srli_epi16, _mm_unpacklo_epi8,
 };
@@ -268,8 +270,35 @@ impl MxFp4StreamingExpertLayer {
         }
 
         #[inline(always)]
-        unsafe fn decode8(nibbles: __m256i, scale: __m256) -> __m256 {
-            // |nibble| 0..7 selects the E2M1 magnitude; bit 3 supplies sign.
+        unsafe fn decode8_normal_e8m0(nibbles: __m256i, scale: u32) -> __m256 {
+            // E2M1 is exactly representable in IEEE-754. For normal E8M0 scales
+            // (2..253), multiplication by 2^(scale-128) is just an exponent-field
+            // adjustment. This avoids the four permutes + four FP multiplies that
+            // the generic LUT path needs for every 32-value block.
+            let mag = _mm256_and_si256(nibbles, _mm256_set1_epi32(7));
+            let exponent = _mm256_add_epi32(
+                _mm256_srli_epi32(mag, 1),
+                _mm256_set1_epi32((scale as i32) - 2),
+            );
+            let exponent_bits = _mm256_slli_epi32(exponent, 23);
+            let mantissa_bits = _mm256_slli_epi32(
+                _mm256_and_si256(mag, _mm256_set1_epi32(1)),
+                22,
+            );
+            let magnitude = _mm256_or_si256(exponent_bits, mantissa_bits);
+            let nonzero = _mm256_cmpgt_epi32(mag, _mm256_set1_epi32(0));
+            let magnitude = _mm256_and_si256(magnitude, nonzero);
+            let sign = _mm256_slli_epi32(
+                _mm256_and_si256(nibbles, _mm256_set1_epi32(8)),
+                28,
+            );
+            _mm256_castsi256_ps(_mm256_or_si256(magnitude, sign))
+        }
+
+        #[inline(always)]
+        unsafe fn decode8_fallback(nibbles: __m256i, scale: __m256) -> __m256 {
+            // Preserve the exact reference behavior for subnormal and overflow edge
+            // scales where direct exponent-field adjustment is not sufficient.
             let idx = _mm256_and_si256(nibbles, _mm256_set1_epi32(7));
             let magnitude = _mm256_permutevar8x32_ps(
                 _mm256_setr_ps(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
@@ -286,22 +315,29 @@ impl MxFp4StreamingExpertLayer {
         let (lo0, hi0) = unpack8(packed);
         let (lo1, hi1) = unpack8(packed.add(8));
 
-        // E8M0: x=0,1 are the special subnormal floor encodings; x>=2 maps
-        // directly to an IEEE-754 exponent field.
         let s = raw_expert[block_start] as u32;
-        let scale_bits = if s < 2 {
-            0x0020_0000u32 << s
+        if (2..=253).contains(&s) {
+            [
+                decode8_normal_e8m0(lo0, s),
+                decode8_normal_e8m0(lo1, s),
+                decode8_normal_e8m0(hi0, s),
+                decode8_normal_e8m0(hi1, s),
+            ]
         } else {
-            (s - 1) << 23
-        };
-        let scale = _mm256_set1_ps(f32::from_bits(scale_bits));
-
-        [
-            decode8(lo0, scale),
-            decode8(lo1, scale),
-            decode8(hi0, scale),
-            decode8(hi1, scale),
-        ]
+            // E8M0 special values x=0,1 are the subnormal floor encodings.
+            let scale_bits = if s < 2 {
+                0x0020_0000u32 << s
+            } else {
+                (s - 1) << 23
+            };
+            let scale = _mm256_set1_ps(f32::from_bits(scale_bits));
+            [
+                decode8_fallback(lo0, scale),
+                decode8_fallback(lo1, scale),
+                decode8_fallback(hi0, scale),
+                decode8_fallback(hi1, scale),
+            ]
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
