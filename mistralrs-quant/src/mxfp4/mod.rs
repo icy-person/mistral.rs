@@ -60,6 +60,8 @@ pub struct MxFp4StreamingExpertLayer {
     in_dim: usize,
     out_dim: usize,
     bias: Option<Tensor>,
+    bias_cpu: Option<Arc<Vec<f32>>>,
+    expert_ranges: Vec<MxFp4StreamRange>,
     cache: Arc<MxFp4StreamCache>,
 }
 
@@ -88,6 +90,7 @@ impl MxFp4StreamingExpertLayer {
             out_dim
         };
 
+        let mut expert_ranges = Vec::with_capacity(raw_weights.len());
         for name in &raw_weights {
             let info = archive.tensor_info(name)?;
             if info.dtype().raw() != 39 {
@@ -134,6 +137,30 @@ impl MxFp4StreamingExpertLayer {
                     "GPT-OSS MXFP4 streaming tensor {name} has {actual_bytes} bytes, expected {expected_bytes}"
                 );
             }
+
+            let base = info
+                .data_range()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "GPT-OSS MXFP4 tensor {name} has no data range"
+                    ))
+                })?
+                .start;
+            let file_len = archive
+                .shards()
+                .get(info.shard_index())
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 shard index out of range".into())
+                })?
+                .file_len();
+            expert_ranges.push(MxFp4StreamRange {
+                shard: info.shard_index(),
+                offset: u64::try_from(base).map_err(|_| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 base offset exceeds u64".into())
+                })?,
+                len: expected_bytes / num_experts,
+                file_len,
+            });
         }
 
         if let Some(bias) = &bias {
