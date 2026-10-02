@@ -461,6 +461,9 @@ impl MxFp4StreamCache {
         self.archive
             .shard_data_slice(range.shard, offset, range.len)
             .ok()?;
+        let _ = self
+            .archive
+            .shard_data_will_need(range.shard, offset, range.len);
 
         Some(Arc::new(MxFp4StreamData::ArchiveMapped {
             archive: self.archive.clone(),
