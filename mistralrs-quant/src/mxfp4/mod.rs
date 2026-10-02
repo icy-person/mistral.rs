@@ -304,6 +304,27 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+        let bias_data = self
+            .bias
+            .as_ref()
+            .map(|bias| {
+                bias.to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+            })
+            .transpose()?;
+
+        if let Some(bias) = &bias_data {
+            let expected = self.num_experts * self.out_dim;
+            if bias.len() != expected {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
+                    bias.len(),
+                    expected
+                );
+            }
+        }
 
         for token_idx in 0..num_tokens {
             for slot_idx in 0..topk {
@@ -344,15 +365,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         );
                     }
                 }
+
+                // Expert bias is selected per route; broadcasting [experts, out]
+                // over [tokens, topk, out] is not valid and would also apply the
+                // wrong expert bias.
+                if let Some(bias) = &bias_data {
+                    let bias_offset = expert_idx * self.out_dim;
+                    let output_offset = route_row * self.out_dim;
+                    for col in 0..self.out_dim {
+                        output[output_offset + col] += bias[bias_offset + col];
+                    }
+                }
             }
         }
 
-        let mut result =
+        let result =
             Tensor::from_vec(output, (num_tokens, topk, self.out_dim), &Device::Cpu)?;
-        if let Some(bias) = &self.bias {
-            result = result.broadcast_add(bias)?;
-        }
-        result = result.to_device(x.device())?.to_dtype(x.dtype())?;
+        let result = result.to_device(x.device())?.to_dtype(x.dtype())?;
         Ok(result)
     }
 
