@@ -1,6 +1,7 @@
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::{collections::HashMap, sync::{atomic::AtomicUsize, Arc}};
 
 use candle_core::{DType, Device, Result, Storage, Tensor};
+use rayon::prelude::*;
 use safetensors::tensor::Dtype;
 
 use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
@@ -203,10 +204,8 @@ impl MxFp4StreamingExpertLayer {
         x: &[f32],
         raw_expert: &[u8],
         row: usize,
-        out_row_offset: usize,
-        output: &mut [f32],
-        output_row: usize,
-        output_rows: usize,
+        out_row: &mut [f32],
+        out_col: usize,
     ) {
         let blocks_per_row = x.len() / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
@@ -232,16 +231,7 @@ impl MxFp4StreamingExpertLayer {
             }
         }
 
-        // out_row_offset is already the final output column. For
-        // interleaved gate/up tensors it is row * 2 + component; adding
-        // row again would skew every row and can index one element past the
-        // route row at the end of the projection.
-        let output_index = output_row
-            .checked_mul(output_rows)
-            .and_then(|base| base.checked_add(out_row_offset))
-            .expect("GPT-OSS MXFP4 output index overflow");
-        debug_assert!(output_index < output.len());
-        output[output_index] += acc;
+        out_row[out_col] += acc;
     }
 }
 
@@ -323,14 +313,19 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
-        let mut needed = std::collections::HashSet::new();
-        for &expert in &indices_data {
-            needed.insert(expert as usize);
+        let mut routes_by_expert = HashMap::<usize, Vec<usize>>::new();
+        for (route, &expert) in indices_data.iter().enumerate() {
+            routes_by_expert
+                .entry(expert as usize)
+                .or_default()
+                .push(route);
         }
+        let mut experts = routes_by_expert.keys().copied().collect::<Vec<_>>();
+        experts.sort_unstable();
 
-        let mut requests = Vec::with_capacity(needed.len() * self.raw_weights.len());
+        let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
         for weight_idx in 0..self.raw_weights.len() {
-            for &expert_idx in &needed {
+            for &expert_idx in &experts {
                 let range = self.raw_expert_range(weight_idx, expert_idx)?;
                 requests.push((
                     MxFp4StreamKey {
@@ -347,7 +342,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         } else {
             None
         };
-        let mut expert_data = std::collections::HashMap::with_capacity(requests.len());
+        let mut expert_data = HashMap::with_capacity(requests.len());
         if pending.is_none() {
             for (key, range) in requests {
                 expert_data.insert(key, self.cache.load(key, range)?);
@@ -355,47 +350,12 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         }
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
-        let bias_data = self
-            .bias
-            .as_ref()
-            .map(|bias| {
-                bias.to_dtype(DType::F32)?
-                    .to_device(&Device::Cpu)?
-                    .flatten_all()?
-                    .to_vec1::<f32>()
-            })
-            .transpose()?;
 
-        if let Some(bias) = &bias_data {
-            let expected = self.num_experts * self.out_dim;
-            if bias.len() != expected {
-                candle_core::bail!(
-                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
-                    bias.len(),
-                    expected
-                );
-            }
-        }
-
-        for token_idx in 0..num_tokens {
-            for slot_idx in 0..topk {
-                let expert_idx = indices_data[token_idx * topk + slot_idx] as usize;
-                if expert_idx >= self.num_experts {
-                    candle_core::bail!(
-                        "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
-                        self.num_experts
-                    );
-                }
-
-                let route_row = token_idx * topk + slot_idx;
-                let x_offset = if x_has_topk {
-                    route_row * self.in_dim
-                } else {
-                    token_idx * self.in_dim
-                };
-                let x_row = &x_data[x_offset..x_offset + self.in_dim];
-
-                for component in 0..self.raw_weights.len() {
+        if self.raw_weights.len() > 1 {
+            // Gate and up are independent projections. While we compute one projection,
+            // the worker pool can continue reading the other projection's experts.
+            for component in 0..self.raw_weights.len() {
+                for &expert_idx in &experts {
                     let key = MxFp4StreamKey {
                         source: self.raw_weights[component].clone(),
                         expert_index: expert_idx,
@@ -414,32 +374,91 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     let expert = expert_data.get(&key).ok_or_else(|| {
                         candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
                     })?;
-                    for row in 0..self.component_out_dim {
-                        let out_index = if self.raw_weights.len() == 2 {
-                            row * 2 + component
-                        } else {
-                            row
-                        };
-                        Self::dot_row(
-                            x_row,
-                            expert,
-                            row,
-                            out_index,
-                            &mut output,
-                            route_row,
-                            self.out_dim,
-                        );
-                    }
-                }
 
-                if let Some(bias) = &bias_data {
-                    let bias_offset = expert_idx * self.out_dim;
-                    let output_offset = route_row * self.out_dim;
-                    for col in 0..self.out_dim {
-                        output[output_offset + col] += bias[bias_offset + col];
-                    }
+                    output
+                        .par_chunks_mut(self.out_dim)
+                        .enumerate()
+                        .for_each(|(route_row, out_row)| {
+                            if indices_data[route_row] as usize != expert_idx {
+                                return;
+                            }
+                            let token_idx = route_row / topk;
+                            let x_offset = if x_has_topk {
+                                route_row * self.in_dim
+                            } else {
+                                token_idx * self.in_dim
+                            };
+                            let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                            for row in 0..self.component_out_dim {
+                                let out_index = row * 2 + component;
+                                Self::dot_row(x_row, expert, row, out_row, out_index);
+                            }
+                        });
                 }
             }
+        } else {
+            // Down projection is a single component and fills the whole output.
+            let component = 0usize;
+            for &expert_idx in &experts {
+                let key = MxFp4StreamKey {
+                    source: self.raw_weights[component].clone(),
+                    expert_index: expert_idx,
+                };
+                if let Some(pending_map) = pending.as_mut() {
+                    if !expert_data.contains_key(&key) {
+                        let handle = pending_map.remove(&key).ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "GPT-OSS MXFP4 streamed expert request was not scheduled",
+                            )
+                        })?;
+                        let data = self.cache.resolve(key, handle)?;
+                        expert_data.insert(key, data);
+                    }
+                }
+                let expert = expert_data.get(&key).ok_or_else(|| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                })?;
+
+                output
+                    .par_chunks_mut(self.out_dim)
+                    .enumerate()
+                    .for_each(|(route_row, out_row)| {
+                        if indices_data[route_row] as usize != expert_idx {
+                            return;
+                        }
+                        let x_row =
+                            &x_data[route_row * self.in_dim..(route_row + 1) * self.in_dim];
+                        for row in 0..self.component_out_dim {
+                            Self::dot_row(x_row, expert, row, out_row, row);
+                        }
+                    });
+            }
+        }
+
+        if let Some(bias) = &self.bias {
+            let bias_data = bias
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = self.num_experts * self.out_dim;
+            if bias_data.len() != expected {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
+                    bias_data.len(),
+                    expected
+                );
+            }
+            output
+                .par_chunks_mut(self.out_dim)
+                .enumerate()
+                .for_each(|(route_row, out_row)| {
+                    let expert_idx = indices_data[route_row] as usize;
+                    let bias_offset = expert_idx * self.out_dim;
+                    for col in 0..self.out_dim {
+                        out_row[col] += bias_data[bias_offset + col];
+                    }
+                });
         }
 
         self.cache.log_stats();
