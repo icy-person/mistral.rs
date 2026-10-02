@@ -1398,6 +1398,19 @@ impl MxFp4StreamingExpertLayer {
                     });
             });
 
+            // Fold top-k weights immediately into the activated route vectors.
+            // This removes a second full activation traversal before down projection.
+            activations[..activation_len]
+                .par_chunks_mut(down.in_dim)
+                .enumerate()
+                .for_each(|(route_idx, activation)| {
+                    let route_row = routes[route_idx];
+                    let weight = route_weights[route_row];
+                    for value in activation {
+                        *value *= weight;
+                    }
+                });
+
             let activation_offsets = &activation_offsets[..route_count];
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
             let down_kernel = kernel;
