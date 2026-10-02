@@ -270,24 +270,39 @@ impl MxFp4StreamingExpertLayer {
         }
 
         #[inline(always)]
-        unsafe fn decode8_normal_e8m0(nibbles: __m256i, scale_offset: __m256i) -> __m256 {
-            // E2M1 is exactly representable in IEEE-754. For normal E8M0 scales
-            // (2..253), multiplication by 2^(scale-128) is just an exponent-field
-            // adjustment. This avoids the four permutes + four FP multiplies that
-            // the generic LUT path needs for every 32-value block.
+        unsafe fn decode8_normal_e8m0(nibbles: __m256i, scale: __m256i) -> __m256 {
+            // FP4 values are {0, 0.5, 1, 1.5, 2, 3, 4, 6}.
+            // Encode them directly as IEEE-754 bits:
+            //   exponent adjustment: {0, -1, 0, 0, 1, 1, 2, 2}
+            //   mantissa bit 22 set for {1.5, 3, 6}.
             let mag = _mm256_and_si256(nibbles, _mm256_set1_epi32(7));
-            let exponent = _mm256_add_epi32(
-                _mm256_srli_epi32(mag, 1),
-                scale_offset,
+
+            let hi = _mm256_srli_epi32(mag, 2);
+            let hi2 = _mm256_srli_epi32(mag, 1);
+            let high_adj = _mm256_add_epi32(
+                hi,
+                _mm256_and_si256(hi, _mm256_and_si256(hi2, _mm256_set1_epi32(1))),
             );
+            let one = _mm256_cmpeq_epi32(mag, _mm256_set1_epi32(1));
+            let exponent_adjust = _mm256_sub_epi32(
+                high_adj,
+                _mm256_and_si256(one, _mm256_set1_epi32(1)),
+            );
+            let exponent = _mm256_add_epi32(scale, exponent_adjust);
             let exponent_bits = _mm256_slli_epi32(exponent, 23);
+
+            let gt_one = _mm256_cmpgt_epi32(mag, _mm256_set1_epi32(1));
+            let odd = _mm256_and_si256(mag, _mm256_set1_epi32(1));
             let mantissa_bits = _mm256_slli_epi32(
-                _mm256_and_si256(mag, _mm256_set1_epi32(1)),
+                _mm256_and_si256(gt_one, odd),
                 22,
             );
-            let magnitude = _mm256_or_si256(exponent_bits, mantissa_bits);
-            let nonzero = _mm256_cmpgt_epi32(mag, _mm256_set1_epi32(0));
-            let magnitude = _mm256_and_si256(magnitude, nonzero);
+
+            let nonzero = _mm256_cmpgt_epi32(mag, _mm256_setzero_si256());
+            let magnitude = _mm256_and_si256(
+                _mm256_or_si256(exponent_bits, mantissa_bits),
+                nonzero,
+            );
             let sign = _mm256_slli_epi32(
                 _mm256_and_si256(nibbles, _mm256_set1_epi32(8)),
                 28,
