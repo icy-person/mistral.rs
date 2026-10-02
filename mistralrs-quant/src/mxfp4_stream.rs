@@ -1,5 +1,5 @@
-use memmap2::Mmap;
-
+// The GGUF archive already owns read-only shard mmaps; streamed experts can
+// reference those mappings directly without another mmap or read/copy.
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -30,7 +30,7 @@ pub(crate) struct MxFp4StreamConfig {
     pub cache_floor_mb: usize,
     pub cache_ceil_mb: Option<usize>,
     pub cache_per_source: usize,
-    pub mmap: bool,
+    pub zero_copy: bool,
     pub io_threads: usize,
     pub overlap: bool,
     pub o_direct: bool,
@@ -44,7 +44,7 @@ impl Default for MxFp4StreamConfig {
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
             cache_per_source: 5,
-            mmap: true,
+            zero_copy: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,
@@ -77,7 +77,7 @@ impl MxFp4StreamConfig {
                 defaults.cache_per_source,
 )
             .clamp(1, 32),
-            mmap: env_bool("MISTRALRS_MOE_MMAP", defaults.mmap),
+            zero_copy: env_bool("MISTRALRS_MOE_ZERO_COPY", defaults.zero_copy),
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
             o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
@@ -193,7 +193,7 @@ impl MxFp4StreamData {
     fn len(&self) -> usize {
         match self {
             Self::Owned(data) => data.len(),
-            Self::Mapped { len, .. } => *len,
+            Self::ArchiveMapped { len, .. } => *len,
         }
     }
 }
@@ -205,10 +205,18 @@ impl Deref for MxFp4StreamData {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Owned(data) => data,
-            Self::Mapped { map, start, len } => &map[*start..*start + *len],
+            Self::ArchiveMapped {
+                archive,
+                shard,
+                offset,
+                len,
+            } => archive
+                .shard_data_slice(*shard, *offset, *len)
+                .expect("validated zero-copy GGUF MXFP4 range"),
         }
     }
 }
+
 
 struct WorkerFiles {
     normal: Vec<File>,
@@ -274,7 +282,7 @@ pub(crate) struct MxFp4StreamCache {
     queues: Vec<SyncSender<ReadJob>>,
     next_queue: AtomicUsize,
     paths: Vec<PathBuf>,
-    maps: Vec<Option<Arc<Mmap>>>,
+    archive: Arc<crate::GgufArchive>,
     config: MxFp4StreamConfig,
     budget_bytes: usize,
     stats: Stats,
@@ -290,28 +298,7 @@ impl MxFp4StreamCache {
             .collect::<Vec<_>>();
         let queue_size = 8usize;
 
-        let mut maps = Vec::with_capacity(paths.len());
-        if config.mmap && !config.o_direct {
-            for path in &paths {
-                let map = match File::open(path) {
-                    Ok(file) => match unsafe { memmap2::MmapOptions::new().map(&file) } {
-                        Ok(map) => Some(Arc::new(map)),
-                        Err(err) => {
-                            tracing::debug!("mmap unavailable for {}: {err}", path.display());
-                            None
-                        }
-                    },
-                    Err(err) => {
-                        tracing::debug!("failed to open {} for mmap: {err}", path.display());
-                        None
-                    }
-                };
-                maps.push(map);
-            }
-        } else {
-            maps.resize(paths.len(), None);
-        }
-
+        let archive_for_cache = archive.clone();
         let mut queues = Vec::with_capacity(config.io_threads);
         let needs_io_workers = maps.iter().any(Option::is_none);
 
@@ -375,7 +362,7 @@ impl MxFp4StreamCache {
             queues,
             next_queue: AtomicUsize::new(0),
             paths: paths.clone(),
-            maps,
+            archive: archive_for_cache,
             budget_bytes: config.cache_budget_bytes(),
             config,
             stats: Stats::default(),
@@ -467,22 +454,21 @@ impl MxFp4StreamCache {
     }
 
     fn mapped_range(&self, range: MxFp4StreamRange) -> Option<Arc<MxFp4StreamData>> {
-        let map = self.maps.get(range.shard).and_then(Option::as_ref)?;
-        let start = usize::try_from(range.offset).ok()?;
-        let end = start.checked_add(range.len)?;
-        if end > map.len() {
+        if !self.config.zero_copy {
             return None;
         }
-        #[cfg(unix)]
-        {
-            let _ = map.advise_range(memmap2::Advice::WillNeed, start, range.len);
-        }
-        Some(Arc::new(MxFp4StreamData::Mapped {
-            map: map.clone(),
-            start,
+        let offset = usize::try_from(range.offset).ok()?;
+        self.archive
+            .shard_data_slice(range.shard, offset, range.len)
+            .ok()?;
+        Some(Arc::new(MxFp4StreamData::ArchiveMapped {
+            archive: self.archive.clone(),
+            shard: range.shard,
+            offset,
             len: range.len,
         }))
     }
+
 
     fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Arc<MxFp4StreamData>>>> {
         if range.shard >= self.paths.len() {
@@ -597,7 +583,7 @@ impl MxFp4StreamCache {
         };
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, mmap={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
             self.budget_bytes / MIB,
@@ -610,7 +596,7 @@ impl MxFp4StreamCache {
             evictions,
             self.config.io_threads,
             self.config.overlap,
-            self.config.mmap,
+            self.config.zero_copy,
             self.config.o_direct,
         );
     }
@@ -777,7 +763,7 @@ mod tests {
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(2048),
             cache_per_source: 5,
-            mmap: true,
+            zero_copy: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,
