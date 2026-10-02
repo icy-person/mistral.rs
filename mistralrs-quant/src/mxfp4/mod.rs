@@ -4,8 +4,12 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256, _mm256_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_hadd_ps,
-    _mm256_loadu_ps, _mm256_mul_ps, _mm_add_ss, _mm_cvtss_f32, _mm256_fmadd_ps, _mm256_setzero_ps,
+    __m128i, __m256, _mm256_add_epi32, _mm256_add_ps, _mm256_castps256_ps128,
+    _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps,
+    _mm256_i32gather_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_epi32,
+    _mm256_setzero_ps, _mm_add_ss, _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64,
+    _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16,
+    _mm_unpacklo_epi8,
 };
 
 use candle_core::{DType, Device, Result, Storage, Tensor};
@@ -228,157 +232,216 @@ impl MxFp4StreamingExpertLayer {
     }
 
     #[inline(always)]
-    fn dot_block(x: &[f32], w: &[f32], kernel: u8) -> f32 {
-        debug_assert_eq!(x.len(), MXFP4_BLOCK_SIZE);
-        debug_assert_eq!(w.len(), MXFP4_BLOCK_SIZE);
+    fn adaptive_parallel(route_count: usize, out_rows: usize, blocks_per_row: usize) -> bool {
+        if rayon::current_num_threads() <= 1 {
+            return false;
+        }
+        let work = route_count
+            .saturating_mul(out_rows)
+            .saturating_mul(blocks_per_row);
+        work >= 8192 && out_rows >= 32
+    }
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            if kernel >= 2 {
-                return unsafe { Self::dot_block_avx2_fma(x, w) };
-            }
-            if kernel == 1 {
-                return unsafe { Self::dot_block_avx2(x, w) };
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline(always)]
+    unsafe fn load_fused_weight_vectors_avx2(
+        raw_expert: &[u8],
+        block_start: usize,
+    ) -> [__m256; 4] {
+        let packed = raw_expert.as_ptr().add(block_start + 1);
+
+        #[inline(always)]
+        unsafe fn unpack8(ptr: *const u8) -> (__m256i, __m256i) {
+            let bytes: __m128i = _mm_loadl_epi64(ptr.cast());
+            let bytes16 = _mm_unpacklo_epi8(bytes, _mm_setzero_si128());
+            let low16 = _mm_and_si128(bytes16, _mm_set1_epi16(0x000f));
+            let high16 = _mm_and_si128(_mm_srli_epi16(bytes16, 4), _mm_set1_epi16(0x000f));
+            let low8 = _mm_packus_epi16(low16, _mm_setzero_si128());
+            let high8 = _mm_packus_epi16(high16, _mm_setzero_si128());
+            (
+                _mm256_cvtepu8_epi32(low8),
+                _mm256_cvtepu8_epi32(high8),
+            )
+        }
+
+        let (lo0, hi0) = unpack8(packed);
+        let (lo1, hi1) = unpack8(packed.add(8));
+        let scale_base = _mm256_set1_epi32((raw_expert[block_start] as i32) << 4);
+
+        let i0 = _mm256_add_epi32(lo0, scale_base);
+        let i1 = _mm256_add_epi32(lo1, scale_base);
+        let i2 = _mm256_add_epi32(hi0, scale_base);
+        let i3 = _mm256_add_epi32(hi1, scale_base);
+
+        [
+            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i0, 4),
+            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i1, 4),
+            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i2, 4),
+            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i3, 4),
+        ]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline(always)]
+    unsafe fn dot_streamed_row_fused_avx2(
+        x: &[f32],
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+    ) -> f32 {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start)), w[0]
+            ));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 8)), w[1]
+            ));
+            a2 = _mm256_add_ps(a2, _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 16)), w[2]
+            ));
+            a3 = _mm256_add_ps(a3, _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 24)), w[3]
+            ));
+        }
+
+        Self::hsum4(a0, a1, a2, a3)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline(always)]
+    unsafe fn dot_streamed_row_fused_avx2_fma(
+        x: &[f32],
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+    ) -> f32 {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+            a0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start)), w[0], a0
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 8)), w[1], a1
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 16)), w[2], a2
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(x_start + 24)), w[3], a3
+            );
+        }
+
+        Self::hsum4(a0, a1, a2, a3)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline(always)]
+    unsafe fn dot_streamed_routes_fused_avx2(
+        x_data: &[f32],
+        x_offsets: &[usize],
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+        accs: &mut [f32],
+    ) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+            for (route_idx, &x_offset) in x_offsets.iter().enumerate() {
+                let x = x_data.as_ptr().add(x_offset + x_start);
+                let a0 = _mm256_mul_ps(_mm256_loadu_ps(x), w[0]);
+                let a1 = _mm256_mul_ps(_mm256_loadu_ps(x.add(8)), w[1]);
+                let a2 = _mm256_mul_ps(_mm256_loadu_ps(x.add(16)), w[2]);
+                let a3 = _mm256_mul_ps(_mm256_loadu_ps(x.add(24)), w[3]);
+                accs[route_idx] += Self::hsum4(a0, a1, a2, a3);
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline(always)]
+    unsafe fn dot_streamed_routes_fused_avx2_fma(
+        x_data: &[f32],
+        x_offsets: &[usize],
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+        accs: &mut [f32],
+    ) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+            for (route_idx, &x_offset) in x_offsets.iter().enumerate() {
+                let x = x_data.as_ptr().add(x_offset + x_start);
+                let a0 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x), w[0], _mm256_setzero_ps()
+                );
+                let a1 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(8)), w[1], _mm256_setzero_ps()
+                );
+                let a2 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(16)), w[2], _mm256_setzero_ps()
+                );
+                let a3 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(24)), w[3], _mm256_setzero_ps()
+                );
+                accs[route_idx] += Self::hsum4(a0, a1, a2, a3);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn dot_block(x: &[f32], w: &[f32], _kernel: u8) -> f32 {
+        debug_assert_eq!(x.len(), MXFP4_BLOCK_SIZE);
+        debug_assert_eq!(w.len(), MXFP4_BLOCK_SIZE);
 
         let mut acc = 0f32;
         for i in 0..MXFP4_BLOCK_SIZE {
             acc += x[i] * w[i];
         }
         acc
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    #[inline(always)]
-    unsafe fn dot_block_pair_avx2(
-        x_data: &[f32],
-        x_offset0: usize,
-        x_offset1: usize,
-        x_start: usize,
-        w: &[f32],
-    ) -> [f32; 2] {
-        let x0 = x_data.as_ptr().add(x_offset0 + x_start);
-        let x1 = x_data.as_ptr().add(x_offset1 + x_start);
-        let w_ptr = w.as_ptr();
-
-        let w0 = _mm256_loadu_ps(w_ptr);
-        let w1 = _mm256_loadu_ps(w_ptr.add(8));
-        let w2 = _mm256_loadu_ps(w_ptr.add(16));
-        let w3 = _mm256_loadu_ps(w_ptr.add(24));
-
-        let a0 = _mm256_mul_ps(_mm256_loadu_ps(x0), w0);
-        let a1 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(8)), w1);
-        let a2 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(16)), w2);
-        let a3 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(24)), w3);
-        let b0 = _mm256_mul_ps(_mm256_loadu_ps(x1), w0);
-        let b1 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(8)), w1);
-        let b2 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(16)), w2);
-        let b3 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(24)), w3);
-
-        [Self::hsum4(a0, a1, a2, a3), Self::hsum4(b0, b1, b2, b3)]
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    #[inline(always)]
-    unsafe fn dot_block_pair_avx2_fma(
-        x_data: &[f32],
-        x_offset0: usize,
-        x_offset1: usize,
-        x_start: usize,
-        w: &[f32],
-    ) -> [f32; 2] {
-        let x0 = x_data.as_ptr().add(x_offset0 + x_start);
-        let x1 = x_data.as_ptr().add(x_offset1 + x_start);
-        let w_ptr = w.as_ptr();
-
-        let w0 = _mm256_loadu_ps(w_ptr);
-        let w1 = _mm256_loadu_ps(w_ptr.add(8));
-        let w2 = _mm256_loadu_ps(w_ptr.add(16));
-        let w3 = _mm256_loadu_ps(w_ptr.add(24));
-
-        let a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0), w0, _mm256_setzero_ps());
-        let a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(8)), w1, _mm256_setzero_ps());
-        let a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(16)), w2, _mm256_setzero_ps());
-        let a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(24)), w3, _mm256_setzero_ps());
-        let b0 = _mm256_fmadd_ps(_mm256_loadu_ps(x1), w0, _mm256_setzero_ps());
-        let b1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(8)), w1, _mm256_setzero_ps());
-        let b2 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(16)), w2, _mm256_setzero_ps());
-        let b3 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(24)), w3, _mm256_setzero_ps());
-
-        [Self::hsum4(a0, a1, a2, a3), Self::hsum4(b0, b1, b2, b3)]
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn dot_block_avx2(x: &[f32], w: &[f32]) -> f32 {
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        a0 = _mm256_add_ps(
-            a0,
-            _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr()),
-                _mm256_loadu_ps(w.as_ptr()),
-            ),
-        );
-        a1 = _mm256_add_ps(
-            a1,
-            _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(8)),
-                _mm256_loadu_ps(w.as_ptr().add(8)),
-            ),
-        );
-        a2 = _mm256_add_ps(
-            a2,
-            _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(16)),
-                _mm256_loadu_ps(w.as_ptr().add(16)),
-            ),
-        );
-        a3 = _mm256_add_ps(
-            a3,
-            _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(24)),
-                _mm256_loadu_ps(w.as_ptr().add(24)),
-            ),
-        );
-        Self::hsum4(a0, a1, a2, a3)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    #[inline]
-    unsafe fn dot_block_avx2_fma(x: &[f32], w: &[f32]) -> f32 {
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        a0 = _mm256_fmadd_ps(
-            _mm256_loadu_ps(x.as_ptr()),
-            _mm256_loadu_ps(w.as_ptr()),
-            a0,
-        );
-        a1 = _mm256_fmadd_ps(
-            _mm256_loadu_ps(x.as_ptr().add(8)),
-            _mm256_loadu_ps(w.as_ptr().add(8)),
-            a1,
-        );
-        a2 = _mm256_fmadd_ps(
-            _mm256_loadu_ps(x.as_ptr().add(16)),
-            _mm256_loadu_ps(w.as_ptr().add(16)),
-            a2,
-        );
-        a3 = _mm256_fmadd_ps(
-            _mm256_loadu_ps(x.as_ptr().add(24)),
-            _mm256_loadu_ps(w.as_ptr().add(24)),
-            a3,
-        );
-        Self::hsum4(a0, a1, a2, a3)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -409,403 +472,6 @@ impl MxFp4StreamingExpertLayer {
     }
 
     const GEMM_MIN_ROUTES: usize = 16;
-
-    #[inline]
-    fn decode_expert_f32(
-        raw_expert: &[u8],
-        out_rows: usize,
-        in_dim: usize,
-    ) -> Vec<f32> {
-        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let mut weights = vec![0f32; out_rows * in_dim];
-
-        weights
-            .par_chunks_mut(in_dim)
-            .enumerate()
-            .for_each(|(row, dst)| {
-                let row_start = row * row_bytes;
-                for block_idx in 0..blocks_per_row {
-                    let block_start =
-                        row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                    let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-                    let packed =
-                        &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-                    let col_start = block_idx * MXFP4_BLOCK_SIZE;
-                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                        let packed_byte = packed[byte_idx];
-                        dst[col_start + byte_idx] =
-                            dequant[(packed_byte & 0x0f) as usize];
-                        dst[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                            dequant[(packed_byte >> 4) as usize];
-                    }
-                }
-            });
-
-        weights
-    }
-
-    #[inline]
-    fn gemm_routes(
-        x_data: &[f32],
-        route_x_offsets: &[usize],
-        raw_expert: &[u8],
-        out_rows: usize,
-        in_dim: usize,
-    ) -> Result<Vec<f32>> {
-        let route_count = route_x_offsets.len();
-        if route_count < Self::GEMM_MIN_ROUTES {
-            return Err(candle_core::Error::Msg(
-                "route count below streamed GEMM threshold".into(),
-            ));
-        }
-
-        let mut x_routes = Vec::with_capacity(route_count * in_dim);
-        for &x_offset in route_x_offsets {
-            x_routes.extend_from_slice(&x_data[x_offset..x_offset + in_dim]);
-        }
-
-        let weights = Self::decode_expert_f32(raw_expert, out_rows, in_dim);
-        let x = Tensor::from_vec(x_routes, (route_count, in_dim), &Device::Cpu)?;
-        let w = Tensor::from_vec(weights, (out_rows, in_dim), &Device::Cpu)?;
-        let y = x.matmul(&w.t()?)?;
-        y.flatten_all()?.to_vec1::<f32>()
-    }
-
-    #[inline(always)]
-    fn dot_streamed_row_group(
-        x_data: &[f32],
-        x_offsets: &[usize],
-        raw_expert: &[u8],
-        row: usize,
-        in_dim: usize,
-        route_count: usize,
-    ) -> Option<[f32; 4]> {
-        if route_count < 2 || route_count > 4 {
-            return None;
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                if std::is_x86_feature_detected!("fma") {
-                    return Some(unsafe {
-                        Self::dot_streamed_row_group_avx2_fma(
-                            x_data,
-                            x_offsets,
-                            raw_expert,
-                            row,
-                            in_dim,
-                            route_count,
-                        )
-                    });
-                }
-                return Some(unsafe {
-                    Self::dot_streamed_row_group_avx2(
-                        x_data,
-                        x_offsets,
-                        raw_expert,
-                        row,
-                        in_dim,
-                        route_count,
-                    )
-                });
-            }
-        }
-        None
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn dot_streamed_row_group_avx2(
-        x_data: &[f32],
-        x_offsets: &[usize],
-        raw_expert: &[u8],
-        row: usize,
-        in_dim: usize,
-        route_count: usize,
-    ) -> [f32; 4] {
-        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let row_start = row * row_bytes;
-        let mut acc = [_mm256_setzero_ps(); 4 * 4];
-        let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-            let packed =
-                &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                let packed_byte = packed[byte_idx];
-                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                    dequant[(packed_byte >> 4) as usize];
-            }
-
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
-            for route in 0..route_count {
-                let x_row = &x_data[x_offsets[route]..x_offsets[route] + in_dim];
-                let base = route * 4;
-                acc[base] = _mm256_add_ps(
-                    acc[base],
-                    _mm256_mul_ps(
-                        _mm256_loadu_ps(x_row.as_ptr().add(x_start)),
-                        _mm256_loadu_ps(w_block.as_ptr()),
-                    ),
-                );
-                acc[base + 1] = _mm256_add_ps(
-                    acc[base + 1],
-                    _mm256_mul_ps(
-                        _mm256_loadu_ps(x_row.as_ptr().add(x_start + 8)),
-                        _mm256_loadu_ps(w_block.as_ptr().add(8)),
-                    ),
-                );
-                acc[base + 2] = _mm256_add_ps(
-                    acc[base + 2],
-                    _mm256_mul_ps(
-                        _mm256_loadu_ps(x_row.as_ptr().add(x_start + 16)),
-                        _mm256_loadu_ps(w_block.as_ptr().add(16)),
-                    ),
-                );
-                acc[base + 3] = _mm256_add_ps(
-                    acc[base + 3],
-                    _mm256_mul_ps(
-                        _mm256_loadu_ps(x_row.as_ptr().add(x_start + 24)),
-                        _mm256_loadu_ps(w_block.as_ptr().add(24)),
-                    ),
-                );
-            }
-        }
-
-        let mut out = [0.0f32; 4];
-        for route in 0..route_count {
-            let base = route * 4;
-            out[route] = Self::hsum4(
-                acc[base],
-                acc[base + 1],
-                acc[base + 2],
-                acc[base + 3],
-            );
-        }
-        out
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn dot_streamed_row_group_avx2_fma(
-        x_data: &[f32],
-        x_offsets: &[usize],
-        raw_expert: &[u8],
-        row: usize,
-        in_dim: usize,
-        route_count: usize,
-    ) -> [f32; 4] {
-        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let row_start = row * row_bytes;
-        let mut acc = [_mm256_setzero_ps(); 4 * 4];
-        let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-            let packed =
-                &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                let packed_byte = packed[byte_idx];
-                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                    dequant[(packed_byte >> 4) as usize];
-            }
-
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
-            for route in 0..route_count {
-                let x_row = &x_data[x_offsets[route]..x_offsets[route] + in_dim];
-                let base = route * 4;
-                acc[base] = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(x_row.as_ptr().add(x_start)),
-                    _mm256_loadu_ps(w_block.as_ptr()),
-                    acc[base],
-                );
-                acc[base + 1] = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(x_row.as_ptr().add(x_start + 8)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(8)),
-                    acc[base + 1],
-                );
-                acc[base + 2] = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(x_row.as_ptr().add(x_start + 16)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(16)),
-                    acc[base + 2],
-                );
-                acc[base + 3] = _mm256_fmadd_ps(
-                    _mm256_loadu_ps(x_row.as_ptr().add(x_start + 24)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(24)),
-                    acc[base + 3],
-                );
-            }
-        }
-
-        let mut out = [0.0f32; 4];
-        for route in 0..route_count {
-            let base = route * 4;
-            out[route] = Self::hsum4(
-                acc[base],
-                acc[base + 1],
-                acc[base + 2],
-                acc[base + 3],
-            );
-        }
-        out
-    }
-
-    #[inline(always)]
-    fn dot_streamed_row(x: &[f32], raw_expert: &[u8], row: usize, kernel: u8) -> f32 {
-        debug_assert!(x.len() >= MXFP4_BLOCK_SIZE);
-        let blocks_per_row = x.len() / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let row_start = row * row_bytes;
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if kernel >= 2 {
-                return unsafe { Self::dot_streamed_row_avx2_fma(x, raw_expert, row_start, blocks_per_row) };
-            }
-            if kernel == 1 {
-                return unsafe { Self::dot_streamed_row_avx2(x, raw_expert, row_start, blocks_per_row) };
-            }
-        }
-
-        let mut acc = 0f32;
-        let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-            let packed =
-                &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                let packed_byte = packed[byte_idx];
-                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                    dequant[(packed_byte >> 4) as usize];
-            }
-            let col_start = block_idx * MXFP4_BLOCK_SIZE;
-            acc += Self::dot_block(
-                &x[col_start..col_start + MXFP4_BLOCK_SIZE],
-                &w_block,
-                0,
-            );
-        }
-        acc
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn dot_streamed_row_avx2(
-        x: &[f32],
-        raw_expert: &[u8],
-        row_start: usize,
-        blocks_per_row: usize,
-    ) -> f32 {
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-            let packed =
-                &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                let packed_byte = packed[byte_idx];
-                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                    dequant[(packed_byte >> 4) as usize];
-            }
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
-            a0 = _mm256_add_ps(
-                a0,
-                _mm256_mul_ps(
-                    _mm256_loadu_ps(x.as_ptr().add(x_start)),
-                    _mm256_loadu_ps(w_block.as_ptr()),
-                ),
-            );
-            a1 = _mm256_add_ps(
-                a1,
-                _mm256_mul_ps(
-                    _mm256_loadu_ps(x.as_ptr().add(x_start + 8)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(8)),
-                ),
-            );
-            a2 = _mm256_add_ps(
-                a2,
-                _mm256_mul_ps(
-                    _mm256_loadu_ps(x.as_ptr().add(x_start + 16)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(16)),
-                ),
-            );
-            a3 = _mm256_add_ps(
-                a3,
-                _mm256_mul_ps(
-                    _mm256_loadu_ps(x.as_ptr().add(x_start + 24)),
-                    _mm256_loadu_ps(w_block.as_ptr().add(24)),
-                ),
-            );
-        }
-        Self::hsum4(a0, a1, a2, a3)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn dot_streamed_row_avx2_fma(
-        x: &[f32],
-        raw_expert: &[u8],
-        row_start: usize,
-        blocks_per_row: usize,
-    ) -> f32 {
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
-        let mut a2 = _mm256_setzero_ps();
-        let mut a3 = _mm256_setzero_ps();
-        let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
-            let packed =
-                &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                let packed_byte = packed[byte_idx];
-                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                    dequant[(packed_byte >> 4) as usize];
-            }
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
-            a0 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start)),
-                _mm256_loadu_ps(w_block.as_ptr()),
-                a0,
-            );
-            a1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 8)),
-                _mm256_loadu_ps(w_block.as_ptr().add(8)),
-                a1,
-            );
-            a2 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 16)),
-                _mm256_loadu_ps(w_block.as_ptr().add(16)),
-                a2,
-            );
-            a3 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 24)),
-                _mm256_loadu_ps(w_block.as_ptr().add(24)),
-                a3,
-            );
-        }
-        Self::hsum4(a0, a1, a2, a3)
-    }
 
     fn dot_row(
         x: &[f32],
@@ -884,10 +550,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 (*tokens, index_dims[1], *cols, false)
             }
             [tokens, x_topk, cols] => {
-                // The routed MoE contract allows either one shared input row per
-                // token ([tokens, 1, hidden]) or one input row per routed slot
-                // ([tokens, topk, hidden]).  GPT-OSS passes the former while
-                // topk_ids has one expert index for every route.
                 if *tokens != index_dims[0] {
                     candle_core::bail!(
                         "GPT-OSS MXFP4 streaming input and index token counts do not agree"
@@ -920,43 +582,66 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
-        let mut routes_by_expert = vec![Vec::<usize>::new(); self.num_experts];
-        for (route, &expert) in indices_data.iter().enumerate() {
+        if indices_data.len() != num_tokens * topk {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 streaming indices have {} routes, expected {}",
+                indices_data.len(),
+                num_tokens * topk
+            );
+        }
+
+        // Flat routing representation: one contiguous route buffer plus expert
+        // prefix offsets. This removes one heap allocation per expert from the old
+        // Vec<Vec<usize>> representation.
+        let mut expert_counts = vec![0usize; self.num_experts];
+        for &expert in &indices_data {
             let expert = expert as usize;
             if expert >= self.num_experts {
                 candle_core::bail!(
-                    "GPT-OSS MXFP4 expert index {} out of range for {} experts",
-                    expert,
+                    "GPT-OSS MXFP4 expert index {expert} out of range for {} experts",
                     self.num_experts
                 );
             }
-            routes_by_expert[expert].push(route);
+            expert_counts[expert] += 1;
         }
-        let mut experts = routes_by_expert
-            .iter()
-            .enumerate()
-            .filter_map(|(expert, routes)| (!routes.is_empty()).then_some(expert))
+
+        let mut expert_offsets = vec![0usize; self.num_experts + 1];
+        for expert in 0..self.num_experts {
+            expert_offsets[expert + 1] =
+                expert_offsets[expert].saturating_add(expert_counts[expert]);
+        }
+
+        let mut routes_flat = vec![0usize; indices_data.len()];
+        let mut cursors = expert_offsets[..self.num_experts].to_vec();
+        for (route, &expert) in indices_data.iter().enumerate() {
+            let expert = expert as usize;
+            let dst = cursors[expert];
+            routes_flat[dst] = route;
+            cursors[expert] += 1;
+        }
+
+        let mut experts = (0..self.num_experts)
+            .filter(|&expert| expert_counts[expert] != 0)
             .collect::<Vec<_>>();
+
         if self.cache.zero_copy() {
-            // Mapped expert ranges are retained without heap pressure. Keep them
-            // in file order so mmap/page-cache readahead sees increasing offsets.
+            // Preserve GGUF file locality in zero-copy mode.
             experts.sort_unstable();
         } else {
-            // Heap-backed fallback mode keeps low-frequency experts first so the
-            // per-source quota retains the hottest experts at the end of the pass.
-            experts.sort_unstable_by_key(|&expert| (routes_by_expert[expert].len(), expert));
+            // In heap-backed fallback mode, load cold experts first so the
+            // per-source quota leaves hot experts resident.
+            experts.sort_unstable_by_key(|&expert| (expert_counts[expert], expert));
         }
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
         for weight_idx in 0..self.raw_weights.len() {
             for &expert_idx in &experts {
-                let range = self.raw_expert_range(weight_idx, expert_idx)?;
                 requests.push((
                     MxFp4StreamKey {
                         source: self.raw_weights[weight_idx].clone(),
                         expert_index: expert_idx,
                     },
-                    range,
+                    self.raw_expert_range(weight_idx, expert_idx)?,
                 ));
             }
         }
@@ -970,214 +655,75 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
         let kernel = Self::dot_kernel();
 
-        // Compute each routed expert once over all of its route rows. The previous
-        // implementation parallelized over route rows and decoded the full expert
-        // matrix independently for every route, which is especially expensive for
-        // prompt batches where the same expert can serve multiple tokens.
-        //
-        // The grouped path below parallelizes over output rows, decodes each MXFP4
-        // weight block once per row, and reuses it across all matching routes..
-        if self.raw_weights.len() > 1 {
-            for component in 0..self.raw_weights.len() {
-                for &expert_idx in &experts {
-                    let key = MxFp4StreamKey {
-                        source: self.raw_weights[component].clone(),
-                        expert_index: expert_idx,
-                    };
-                    let expert_data;
-                    if let Some(pending_queue) = pending.as_mut() {
-                        let handle = pending_queue.pop_front().ok_or_else(|| {
-                            candle_core::Error::Msg(
-                                "GPT-OSS MXFP4 streamed expert request was not scheduled"
-                                    .to_string(),
-                            )
-                        })?;
-                        expert_data = self.cache.resolve(&key, handle)?;
-                    } else {
-                        let range = self.raw_expert_range(component, expert_idx)?;
-                        expert_data = self.cache.load(&key, range)?;
-                    }
-                    let expert = expert_data.as_ref();
-                    let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
-                        candle_core::Error::Msg(
-                            "GPT-OSS MXFP4 route table lost a selected expert".into(),
-                        )
-                    })?;
-                    let route_x_offsets: Vec<usize> = routes
-                        .iter()
-                        .map(|&route_row| {
-                            if x_has_topk {
-                                route_row * self.in_dim
-                            } else {
-                                (route_row / topk) * self.in_dim
-                            }
-                        })
-                        .collect();
+        // Reused across all experts/components in this forward.
+        let mut route_x_offsets = Vec::<usize>::new();
+        let mut partial = Vec::<f32>::new();
+        let interleaved_gate_up = self.raw_weights.len() == 2;
 
-                    let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
-                    let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-                    let route_count = routes.len();
-
-                    if route_count >= Self::GEMM_MIN_ROUTES {
-                        let result =
-                            Self::gemm_routes(&x_data, &route_x_offsets, expert, self.component_out_dim, self.in_dim)?;
-                        for (route_idx, &route_row) in routes.iter().enumerate() {
-                            let out_row = &mut output
-                                [route_row * self.out_dim..(route_row + 1) * self.out_dim];
-                            let base = route_idx * self.component_out_dim;
-                            for row in 0..self.component_out_dim {
-                                out_row[row * 2 + component] += result[base + row];
-                            }
-                        }
-                        continue;
-                    }
-
-                if route_count == 1 {
-                        let route_row = routes[0];
-                        let x_offset = route_x_offsets[0];
-                        let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                        let out_row =
-                            &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
-                        out_row
-                            .par_chunks_mut(2)
-                            .enumerate()
-                            .for_each(|(row, pair)| {
-                                pair[component] +=
-                                    Self::dot_streamed_row(x_row, expert, row, kernel);
-                            });
-                        continue;
-                    }
-
-                    let mut partial = vec![0f32; self.component_out_dim * route_count];
-
-                    partial
-                        .par_chunks_mut(route_count)
-                        .enumerate()
-                        .for_each(|(row, accs)| {
-                            if let Some(grouped) = Self::dot_streamed_row_group(
-                                &x_data,
-                                &route_x_offsets,
-                                expert,
-                                row,
-                                self.in_dim,
-                                route_count,
-                            ) {
-                                accs[..route_count].copy_from_slice(&grouped[..route_count]);
-                                return;
-                            }
-
-                            let row_start = row * row_bytes;
-                            for block_idx in 0..blocks_per_row {
-                                let block_start =
-                                    row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                                let scale = expert[block_start] as usize;
-                                let dequant = &MXFP4Layer::DEQUANT_LUT[scale];
-                                let packed =
-                                    &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
-                                let col_start = block_idx * MXFP4_BLOCK_SIZE;
-                                let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                                    let packed_byte = packed[byte_idx];
-                                    w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                                    w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                                        dequant[(packed_byte >> 4) as usize];
-                                }
-
-                                for pair_start in (0..route_count).step_by(2) {
-                                let pair_len = (route_count - pair_start).min(2);
-                                if pair_len == 2 {
-                                    #[cfg(target_arch = "x86_64")]
-                                    if kernel >= 2 {
-                                        let pair = unsafe {
-                                            Self::dot_block_pair_avx2_fma(
-                                                &x_data,
-                                                route_x_offsets[pair_start],
-                                                route_x_offsets[pair_start + 1],
-                                                col_start,
-                                                &w_block,
-                                            )
-                                        };
-                                        accs[pair_start] += pair[0];
-                                        accs[pair_start + 1] += pair[1];
-                                        continue;
-                                    }
-
-                                    #[cfg(target_arch = "x86_64")]
-                                    if kernel == 1 {
-                                        let pair = unsafe {
-                                            Self::dot_block_pair_avx2(
-                                                &x_data,
-                                                route_x_offsets[pair_start],
-                                                route_x_offsets[pair_start + 1],
-                                                col_start,
-                                                &w_block,
-                                            )
-                                        };
-                                        accs[pair_start] += pair[0];
-                                        accs[pair_start + 1] += pair[1];
-                                        continue;
-                                    }
-                                }
-
-                                let x_offset = route_x_offsets[pair_start];
-                                let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                                let x_block =
-                                    &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                accs[pair_start] +=
-                                    Self::dot_block(x_block, &w_block, kernel);
-                            }
-                        });
-
-                    for (route_idx, &route_row) in routes.iter().enumerate() {
-                        let out_row = &mut output
-                            [route_row * self.out_dim..(route_row + 1) * self.out_dim];
-                        for row in 0..self.component_out_dim {
-                            out_row[row * 2 + component] +=
-                                partial[row * route_count + route_idx];
-                        }
-                    }
-                }
-            }
-        } else {
-            let component = 0usize;
+        for component in 0..self.raw_weights.len() {
             for &expert_idx in &experts {
                 let key = MxFp4StreamKey {
                     source: self.raw_weights[component].clone(),
                     expert_index: expert_idx,
                 };
-                let expert_data;
-                if let Some(pending_queue) = pending.as_mut() {
+
+                let expert_data = if let Some(pending_queue) = pending.as_mut() {
                     let handle = pending_queue.pop_front().ok_or_else(|| {
                         candle_core::Error::Msg(
                             "GPT-OSS MXFP4 streamed expert request was not scheduled"
                                 .to_string(),
                         )
                     })?;
-                    expert_data = self.cache.resolve(&key, handle)?;
+                    self.cache.resolve(&key, handle)?
                 } else {
-                    let range = self.raw_expert_range(0, expert_idx)?;
-                    expert_data = self.cache.load(&key, range)?;
-                }
+                    let range = self.raw_expert_range(component, expert_idx)?;
+                    self.cache.load(&key, range)?
+                };
                 let expert = expert_data.as_ref();
-                let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
-                    candle_core::Error::Msg(
-                        "GPT-OSS MXFP4 route table lost a selected expert".into(),
-                    )
-                })?;
-                let route_x_offsets: Vec<usize> = routes
-                    .iter()
-                    .map(|&route_row| {
-                        if x_has_topk {
-                            route_row * self.in_dim
-                        } else {
-                            (route_row / topk) * self.in_dim
-                        }
-                    })
-                    .collect();
+
+                let route_start = expert_offsets[expert_idx];
+                let route_end = expert_offsets[expert_idx + 1];
+                let routes = &routes_flat[route_start..route_end];
+                let route_count = routes.len();
+
+                route_x_offsets.clear();
+                if route_x_offsets.capacity() < route_count {
+                    route_x_offsets.reserve(route_count - route_x_offsets.capacity());
+                }
+                for &route_row in routes {
+                    route_x_offsets.push(if x_has_topk {
+                        route_row * self.in_dim
+                    } else {
+                        (route_row / topk) * self.in_dim
+                    });
+                }
 
                 let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
-                let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-                let route_count = routes.len();
+
+                if route_count >= Self::GEMM_MIN_ROUTES {
+                    let result = Self::gemm_routes(
+                        &x_data,
+                        &route_x_offsets,
+                        expert,
+                        self.component_out_dim,
+                        self.in_dim,
+                    )?;
+
+                    for (route_idx, &route_row) in routes.iter().enumerate() {
+                        let out_row =
+                            &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                        let base = route_idx * self.component_out_dim;
+                        for row in 0..self.component_out_dim {
+                            let col = if interleaved_gate_up {
+                                row * 2 + component
+                            } else {
+                                row
+                            };
+                            out_row[col] += result[base + row];
+                        }
+                    }
+                    continue;
+                }
 
                 if route_count == 1 {
                     let route_row = routes[0];
@@ -1185,105 +731,393 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     let x_row = &x_data[x_offset..x_offset + self.in_dim];
                     let out_row =
                         &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
-                    out_row
-                        .par_iter_mut()
-                        .enumerate()
-                        .for_each(|(row, value)| {
-                            *value += Self::dot_streamed_row(x_row, expert, row, kernel);
-                        });
+
+                    let parallel = Self::adaptive_parallel(1, self.component_out_dim, blocks_per_row);
+                    if parallel {
+                        if interleaved_gate_up {
+                            out_row
+                                .par_chunks_mut(2)
+                                .enumerate()
+                                .for_each(|(row, pair)| {
+                                    let value = if kernel >= 2 {
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe {
+                                                Self::dot_streamed_row_fused_avx2_fma(
+                                                    x_row,
+                                                    expert,
+                                                    row,
+                                                    self.in_dim,
+                                                )
+                                            }
+                                        }
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        {
+                                            0.0
+                                        }
+                                    } else if kernel == 1 {
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe {
+                                                Self::dot_streamed_row_fused_avx2(
+                                                    x_row,
+                                                    expert,
+                                                    row,
+                                                    self.in_dim,
+                                                )
+                                            }
+                                        }
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        {
+                                            0.0
+                                        }
+                                    } else {
+                                        let row_bytes =
+                                            blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                        let mut acc = 0.0f32;
+                                        for block_idx in 0..blocks_per_row {
+                                            let block_start =
+                                                row * row_bytes
+                                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                            let scale =
+                                                &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
+                                            let packed = &expert[block_start + 1
+                                                ..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                            let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                                let packed_byte = packed[byte_idx];
+                                                acc += x_row[col_start + byte_idx]
+                                                    * scale[(packed_byte & 0x0f) as usize];
+                                                acc += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                                    * scale[(packed_byte >> 4) as usize];
+                                            }
+                                        }
+                                        acc
+                                    };
+                                    pair[component] += value;
+                                });
+                        } else {
+                            out_row
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(row, value)| {
+                                    let value = if kernel >= 2 {
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe {
+                                                Self::dot_streamed_row_fused_avx2_fma(
+                                                    x_row,
+                                                    expert,
+                                                    row,
+                                                    self.in_dim,
+                                                )
+                                            }
+                                        }
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        {
+                                            0.0
+                                        }
+                                    } else if kernel == 1 {
+                                        #[cfg(target_arch = "x86_64")]
+                                        {
+                                            unsafe {
+                                                Self::dot_streamed_row_fused_avx2(
+                                                    x_row,
+                                                    expert,
+                                                    row,
+                                                    self.in_dim,
+                                                )
+                                            }
+                                        }
+                                        #[cfg(not(target_arch = "x86_64"))]
+                                        {
+                                            0.0
+                                        }
+                                    } else {
+                                        let row_bytes =
+                                            blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                        let mut acc = 0.0f32;
+                                        for block_idx in 0..blocks_per_row {
+                                            let block_start =
+                                                row * row_bytes
+                                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                            let scale =
+                                                &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
+                                            let packed = &expert[block_start + 1
+                                                ..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                            let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                                let packed_byte = packed[byte_idx];
+                                                acc += x_row[col_start + byte_idx]
+                                                    * scale[(packed_byte & 0x0f) as usize];
+                                                acc += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                                    * scale[(packed_byte >> 4) as usize];
+                                            }
+                                        }
+                                        acc
+                                    };
+                                    *value += value;
+                                });
+                        }
+                    } else {
+                        for row in 0..self.component_out_dim {
+                            let value = if kernel >= 2 {
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    unsafe {
+                                        Self::dot_streamed_row_fused_avx2_fma(
+                                            x_row,
+                                            expert,
+                                            row,
+                                            self.in_dim,
+                                        )
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    let row_bytes =
+                                        blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                    let mut acc = 0.0f32;
+                                    for block_idx in 0..blocks_per_row {
+                                        let block_start =
+                                            row * row_bytes
+                                                + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                        let scale = &MXFP4Layer::DEQUANT_LUT
+                                            [expert[block_start] as usize];
+                                        let packed = &expert[block_start + 1
+                                            ..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                        let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                        for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                            let packed_byte = packed[byte_idx];
+                                            acc += x_row[col_start + byte_idx]
+                                                * scale[(packed_byte & 0x0f) as usize];
+                                            acc += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                                * scale[(packed_byte >> 4) as usize];
+                                        }
+                                    }
+                                    acc
+                                }
+                            } else if kernel == 1 {
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    unsafe {
+                                        Self::dot_streamed_row_fused_avx2(
+                                            x_row,
+                                            expert,
+                                            row,
+                                            self.in_dim,
+                                        )
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    let row_bytes =
+                                        blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                    let mut acc = 0.0f32;
+                                    for block_idx in 0..blocks_per_row {
+                                        let block_start =
+                                            row * row_bytes
+                                                + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                        let scale = &MXFP4Layer::DEQUANT_LUT
+                                            [expert[block_start] as usize];
+                                        let packed = &expert[block_start + 1
+                                            ..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                        let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                        for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                            let packed_byte = packed[byte_idx];
+                                            acc += x_row[col_start + byte_idx]
+                                                * scale[(packed_byte & 0x0f) as usize];
+                                            acc += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                                * scale[(packed_byte >> 4) as usize];
+                                        }
+                                    }
+                                    acc
+                                }
+                            } else {
+                                let mut acc = 0.0f32;
+                                let row_bytes =
+                                    blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                for block_idx in 0..blocks_per_row {
+                                    let block_start =
+                                        row * row_bytes
+                                            + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                    let scale =
+                                        &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
+                                    let packed = &expert[block_start + 1
+                                        ..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                    let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                        let packed_byte = packed[byte_idx];
+                                        acc += x_row[col_start + byte_idx]
+                                            * scale[(packed_byte & 0x0f) as usize];
+                                        acc += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                            * scale[(packed_byte >> 4) as usize];
+                                    }
+                                }
+                                acc
+                            };
+
+                            let col = if interleaved_gate_up {
+                                row * 2 + component
+                            } else {
+                                row
+                            };
+                            out_row[col] += value;
+                        }
+                    }
                     continue;
                 }
 
-                let mut partial = vec![0f32; self.component_out_dim * route_count];
+                let scratch_len = self.component_out_dim * route_count;
+                if partial.len() < scratch_len {
+                    partial.resize(scratch_len, 0.0);
+                } else {
+                    partial[..scratch_len].fill(0.0);
+                    partial.truncate(scratch_len);
+                }
 
-                partial
-                    .par_chunks_mut(route_count)
-                    .enumerate()
-                    .for_each(|(row, accs)| {
-                        if let Some(grouped) = Self::dot_streamed_row_group(
-                            &x_data,
-                            &route_x_offsets,
-                            expert,
-                            row,
-                            self.in_dim,
-                            route_count,
-                        ) {
-                            accs[..route_count].copy_from_slice(&grouped[..route_count]);
-                            return;
+                let parallel = Self::adaptive_parallel(route_count, self.component_out_dim, blocks_per_row);
+                let compute_rows = |partial: &mut [f32]| {
+                    partial
+                        .par_chunks_mut(route_count)
+                        .enumerate()
+                        .for_each(|(row, accs)| {
+                            if kernel >= 2 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    Self::dot_streamed_routes_fused_avx2_fma(
+                                        &x_data,
+                                        &route_x_offsets,
+                                        expert,
+                                        row,
+                                        self.in_dim,
+                                        accs,
+                                    );
+                                    return;
+                                }
+                            } else if kernel == 1 {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    Self::dot_streamed_routes_fused_avx2(
+                                        &x_data,
+                                        &route_x_offsets,
+                                        expert,
+                                        row,
+                                        self.in_dim,
+                                        accs,
+                                    );
+                                    return;
+                                }
+                            }
+
+                            let row_bytes =
+                                blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                            let row_start = row * row_bytes;
+                            for block_idx in 0..blocks_per_row {
+                                let block_start =
+                                    row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                let dequant =
+                                    &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
+                                let packed =
+                                    &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                for (route_idx, &x_offset) in
+                                    route_x_offsets.iter().enumerate()
+                                {
+                                    let x_row =
+                                        &x_data[x_offset..x_offset + self.in_dim];
+                                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                        let packed_byte = packed[byte_idx];
+                                        accs[route_idx] += x_row[col_start + byte_idx]
+                                            * dequant[(packed_byte & 0x0f) as usize];
+                                        accs[route_idx] += x_row[
+                                            col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx
+                                        ] * dequant[(packed_byte >> 4) as usize];
+                                    }
+                                }
+                            }
+                        });
+                };
+
+                if parallel {
+                    compute_rows(&mut partial[..scratch_len]);
+                } else {
+                    for row in 0..self.component_out_dim {
+                        let accs =
+                            &mut partial[row * route_count..(row + 1) * route_count];
+                        if kernel >= 2 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                Self::dot_streamed_routes_fused_avx2_fma(
+                                    &x_data,
+                                    &route_x_offsets,
+                                    expert,
+                                    row,
+                                    self.in_dim,
+                                    accs,
+                                );
+                                continue;
+                            }
+                        } else if kernel == 1 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                Self::dot_streamed_routes_fused_avx2(
+                                    &x_data,
+                                    &route_x_offsets,
+                                    expert,
+                                    row,
+                                    self.in_dim,
+                                    accs,
+                                );
+                                continue;
+                            }
                         }
 
-                        let row_start = row * row_bytes;
+                        let row_bytes =
+                            blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
                         for block_idx in 0..blocks_per_row {
                             let block_start =
-                                row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                            let scale = expert[block_start] as usize;
-                            let dequant = &MXFP4Layer::DEQUANT_LUT[scale];
+                                row * row_bytes
+                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                            let dequant =
+                                &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
                             let packed =
                                 &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
                             let col_start = block_idx * MXFP4_BLOCK_SIZE;
-                            let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
-                            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                                let packed_byte = packed[byte_idx];
-                                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
-                                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
-                                    dequant[(packed_byte >> 4) as usize];
-                            }
-
-                            for pair_start in (0..route_count).step_by(2) {
-                                let pair_len = (route_count - pair_start).min(2);
-                                if pair_len == 2 {
-                                    #[cfg(target_arch = "x86_64")]
-                                    if kernel >= 2 {
-                                        let pair = unsafe {
-                                            Self::dot_block_pair_avx2_fma(
-                                                &x_data,
-                                                route_x_offsets[pair_start],
-                                                route_x_offsets[pair_start + 1],
-                                                col_start,
-                                                &w_block,
-                                            )
-                                        };
-                                        accs[pair_start] += pair[0];
-                                        accs[pair_start + 1] += pair[1];
-                                        continue;
-                                    }
-
-                                    #[cfg(target_arch = "x86_64")]
-                                    if kernel == 1 {
-                                        let pair = unsafe {
-                                            Self::dot_block_pair_avx2(
-                                                &x_data,
-                                                route_x_offsets[pair_start],
-                                                route_x_offsets[pair_start + 1],
-                                                col_start,
-                                                &w_block,
-                                            )
-                                        };
-                                        accs[pair_start] += pair[0];
-                                        accs[pair_start + 1] += pair[1];
-                                        continue;
-                                    }
+                            for (route_idx, &x_offset) in
+                                route_x_offsets.iter().enumerate()
+                            {
+                                let x_row =
+                                    &x_data[x_offset..x_offset + self.in_dim];
+                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                    let packed_byte = packed[byte_idx];
+                                    accs[route_idx] += x_row[col_start + byte_idx]
+                                        * dequant[(packed_byte & 0x0f) as usize];
+                                    accs[route_idx] += x_row[
+                                        col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx
+                                    ] * dequant[(packed_byte >> 4) as usize];
                                 }
-
-                                let x_offset = route_x_offsets[pair_start];
-                                let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                                let x_block =
-                                    &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                accs[pair_start] +=
-                                    Self::dot_block(x_block, &w_block, kernel);
                             }
                         }
-                    });
+                    }
+                }
 
                 for (route_idx, &route_row) in routes.iter().enumerate() {
-                    let out_row = &mut output
-                        [route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                    let out_row =
+                        &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                    let base = route_idx;
                     for row in 0..self.component_out_dim {
-                        out_row[row] += partial[row * route_count + route_idx];
+                        let col = if interleaved_gate_up {
+                            row * 2 + component
+                        } else {
+                            row
+                        };
+                        out_row[col] += partial[row * route_count + base];
                     }
                 }
             }
         }
+
         if let Some(bias_data) = &self.bias_cpu {
             output
                 .par_chunks_mut(self.out_dim)
@@ -1978,6 +1812,29 @@ impl MXFP4Layer {
     /// For each of the 256 possible E8M0 scale values, stores the 16 possible
     /// dequantized values (FP4_LUT[nibble] * 2^(scale - 127)).
     /// This turns dequantization into a single table lookup per element.
+    const DEQUANT_LUT_FLAT: [f32; 4096] = {
+        let mut lut = [0.0f32; 4096];
+        let fp4: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let mut s = 0u32;
+        while s < 256 {
+            let scale_factor = if s < 2 {
+                f32::from_bits(0x0020_0000u32 << s)
+            } else {
+                f32::from_bits((s - 1) << 23)
+            };
+            let mut n = 0;
+            while n < 16 {
+                lut[s as usize * 16 + n] = fp4[n] * scale_factor;
+                n += 1;
+            }
+            s += 1;
+        }
+        lut
+    };
+
     const DEQUANT_LUT: [[f32; 16]; 256] = {
         let mut lut = [[0.0f32; 16]; 256];
         let fp4: [f32; 16] = [
