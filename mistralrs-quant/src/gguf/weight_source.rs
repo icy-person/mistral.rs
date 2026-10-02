@@ -12,6 +12,7 @@ use crate::{
     QuantMethodConfig, QuantizedWeightSource, Shard, ShardedSafeTensors, ShardedVarBuilder,
     TensorShapes, UnquantLinear,
 };
+use crate::mxfp4::MxFp4StreamingExpertLayer;
 
 const DIRECT_GGUF_DTYPES: &str =
     "F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q2_K through Q8_K";
@@ -832,7 +833,7 @@ impl QuantizedWeightSource for GgufWeightSource {
         };
 
         let bias = self.load_bias(key, &Device::Cpu, None, 3)?;
-        let layer = crate::MxFp4StreamingExpertLayer::from_gguf(
+        let layer = MxFp4StreamingExpertLayer::from_gguf(
             self.archive.clone(),
             raw_names,
             num_experts,
