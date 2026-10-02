@@ -357,6 +357,8 @@ pub struct ModelLoaderConfig {
     pub mtp_config: Option<MtpConfig>,
     /// Optional logical tensor byte budget for multimodal encoder outputs.
     pub encoder_cache_memory_bytes: Option<usize>,
+    /// Whether to keep supported MoE expert banks file-backed and stream routed experts.
+    pub moe_streaming: bool,
 }
 
 /// State preserved when a model is unloaded.
@@ -2747,6 +2749,7 @@ impl MistralRs {
                     .is_some_and(MtpConfig::is_builtin),
             )
             .with_encoder_cache_memory_bytes(loader_config.encoder_cache_memory_bytes)
+            .with_moe_streaming(loader_config.moe_streaming)
             .build()
             .map_err(|e| MistralRsError::ReloadFailed(format!("Failed to build loader: {e}")))?;
 

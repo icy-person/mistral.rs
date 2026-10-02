@@ -753,6 +753,7 @@ pub async fn build_text_pipeline(
         hf_config_overrides: builder.hf_config_overrides.clone(),
         mtp_config: builder.mtp_config.clone(),
         encoder_cache_memory_bytes: None,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -908,6 +909,7 @@ pub async fn build_multimodal_pipeline(
         hf_config_overrides: builder.hf_config_overrides.clone(),
         mtp_config: builder.mtp_config.clone(),
         encoder_cache_memory_bytes: builder.encoder_cache_memory_bytes,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -1106,6 +1108,7 @@ pub async fn build_gguf_pipeline(
         hf_config_overrides: None,
         mtp_config: builder.mtp_config.clone(),
         encoder_cache_memory_bytes: builder.encoder_cache_memory_bytes,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -1169,6 +1172,7 @@ pub async fn build_diffusion_pipeline(
         hf_config_overrides: None,
         mtp_config: None,
         encoder_cache_memory_bytes: None,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -1236,6 +1240,7 @@ pub async fn build_speech_pipeline(
         hf_config_overrides: None,
         mtp_config: None,
         encoder_cache_memory_bytes: None,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -1334,6 +1339,7 @@ pub async fn build_embedding_pipeline(
         hf_config_overrides: None,
         mtp_config: None,
         encoder_cache_memory_bytes: None,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {
@@ -1517,6 +1523,7 @@ pub async fn build_auto_pipeline(
         hf_config_overrides: builder.hf_config_overrides.clone(),
         mtp_config: builder.mtp_config.clone(),
         encoder_cache_memory_bytes: builder.encoder_cache_memory_bytes,
+        moe_streaming: false,
     };
 
     let add_model_config = AddModelConfig {

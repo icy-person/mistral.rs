@@ -782,9 +782,13 @@ impl StreamedProjection {
         let row_bytes = expert_bytes / full_rows;
 
         let shard = info.shard_index();
-        let shard_info = archive.shards().get(shard).ok_or_else(|| {
-            candle_core::Error::Msg("GGUF expert shard index out of range".to_string())
-        })?;
+        let shard_file_len = archive
+            .shards()
+            .get(shard)
+            .map(|shard| shard.file_len())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("GGUF expert shard index out of range".to_string())
+            })?;
         let tensor_offset = info.data_range().ok_or_else(|| {
             candle_core::Error::Msg(format!("GGUF expert tensor {source} has no data range"))
         })?.start;
