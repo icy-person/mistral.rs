@@ -1604,16 +1604,14 @@ mod tests {
         let raw_expert = vec![127u8; 4 * (MXFP4_BLOCK_SIZE / 2 + 1)];
         let mut output = vec![0.0f32; 4];
 
-        // This targets the last output column. Before the fix, adding row to the
-        // final column offset made the computed index 6 and panicked here.
+        // This targets the last output column. The helper now receives the
+        // route-local output row, so the column offset is applied exactly once.
         MxFp4StreamingExpertLayer::dot_row(
             &x,
             &raw_expert,
             3,
-            3,
             &mut output,
-            0,
-            4,
+            3,
         );
 
         assert!(output[3].is_finite());
