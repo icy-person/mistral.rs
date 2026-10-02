@@ -305,19 +305,7 @@ impl MxFp4StreamCache {
         let queue_size = 8usize;
         let mut queues = Vec::with_capacity(config.io_threads);
 
-        let cache = Arc::new(Self {
-            inner: Mutex::new(CacheInner {
-                entries: HashMap::new(),
-                used_bytes: 0,
-                clock: 0,
-            }),
-            queues: Vec::new(),
-            next_queue: AtomicUsize::new(0),
-            paths: paths.clone(),
-            budget_bytes: config.cache_budget_bytes(),
-            config,
-            stats: Stats::default(),
-        });
+        let mut queues = Vec::with_capacity(config.io_threads);
 
         for worker_id in 0..config.io_threads {
             let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
@@ -360,13 +348,27 @@ impl MxFp4StreamCache {
                         let _ = job.reply.send(result);
                     }
                 })
-                .map_err(|err| io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("failed to start MXFP4 I/O worker: {err}"),
-                ))?;
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to start MXFP4 I/O worker: {err}"),
+                    )
+                })?;
         }
 
-        cache.queues = queues;
+        let cache = Arc::new(Self {
+            inner: Mutex::new(CacheInner {
+                entries: HashMap::new(),
+                used_bytes: 0,
+                clock: 0,
+            }),
+            queues,
+            next_queue: AtomicUsize::new(0),
+            paths: paths.clone(),
+            budget_bytes: config.cache_budget_bytes(),
+            config,
+            stats: Stats::default(),
+        });
         Ok(cache)
     }
 
