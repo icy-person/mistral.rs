@@ -11,7 +11,7 @@ use std::arch::x86_64::{
     _mm256_hadd_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
     _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set1_epi16, _mm256_set1_epi32,
     _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256,
-    _mm256_slli_epi32, _mm256_srli_epi32, _mm256_sub_epi32, _mm256_sub_ps, _mm256_xor_ps,
+    _mm256_slli_epi32, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps, _mm256_xor_ps,
     _mm_add_ss,
     _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_packus_epi16, _mm_setzero_si128,
     _mm_srli_epi16, _mm_unpacklo_epi8,
