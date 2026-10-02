@@ -1155,7 +1155,6 @@ impl MxFp4StreamingExpertLayer {
         let mut activations = Vec::new();
         let mut gate_values = Vec::new();
         let mut up_values = Vec::new();
-        let mut route_x_offsets = Vec::with_capacity(topk.max(1));
         let kernel = Self::dot_kernel();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
@@ -1203,11 +1202,6 @@ impl MxFp4StreamingExpertLayer {
             }
 
             let activation_len = route_count * down.in_dim;
-            if activations.len() < activation_len {
-                activations.resize(activation_len, 0.0);
-            } else {
-                activations.truncate(activation_len);
-            }
             activations.resize(activation_len, 0.0);
 
             let gate_raw = gate_data.as_ref();
@@ -1311,7 +1305,7 @@ impl MxFp4StreamingExpertLayer {
                     });
             }
 
-            let activation_offsets: Vec<usize> =
+                let activation_offsets: Vec<usize> =
                 (0..route_count).map(|route| route * down.in_dim).collect();
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
             let down_kernel = kernel;
@@ -3312,6 +3306,53 @@ mod tests {
         let actual = MxFp4StreamingExpertLayer::dot_block(&x, &w, kernel);
         assert!((actual - scalar).abs() < 1e-4, "actual={actual} scalar={scalar}");
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn streaming_swiglu_avx2_matches_scalar() {
+        let alpha = 1.702f32;
+        let values = [
+            -18.0f32, -8.0, -2.0, -1.0, -0.25, 0.0, 0.25, 1.0,
+            2.0, 4.0, 7.0, 18.0, -30.0, 30.0, 0.5, -0.5,
+        ];
+        let gates = values;
+        let ups = [
+            7.0f32, -7.0, 3.0, -3.0, 1.0, -1.0, 0.0, 2.0,
+            -2.0, 6.0, -6.0, 7.0, -7.0, 0.0, 0.75, -0.75,
+        ];
+
+        let expected = gates.map(|gate| gate.min(7.0));
+        let expected_up = ups.map(|up| up.clamp(-7.0, 7.0));
+        let expected: Vec<f32> = expected
+            .iter()
+            .zip(expected_up.iter())
+            .map(|(&gate, &up)| {
+                (up + 1.0) * gate / (1.0 + (-gate * alpha).exp())
+            })
+            .collect();
+
+        let actual = unsafe {
+            let g = _mm256_loadu_ps(gates.as_ptr());
+            let u = _mm256_loadu_ps(ups.as_ptr());
+            let y = MxFp4StreamingExpertLayer::swiglu8_avx2(g, u, alpha);
+            let mut out = [0.0f32; 8];
+            _mm256_storeu_ps(out.as_mut_ptr(), y);
+            let g2 = _mm256_loadu_ps(gates.as_ptr().add(8));
+            let u2 = _mm256_loadu_ps(ups.as_ptr().add(8));
+            let y2 = MxFp4StreamingExpertLayer::swiglu8_avx2(g2, u2, alpha);
+            _mm256_storeu_ps(out[8..].as_mut_ptr(), y2);
+            out.to_vec()
+        };
+
+        for (got, want) in actual.iter().zip(expected.iter()) {
+            let tol = 2e-4f32.max(want.abs() * 2e-4);
+            assert!(
+                (got - want).abs() <= tol,
+                "got={got} want={want} diff={}",
+                (got - want).abs()
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
