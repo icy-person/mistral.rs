@@ -177,6 +177,7 @@ pub(crate) struct MxFp4StreamCache {
     queue: SyncSender<ReadJob>,
     paths: Vec<PathBuf>,
     config: MxFp4StreamConfig,
+    budget_bytes: usize,
     stats: Stats,
 }
 
@@ -200,6 +201,7 @@ impl MxFp4StreamCache {
             }),
             queue,
             paths: paths.clone(),
+            budget_bytes: config.cache_budget_bytes(),
             config,
             stats: Stats::default(),
         });
@@ -247,7 +249,7 @@ impl MxFp4StreamCache {
 
     fn insert(&self, key: MxFp4StreamKey, data: Arc<Vec<u8>>) {
         let len = data.len();
-        let capacity = self.config.cache_budget_bytes();
+        let capacity = self.budget_bytes;
         if len == 0 || len > capacity {
             return;
         }
@@ -383,7 +385,7 @@ impl MxFp4StreamCache {
             "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
-            self.config.cache_budget_bytes() / MIB,
+            self.budget_bytes / MIB,
             hits,
             misses,
             hit_rate * 100.0,
