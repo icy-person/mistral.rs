@@ -114,9 +114,6 @@ pub enum Command {
         /// Enable BigMoe-style routed-expert streaming for supported GGUF MoE models.
         /// This keeps GPT-OSS MXFP4 expert banks file-backed and loads only routed experts.
         /// Requires CPU execution.
-        #[arg(long)]
-        moe_stream: bool,
-
         /// LoRA adapter alias to use for requests. Omit to run the base model.
         #[arg(long)]
         adapter: Option<String>,
@@ -714,7 +711,7 @@ pub struct RuntimeOptions {
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 
     /// Stream routed MoE expert weights from GGUF instead of materializing the full expert stack.
-    #[arg(long, env = "MISTRALRS_MOE_STREAM")]
+    #[arg(long = "moe-stream", env = "MISTRALRS_MOE_STREAM")]
     #[serde(default)]
     pub moe_stream: bool,
 
