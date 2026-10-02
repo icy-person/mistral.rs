@@ -244,7 +244,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    #[inline(always)]
+    #[inline]
     unsafe fn load_fused_weight_vectors_avx2(
         raw_expert: &[u8],
         block_start: usize,
@@ -284,7 +284,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    #[inline(always)]
+    #[inline]
     unsafe fn dot_streamed_row_fused_avx2(
         x: &[f32],
         raw_expert: &[u8],
@@ -324,7 +324,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    #[inline(always)]
+    #[inline]
     unsafe fn dot_streamed_row_fused_avx2_fma(
         x: &[f32],
         raw_expert: &[u8],
@@ -364,7 +364,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    #[inline(always)]
+    #[inline]
     unsafe fn dot_streamed_routes_fused_avx2(
         x_data: &[f32],
         x_offsets: &[usize],
@@ -395,7 +395,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    #[inline(always)]
+    #[inline]
     unsafe fn dot_streamed_routes_fused_avx2_fma(
         x_data: &[f32],
         x_offsets: &[usize],
@@ -472,6 +472,69 @@ impl MxFp4StreamingExpertLayer {
     }
 
     const GEMM_MIN_ROUTES: usize = 16;
+
+    #[inline]
+    fn decode_expert_f32(
+        raw_expert: &[u8],
+        out_rows: usize,
+        in_dim: usize,
+    ) -> Vec<f32> {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let mut weights = vec![0f32; out_rows * in_dim];
+
+        weights
+            .par_chunks_mut(in_dim)
+            .enumerate()
+            .for_each(|(row, dst)| {
+                let row_start = row * row_bytes;
+                for block_idx in 0..blocks_per_row {
+                    let block_start =
+                        row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                    let dequant =
+                        &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
+                    let packed =
+                        &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                    let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                        let packed_byte = packed[byte_idx];
+                        dst[col_start + byte_idx] =
+                            dequant[(packed_byte & 0x0f) as usize];
+                        dst[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx] =
+                            dequant[(packed_byte >> 4) as usize];
+                    }
+                }
+            });
+
+        weights
+    }
+
+    #[inline]
+    fn gemm_routes(
+        x_data: &[f32],
+        route_x_offsets: &[usize],
+        raw_expert: &[u8],
+        out_rows: usize,
+        in_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let route_count = route_x_offsets.len();
+        if route_count < Self::GEMM_MIN_ROUTES {
+            return Err(candle_core::Error::Msg(
+                "route count below streamed GEMM threshold".into(),
+            ));
+        }
+
+        let mut x_routes = Vec::with_capacity(route_count * in_dim);
+        for &x_offset in route_x_offsets {
+            x_routes.extend_from_slice(&x_data[x_offset..x_offset + in_dim]);
+        }
+
+        let weights = Self::decode_expert_f32(raw_expert, out_rows, in_dim);
+        let x = Tensor::from_vec(x_routes, (route_count, in_dim), &Device::Cpu)?;
+        let w = Tensor::from_vec(weights, (out_rows, in_dim), &Device::Cpu)?;
+        let y = x.matmul(&w.t()?)?;
+        y.flatten_all()?.to_vec1::<f32>()
+    }
 
     fn dot_row(
         x: &[f32],
