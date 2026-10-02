@@ -163,14 +163,30 @@ impl MxFp4StreamingExpertLayer {
             });
         }
 
-        if let Some(bias) = &bias {
+        let bias_cpu = if let Some(bias) = &bias {
             if bias.dims() != [num_experts, out_dim] {
                 candle_core::bail!(
                     "GPT-OSS MXFP4 streaming bias has shape {:?}, expected [{num_experts}, {out_dim}]",
                     bias.dims()
                 );
             }
-        }
+            let values = bias
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = num_experts * out_dim;
+            if values.len() != expected {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
+                    values.len(),
+                    expected
+                );
+            }
+            Some(Arc::new(values))
+        } else {
+            None
+        };
 
         Ok(Self {
             archive,
@@ -1056,20 +1072,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 }
             }
         }
-        if let Some(bias) = &self.bias {
-            let bias_data = bias
-                .to_dtype(DType::F32)?
-                .to_device(&Device::Cpu)?
-                .flatten_all()?
-                .to_vec1::<f32>()?;
-            let expected = self.num_experts * self.out_dim;
-            if bias_data.len() != expected {
-                candle_core::bail!(
-                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
-                    bias_data.len(),
-                    expected
-                );
-            }
+        if let Some(bias_data) = &self.bias_cpu {
             output
                 .par_chunks_mut(self.out_dim)
                 .enumerate()
