@@ -2311,6 +2311,67 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn streaming_fused_row_kernel_matches_scalar() -> Result<()> {
+        let in_dim = 64;
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+
+        let x = (0..in_dim)
+            .map(|i| ((i as f32 * 0.071) - 1.25).sin())
+            .collect::<Vec<_>>();
+        let mut raw = vec![0u8; row_bytes];
+        for block in 0..blocks_per_row {
+            let start = block * (MXFP4_BLOCK_SIZE / 2 + 1);
+            raw[start] = if block == 0 { 120 } else { 132 };
+            for i in 0..MXFP4_BLOCK_SIZE / 2 {
+                raw[start + 1 + i] = (i as u8).wrapping_mul(29).wrapping_add(0x53);
+            }
+        }
+
+        let mut expected = 0.0f32;
+        for block in 0..blocks_per_row {
+            let start = block * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let dequant = &MXFP4Layer::DEQUANT_LUT[raw[start] as usize];
+            let col_start = block * MXFP4_BLOCK_SIZE;
+            for i in 0..MXFP4_BLOCK_SIZE / 2 {
+                let packed = raw[start + 1 + i];
+                expected += x[col_start + i] * dequant[(packed & 0x0f) as usize];
+                expected +=
+                    x[col_start + MXFP4_BLOCK_SIZE / 2 + i]
+                        * dequant[(packed >> 4) as usize];
+            }
+        }
+
+        let kernel = MxFp4StreamingExpertLayer::dot_kernel();
+        let actual = if kernel >= 2 {
+            unsafe {
+                MxFp4StreamingExpertLayer::dot_streamed_row_fused_avx2_fma(
+                    &x,
+                    &raw,
+                    0,
+                    in_dim,
+                )
+            }
+        } else {
+            unsafe {
+                MxFp4StreamingExpertLayer::dot_streamed_row_fused_avx2(
+                    &x,
+                    &raw,
+                    0,
+                    in_dim,
+                )
+            }
+        };
+
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "actual={actual} expected={expected}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn streaming_dot_row_uses_output_column_once() -> Result<()> {
         let x = vec![1.0f32; MXFP4_BLOCK_SIZE];
