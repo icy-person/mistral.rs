@@ -140,7 +140,7 @@ fn available_memory_bytes() -> usize {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MxFp4StreamKey {
-    pub source: String,
+    pub source: Arc<str>,
     pub expert_index: usize,
 }
 
@@ -796,11 +796,11 @@ mod tests {
     #[test]
     fn cache_keys_include_tensor_source() {
         let gate_l0 = MxFp4StreamKey {
-            source: "blk.0.ffn_gate_exps.weight".to_string(),
+            source: Arc::<str>::from("blk.0.ffn_gate_exps.weight"),
             expert_index: 0,
         };
         let gate_l1 = MxFp4StreamKey {
-            source: "blk.1.ffn_gate_exps.weight".to_string(),
+            source: Arc::<str>::from("blk.1.ffn_gate_exps.weight"),
             expert_index: 0,
         };
         assert_ne!(gate_l0, gate_l1);
