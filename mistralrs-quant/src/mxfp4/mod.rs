@@ -899,12 +899,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         } else {
             None
         };
-        let mut expert_data = HashMap::with_capacity(requests.len());
-        if pending.is_none() {
-            for (key, range) in requests {
-                expert_data.insert(key.clone(), self.cache.load(&key, range)?);
-            }
-        }
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
         let kernel = Self::dot_kernel();
@@ -923,23 +917,20 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         source: self.raw_weights[component].clone(),
                         expert_index: expert_idx,
                     };
-                    if let Some(pending_map) = pending.as_mut() {
-                        if !expert_data.contains_key(&key) {
-                            let handle = pending_map.remove(&key).ok_or_else(|| {
-                                candle_core::Error::Msg(
-                                    "GPT-OSS MXFP4 streamed expert request was not scheduled"
-                                        .to_string(),
-                                )
-                            })?;
-                            let data = self.cache.resolve(&key, handle)?;
-                            expert_data.insert(key.clone(), data);
-                        }
+                    let expert_data;
+                    if let Some(pending_queue) = pending.as_mut() {
+                        let handle = pending_queue.pop_front().ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "GPT-OSS MXFP4 streamed expert request was not scheduled"
+                                    .to_string(),
+                            )
+                        })?;
+                        expert_data = self.cache.resolve(&key, handle)?;
+                    } else {
+                        let range = self.raw_expert_range(component, expert_idx)?;
+                        expert_data = self.cache.load(&key, range)?;
                     }
-                    let expert = expert_data.get(&key).ok_or_else(|| {
-                        candle_core::Error::Msg(
-                            "GPT-OSS MXFP4 streamed expert was not loaded".into(),
-                        )
-                    })?;
+                    let expert = expert_data.as_ref();
                     let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
                         candle_core::Error::Msg(
                             "GPT-OSS MXFP4 route table lost a selected expert".into(),
@@ -1051,23 +1042,20 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     source: self.raw_weights[component].clone(),
                     expert_index: expert_idx,
                 };
-                if let Some(pending_map) = pending.as_mut() {
-                    if !expert_data.contains_key(&key) {
-                        let handle = pending_map.remove(&key).ok_or_else(|| {
-                            candle_core::Error::Msg(
-                                "GPT-OSS MXFP4 streamed expert request was not scheduled"
-                                    .to_string(),
-                            )
-                        })?;
-                        let data = self.cache.resolve(&key, handle)?;
-                        expert_data.insert(key.clone(), data);
-                    }
+                let expert_data;
+                if let Some(pending_queue) = pending.as_mut() {
+                    let handle = pending_queue.pop_front().ok_or_else(|| {
+                        candle_core::Error::Msg(
+                            "GPT-OSS MXFP4 streamed expert request was not scheduled"
+                                .to_string(),
+                        )
+                    })?;
+                    expert_data = self.cache.resolve(&key, handle)?;
+                } else {
+                    let range = self.raw_expert_range(0, expert_idx)?;
+                    expert_data = self.cache.load(&key, range)?;
                 }
-                let expert = expert_data.get(&key).ok_or_else(|| {
-                    candle_core::Error::Msg(
-                        "GPT-OSS MXFP4 streamed expert was not loaded".into(),
-                    )
-                })?;
+                let expert = expert_data.as_ref();
                 let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
                     candle_core::Error::Msg(
                         "GPT-OSS MXFP4 route table lost a selected expert".into(),
