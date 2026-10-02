@@ -920,441 +920,410 @@ impl MxFp4StreamingExpertLayer {
     }
 }
 
-
-/// Fused CPU GPT-OSS MXFP4 MLP.
-///
-/// This path directly computes:
-///   gate_up -> GPT-OSS SwiGLU -> down -> top-k weighted sum
-/// without creating the intermediate gate/up, activated, or per-route down-output
-/// Tensors. It is only used when both projections are native streamed MXFP4 layers
-/// and no expert LoRA delta is active.
-pub(crate) fn fused_gptoss_mlp(
-    gate_up: &MxFp4StreamingExpertLayer,
-    down: &MxFp4StreamingExpertLayer,
-    x: &Tensor,
-    indices: &Tensor,
-    weights: &Tensor,
-    alpha: f32,
-    limit: f32,
-) -> Result<Tensor> {
-    let x_dims = x.dims();
-    let [num_tokens, hidden_dim] = x_dims else {
-        candle_core::bail!("fused GPT-OSS MXFP4 MLP expects rank-2 input, got {:?}", x_dims);
-    };
-    let index_dims = indices.dims2()?;
-    let (idx_tokens, topk) = index_dims;
-    if *idx_tokens != *num_tokens {
-        candle_core::bail!("fused GPT-OSS MXFP4 MLP token/index shape mismatch");
-    }
-    let weight_dims = weights.dims2()?;
-    if weight_dims != [*num_tokens, *topk] {
-        candle_core::bail!("fused GPT-OSS MXFP4 MLP weight shape mismatch");
-    }
-    if gate_up.num_experts != down.num_experts {
-        candle_core::bail!("fused GPT-OSS MXFP4 MLP expert-count mismatch");
-    }
-    if gate_up.raw_weights.len() != 1 || down.raw_weights.len() != 1 {
-        candle_core::bail!("fused GPT-OSS MXFP4 MLP requires single raw tensors for gate/up and down");
-    }
-    if gate_up.out_dim != gate_up.component_out_dim
-        || gate_up.component_out_dim != down.in_dim * 2
-        || down.component_out_dim != down.out_dim
-    {
-        candle_core::bail!(
-            "fused GPT-OSS MXFP4 MLP dimension mismatch: gate_up={:?}, down={:?}",
-            (gate_up.component_out_dim, gate_up.out_dim, gate_up.in_dim),
-            (down.component_out_dim, down.out_dim, down.in_dim)
-        );
-    }
-    if down.out_dim != *hidden_dim {
-        candle_core::bail!(
-            "fused GPT-OSS MXFP4 MLP hidden size mismatch: down output {}, input {}",
-            down.out_dim,
-            hidden_dim
-        );
-    }
-
-    let x_cpu = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-    let x_data = x_cpu.flatten_all()?.to_vec1::<f32>()?;
-    let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
-    let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
-    let weights_cpu = weights.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
-    let weights_data = weights_cpu.flatten_all()?.to_vec1::<f32>()?;
-
-    let mut expert_counts = vec![0usize; gate_up.num_experts];
-    for &expert in &indices_data {
-        let expert = expert as usize;
-        if expert >= gate_up.num_experts {
-            candle_core::bail!(
-                "fused GPT-OSS MXFP4 expert index {} out of range",
-                expert
-            );
+    /// Fused CPU GPT-OSS path for native streamed MXFP4 experts.
+    ///
+    /// Computes gate/up, GPT-OSS SwiGLU, down projection, and top-k weighted
+    /// reduction without materializing Tensor intermediates.
+    pub(crate) fn fused_gptoss_mlp(
+        gate_up: &MxFp4StreamingExpertLayer,
+        down: &MxFp4StreamingExpertLayer,
+        x: &Tensor,
+        indices: &Tensor,
+        weights: &Tensor,
+        alpha: f32,
+        limit: f32,
+    ) -> Result<Option<Tensor>> {
+        let [num_tokens, hidden_dim] = x.dims2()?;
+        let (idx_tokens, topk) = indices.dims2()?;
+        if idx_tokens != num_tokens || topk == 0 || weights.dims2()? != (num_tokens, topk) {
+            return Ok(None);
         }
-        expert_counts[expert] += 1;
-    }
-    let mut expert_offsets = vec![0usize; gate_up.num_experts + 1];
-    for expert in 0..gate_up.num_experts {
-        expert_offsets[expert + 1] = expert_offsets[expert] + expert_counts[expert];
-    }
-    let mut routes_flat = vec![0usize; indices_data.len()];
-    expert_counts[..gate_up.num_experts].copy_from_slice(&expert_offsets[..gate_up.num_experts]);
-    for (route, &expert) in indices_data.iter().enumerate() {
-        let expert = expert as usize;
-        let dst = expert_counts[expert];
-        routes_flat[dst] = route;
-        expert_counts[expert] += 1;
-    }
+        if gate_up.num_experts != down.num_experts
+            || gate_up.raw_weights.len() != 1
+            || down.raw_weights.len() != 1
+            || gate_up.out_dim != gate_up.component_out_dim
+            || gate_up.component_out_dim != down.in_dim * 2
+            || gate_up.in_dim != hidden_dim
+            || down.component_out_dim != down.out_dim
+            || down.out_dim != hidden_dim
+            || !gate_up.in_dim.is_multiple_of(MXFP4_BLOCK_SIZE)
+            || !down.in_dim.is_multiple_of(MXFP4_BLOCK_SIZE)
+            || Self::dot_kernel() == 0
+        {
+            return Ok(None);
+        }
 
-    let mut experts = (0..gate_up.num_experts)
-        .filter(|&expert| expert_offsets[expert] != expert_offsets[expert + 1])
-        .collect::<Vec<_>>();
-    if gate_up.cache.zero_copy() {
-        experts.sort_unstable();
-    } else {
-        experts.sort_unstable_by_key(|&expert| {
-            expert_offsets[expert + 1] - expert_offsets[expert]
-        });
-    }
+        let x_cpu = x.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let x_data = x_cpu.flatten_all()?.to_vec1::<f32>()?;
+        let ids_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
+        let ids = ids_cpu.flatten_all()?.to_vec1::<u32>()?;
+        let w_cpu = weights.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+        let route_weights = w_cpu.flatten_all()?.to_vec1::<f32>()?;
 
-    let mut requests = Vec::with_capacity(experts.len() * 2);
-    for &expert_idx in &experts {
-        requests.push((
-            MxFp4StreamKey {
-                source: gate_up.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            },
-            gate_up.raw_expert_range(0, expert_idx)?,
-        ));
-        requests.push((
-            MxFp4StreamKey {
-                source: down.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            },
-            down.raw_expert_range(0, expert_idx)?,
-        ));
-    }
-    let shared_cache = Arc::ptr_eq(&gate_up.cache, &down.cache);
-    let mut pending = if shared_cache && gate_up.cache.overlap() {
-        Some(gate_up.cache.prefetch(&requests)?)
-    } else {
-        None
-    };
+        let mut expert_counts = vec![0usize; gate_up.num_experts];
+        for &id in &ids {
+            let expert = id as usize;
+            if expert >= gate_up.num_experts {
+                candle_core::bail!("fused GPT-OSS expert index {expert} out of range");
+            }
+            expert_counts[expert] += 1;
+        }
 
-    let mut output = vec![0f32; *num_tokens * *hidden_dim];
-    let mut route_x_offsets = Vec::<usize>::new();
-    let mut activations = Vec::<f32>::new();
-    let mut down_accs = Vec::<f32>::new();
+        let mut expert_offsets = vec![0usize; gate_up.num_experts + 1];
+        for expert in 0..gate_up.num_experts {
+            expert_offsets[expert + 1] = expert_offsets[expert] + expert_counts[expert];
+        }
 
-    let gate_bias = gate_up.bias_cpu.as_deref();
-    let down_bias = down.bias_cpu.as_deref();
+        let mut routes_flat = vec![0usize; ids.len()];
+        expert_counts[..gate_up.num_experts].copy_from_slice(&expert_offsets[..gate_up.num_experts]);
+        for (route, &id) in ids.iter().enumerate() {
+            let expert = id as usize;
+            let dst = expert_counts[expert];
+            routes_flat[dst] = route;
+            expert_counts[expert] += 1;
+        }
 
-    for &expert_idx in &experts {
-        let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
-            let gate_handle = queue.pop_front().ok_or_else(|| {
-                candle_core::Error::Msg("fused GPT-OSS gate request queue underflow".into())
-            })?;
-            let gate_key = MxFp4StreamKey {
-                source: gate_up.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            };
-            let gate_data = gate_up.cache.resolve(&gate_key, gate_handle)?;
+        let mut experts = (0..gate_up.num_experts)
+            .filter(|&expert| expert_offsets[expert] != expert_offsets[expert + 1])
+            .collect::<Vec<_>>();
 
-            let down_handle = queue.pop_front().ok_or_else(|| {
-                candle_core::Error::Msg("fused GPT-OSS down request queue underflow".into())
-            })?;
-            let down_key = MxFp4StreamKey {
-                source: down.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            };
-            let down_data = down.cache.resolve(&down_key, down_handle)?;
-            (gate_data, down_data)
+        if gate_up.cache.zero_copy() {
+            experts.sort_unstable();
         } else {
-            let gate_key = MxFp4StreamKey {
-                source: gate_up.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            };
-            let down_key = MxFp4StreamKey {
-                source: down.raw_weights[0].clone(),
-                expert_index: expert_idx,
-            };
-            (
-                gate_up.cache.load(&gate_key, gate_up.raw_expert_range(0, expert_idx)?)?,
-                down.cache.load(&down_key, down.raw_expert_range(0, expert_idx)?)?,
-            )
+            experts.sort_unstable_by_key(|&expert| {
+                expert_offsets[expert + 1] - expert_offsets[expert]
+            });
+        }
+
+        // Preserve the existing streamed GEMM fast path for large expert groups.
+        if experts.iter().any(|&expert| {
+            expert_offsets[expert + 1] - expert_offsets[expert] >= Self::GEMM_MIN_ROUTES
+        }) {
+            return Ok(None);
+        }
+
+        let shared_cache = Arc::ptr_eq(&gate_up.cache, &down.cache);
+        let mut requests = Vec::with_capacity(experts.len() * 2);
+        if shared_cache && gate_up.cache.overlap() {
+            for &expert in &experts {
+                requests.push((
+                    MxFp4StreamKey {
+                        source: gate_up.raw_weights[0].clone(),
+                        expert_index: expert,
+                    },
+                    gate_up.raw_expert_range(0, expert)?,
+                ));
+                requests.push((
+                    MxFp4StreamKey {
+                        source: down.raw_weights[0].clone(),
+                        expert_index: expert,
+                    },
+                    down.raw_expert_range(0, expert)?,
+                ));
+            }
+        }
+
+        let mut pending = if shared_cache && gate_up.cache.overlap() {
+            Some(gate_up.cache.prefetch(&requests)?)
+        } else {
+            None
         };
 
-        let route_start = expert_offsets[expert_idx];
-        let route_end = expert_offsets[expert_idx + 1];
-        let routes = &routes_flat[route_start..route_end];
-        let route_count = routes.len();
+        let gate_bias = gate_up.bias_cpu.as_deref();
+        let down_bias = down.bias_cpu.as_deref();
+        let mut output = vec![0.0f32; num_tokens * hidden_dim];
+        let mut route_x_offsets = Vec::with_capacity(topk.max(1));
+        let mut activations = Vec::new();
+        let kernel = Self::dot_kernel();
 
-        route_x_offsets.clear();
-        if route_x_offsets.capacity() < route_count {
-            route_x_offsets.reserve(route_count - route_x_offsets.capacity());
-        }
+        for &expert_idx in &experts {
+            let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
+                let gate_key = MxFp4StreamKey {
+                    source: gate_up.raw_weights[0].clone(),
+                    expert_index: expert_idx,
+                };
+                let gate_handle = queue.pop_front().ok_or_else(|| {
+                    candle_core::Error::Msg("fused GPT-OSS gate request queue underflow".into())
+                })?;
+                let gate_data = gate_up.cache.resolve(&gate_key, gate_handle)?;
 
-        activations.clear();
-        let activation_len = route_count * down.in_dim;
-        if activations.capacity() < activation_len {
-            activations.reserve(activation_len - activations.capacity());
-        }
-        activations.resize(activation_len, 0.0);
-
-        let gate_raw = gate_data.as_ref();
-        let down_raw = down_data.as_ref();
-        let gate_bias_ref = gate_bias;
-        let gate_kernel = Self::dot_kernel();
-
-        route_x_offsets.reserve(route_count);
-        activations.par_iter_mut().enumerate().for_each(|(flat_idx, dst)| {
-            let route_idx = flat_idx / down.in_dim;
-            let row = flat_idx % down.in_dim;
-            let x_offset = route_x_offsets[route_idx];
-            let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
-
-            let (gate_value, up_value) = if gate_kernel >= 2 {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
-                        x_row,
-                        gate_raw,
-                        row * 2,
-                        row * 2 + 1,
-                        gate_up.in_dim,
-                    )
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    (0.0, 0.0)
-                }
-            } else if gate_kernel == 1 {
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
-                        x_row,
-                        gate_raw,
-                        row * 2,
-                        row * 2 + 1,
-                        gate_up.in_dim,
-                    )
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    (0.0, 0.0)
-                }
+                let down_key = MxFp4StreamKey {
+                    source: down.raw_weights[0].clone(),
+                    expert_index: expert_idx,
+                };
+                let down_handle = queue.pop_front().ok_or_else(|| {
+                    candle_core::Error::Msg("fused GPT-OSS down request queue underflow".into())
+                })?;
+                let down_data = down.cache.resolve(&down_key, down_handle)?;
+                (gate_data, down_data)
             } else {
-                let row_bytes =
-                    (gate_up.in_dim / MXFP4_BLOCK_SIZE) * (MXFP4_BLOCK_SIZE / 2 + 1);
-                let mut gate_value = 0.0f32;
-                let mut up_value = 0.0f32;
-                for block_idx in 0..gate_up.in_dim / MXFP4_BLOCK_SIZE {
-                    let base0 =
-                        (row * 2) * row_bytes + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                    let base1 =
-                        (row * 2 + 1) * row_bytes + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                    let d0 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base0] as usize];
-                    let d1 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base1] as usize];
-                    let p0 = &gate_raw[base0 + 1..base0 + 1 + MXFP4_BLOCK_SIZE / 2];
-                    let p1 = &gate_raw[base1 + 1..base1 + 1 + MXFP4_BLOCK_SIZE / 2];
-                    let cs = block_idx * MXFP4_BLOCK_SIZE;
-                    for b in 0..MXFP4_BLOCK_SIZE / 2 {
-                        gate_value += x_row[cs + b] * d0[(p0[b] & 0x0f) as usize];
-                        gate_value += x_row[cs + 16 + b] * d0[(p0[b] >> 4) as usize];
-                        up_value += x_row[cs + b] * d1[(p1[b] & 0x0f) as usize];
-                        up_value += x_row[cs + 16 + b] * d1[(p1[b] >> 4) as usize];
-                    }
-                }
-                (gate_value, up_value)
+                let gate_key = MxFp4StreamKey {
+                    source: gate_up.raw_weights[0].clone(),
+                    expert_index: expert_idx,
+                };
+                let down_key = MxFp4StreamKey {
+                    source: down.raw_weights[0].clone(),
+                    expert_index: expert_idx,
+                };
+                (
+                    gate_up.cache.load(&gate_key, gate_up.raw_expert_range(0, expert_idx)?)?,
+                    down.cache.load(&down_key, down.raw_expert_range(0, expert_idx)?)?,
+                )
             };
 
-            let gate = gate_bias_ref
-                .map(|bias| gate_value + bias[expert_idx * gate_up.out_dim + row * 2])
-                .unwrap_or(gate_value)
-                .min(limit);
-            let up = gate_bias_ref
-                .map(|bias| up_value + bias[expert_idx * gate_up.out_dim + row * 2 + 1])
-                .unwrap_or(up_value)
-                .clamp(-limit, limit);
+            let start = expert_offsets[expert_idx];
+            let end = expert_offsets[expert_idx + 1];
+            let routes = &routes_flat[start..end];
+            let route_count = routes.len();
 
-            *dst = (up + 1.0) * gate / (1.0 + (-gate * alpha).exp());
-        });
-
-        let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
-        let parallel = Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row);
-        down_accs.resize(route_count, 0.0);
-        for row in 0..down.out_dim {
-            down_accs.fill(0.0);
-            if std::is_x86_feature_detected!("avx2") {
-                if std::is_x86_feature_detected!("fma") {
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2_fma(
-                            &activations,
-                            &(0..route_count)
-                                .map(|route| route * down.in_dim)
-                                .collect::<Vec<_>>(),
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            &mut down_accs,
-                        );
-                    }
-                } else {
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2(
-                            &activations,
-                            &(0..route_count)
-                                .map(|route| route * down.in_dim)
-                                .collect::<Vec<_>>(),
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            &mut down_accs,
-                        );
-                    }
-                }
-            } else {
-                for route_idx in 0..route_count {
-                    let act = &activations[route_idx * down.in_dim..(route_idx + 1) * down.in_dim];
-                    let mut acc = 0.0f32;
-                    let row_bytes = blocks_per_row * 17;
-                    let row_start = row * row_bytes;
-                    for block_idx in 0..blocks_per_row {
-                        let base = row_start + block_idx * 17;
-                        let d = &MXFP4Layer::DEQUANT_LUT[down_raw[base] as usize];
-                        let packed = &down_raw[base+1..base+17];
-                        let cs = block_idx * 32;
-                        for b in 0..16 {
-                            acc += act[cs+b] * d[(packed[b]&15) as usize];
-                            acc += act[cs+16+b] * d[(packed[b]>>4) as usize];
-                        }
-                    }
-                    down_accs[route_idx]=acc;
-                }
+            route_x_offsets.clear();
+            for &route_row in routes {
+                route_x_offsets.push((route_row / topk) * hidden_dim);
             }
 
-            let bias = down_bias.map(|b| &b[expert_idx * down.out_dim + row]);
-            for (route_idx, &route_row) in routes.iter().enumerate() {
-                let token = route_row / topk;
-                    let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
-        let down_kernel = Self::dot_kernel();
-        let activation_offsets: Vec<usize> =
-            (0..route_count).map(|route| route * down.in_dim).collect();
-        let mut down_accs = vec![0.0f32; route_count];
+            let activation_len = route_count * down.in_dim;
+            if activations.len() < activation_len {
+                activations.resize(activation_len, 0.0);
+            } else {
+                activations[..activation_len].fill(0.0);
+                activations.truncate(activation_len);
+            }
 
-        const STACK_ROUTES: usize = 8;
-        if route_count <= STACK_ROUTES
-            && Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row)
-        {
-            let output_ptr = output.as_mut_ptr();
-            let route_rows_ptr = routes.as_ptr();
-            let weights_ptr = weights_data.as_ptr();
-            let hidden = *hidden_dim;
-            let activation_offsets_ref = activation_offsets.as_slice();
-            let down_bias_ref = down_bias;
+            let gate_raw = gate_data.as_ref();
+            let down_raw = down_data.as_ref();
+            let gate_bias_ref = gate_bias;
 
-            (0..down.out_dim).into_par_iter().for_each(|row| {
-                let mut accs = [0.0f32; STACK_ROUTES];
-                let acc_slice = &mut accs[..route_count];
+            activations
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(flat_idx, dst)| {
+                    let route_idx = flat_idx / down.in_dim;
+                    let row = flat_idx % down.in_dim;
+                    let x_offset = route_x_offsets[route_idx];
+                    let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
 
-                if down_kernel >= 2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2_fma(
-                            &activations,
-                            activation_offsets_ref,
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            acc_slice,
-                        );
-                    }
-                } else if down_kernel == 1 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2(
-                            &activations,
-                            activation_offsets_ref,
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            acc_slice,
-                        );
-                    }
-                }
-
-                for route_idx in 0..route_count {
-                    let route_row = unsafe { *route_rows_ptr.add(route_idx) };
-                    let token = route_row / topk;
-                    let route_weight = unsafe { *weights_ptr.add(route_row) };
-                    let bias = down_bias_ref
-                        .map(|b| b[expert_idx * down.out_dim + row])
-                        .unwrap_or(0.0);
-                    unsafe {
-                        *output_ptr.add(token * hidden + row) +=
-                            route_weight * (acc_slice[route_idx] + bias);
-                    }
-                }
-            });
-        } else {
-            for row in 0..down.out_dim {
-                down_accs.fill(0.0);
-                if down_kernel >= 2 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2_fma(
-                            &activations,
-                            &activation_offsets,
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            &mut down_accs,
-                        );
-                    }
-                } else if down_kernel == 1 {
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        Self::dot_streamed_routes_fused_avx2(
-                            &activations,
-                            &activation_offsets,
-                            down_raw,
-                            row,
-                            down.in_dim,
-                            &mut down_accs,
-                        );
-                    }
-                } else {
-                    for route_idx in 0..route_count {
-                        let act = &activations
-                            [activation_offsets[route_idx]..activation_offsets[route_idx] + down.in_dim];
-                        let mut acc = 0.0f32;
-                        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-                        let row_start = row * row_bytes;
-                        for block_idx in 0..blocks_per_row {
-                            let base = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                            let d = &MXFP4Layer::DEQUANT_LUT[down_raw[base] as usize];
-                            let packed = &down_raw[base + 1..base + 1 + MXFP4_BLOCK_SIZE / 2];
-                            let cs = block_idx * MXFP4_BLOCK_SIZE;
-                            for b in 0..MXFP4_BLOCK_SIZE / 2 {
-                                acc += act[cs + b] * d[(packed[b] & 0x0f) as usize];
-                                acc += act[cs + 16 + b] * d[(packed[b] >> 4) as usize];
-                            }
+                    let (gate_value, up_value) = if kernel >= 2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
+                                x_row,
+                                gate_raw,
+                                row * 2,
+                                row * 2 + 1,
+                                gate_up.in_dim,
+                            )
                         }
-                        down_accs[route_idx] = acc;
-                    }
-                }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            unreachable!()
+                        }
+                    } else {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
+                                x_row,
+                                gate_raw,
+                                row * 2,
+                                row * 2 + 1,
+                                gate_up.in_dim,
+                            )
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            unreachable!()
+                        }
+                    };
 
-                for (route_idx, &route_row) in routes.iter().enumerate() {
-                    let token = route_row / topk;
-                    let route_weight = weights_data[route_row];
-                    let bias = down_bias
-                        .map(|b| b[expert_idx * down.out_dim + row])
-                        .unwrap_or(0.0);
-                    output[token * *hidden_dim + row] +=
-                        route_weight * (down_accs[route_idx] + bias);
+                    let gate = gate_bias_ref
+                        .map(|bias| gate_value + bias[expert_idx * gate_up.out_dim + row * 2])
+                        .unwrap_or(gate_value)
+                        .min(limit);
+                    let up = gate_bias_ref
+                        .map(|bias| up_value + bias[expert_idx * gate_up.out_dim + row * 2 + 1])
+                        .unwrap_or(up_value)
+                        .clamp(-limit, limit);
+
+                    *dst = (up + 1.0) * gate / (1.0 + (-gate * alpha).exp());
+                });
+
+            let activation_offsets: Vec<usize> =
+                (0..route_count).map(|route| route * down.in_dim).collect();
+            let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
+            let down_kernel = kernel;
+
+            const STACK_ROUTES: usize = 8;
+            let parallel_down = route_count <= STACK_ROUTES
+                && Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row);
+
+            if parallel_down {
+                let output_ptr = output.as_mut_ptr();
+                let route_rows_ptr = routes.as_ptr();
+                let weights_ptr = route_weights.as_ptr();
+                let activation_offsets_ref = activation_offsets.as_slice();
+                let down_bias_ref = down_bias;
+                (0..down.out_dim).into_par_iter().for_each(|row| {
+                    let mut accs = [0.0f32; STACK_ROUTES];
+                    let accs = &mut accs[..route_count];
+                    if down_kernel >= 2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_routes_fused_avx2_fma(
+                                &activations,
+                                activation_offsets_ref,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                                accs,
+                            );
+                        }
+                    } else {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_routes_fused_avx2(
+                                &activations,
+                                activation_offsets_ref,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                                accs,
+                            );
+                        }
+                    }
+
+                    for route_idx in 0..route_count {
+                        let route_row = unsafe { *route_rows_ptr.add(route_idx) };
+                        let token = route_row / topk;
+                        let weight = unsafe { *weights_ptr.add(route_row) };
+                        let bias = down_bias_ref
+                            .map(|b| b[expert_idx * down.out_dim + row])
+                            .unwrap_or(0.0);
+                        unsafe {
+                            *output_ptr.add(token * hidden_dim + row) +=
+                                weight * (accs[route_idx] + bias);
+                        }
+                    }
+                });
+            } else {
+                let mut accs = vec![0.0f32; route_count];
+                for row in 0..down.out_dim {
+                    accs.fill(0.0);
+                    if down_kernel >= 2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_routes_fused_avx2_fma(
+                                &activations,
+                                &activation_offsets,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                                &mut accs,
+                            );
+                        }
+                    } else {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            Self::dot_streamed_routes_fused_avx2(
+                                &activations,
+                                &activation_offsets,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                                &mut accs,
+                            );
+                        }
+                    }
+                    for (route_idx, &route_row) in routes.iter().enumerate() {
+                        let token = route_row / topk;
+                        let weight = route_weights[route_row];
+                        let bias = down_bias
+                            .map(|b| b[expert_idx * down.out_dim + row])
+                            .unwrap_or(0.0);
+                        output[token * hidden_dim + row] +=
+                            weight * (accs[route_idx] + bias);
+                    }
                 }
             }
         }
- k != self.in_dim || !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
+
+        gate_up.cache.log_stats();
+        if !shared_cache {
+            down.cache.log_stats();
+        }
+
+        Ok(Some(
+            Tensor::from_vec(output, (num_tokens, hidden_dim), &Device::Cpu)?
+                .to_device(x.device())?
+                .to_dtype(x.dtype())?,
+        ))
+    }
+
+impl QuantMethod for MxFp4StreamingExpertLayer {
+    fn as_mxfp4_streaming(&self) -> Option<&crate::MxFp4StreamingExpertLayer> {
+        Some(self)
+    }
+
+    fn new(_method: QuantMethodConfig) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        candle_core::bail!("MxFp4StreamingExpertLayer must be constructed from a GGUF archive")
+    }
+
+    fn dequantize_w(&self) -> Result<Tensor> {
+        candle_core::bail!(
+            "{} keeps expert weights file-backed and supports gather_forward only",
+            self.name()
+        )
+    }
+
+    fn forward_raw(&self, _a: &Tensor) -> Result<Tensor> {
+        candle_core::bail!(
+            "{} is a routed expert layer; use gather_forward",
+            self.name()
+        )
+    }
+
+    fn gather_forward_raw(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        let x_dims = x.dims();
+        let index_dims = indices.dims();
+        if index_dims.len() != 2 {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 streaming expects rank-2 indices, got rank {}",
+                index_dims.len()
+            );
+        }
+
+        let (num_tokens, topk, k, x_has_topk) = match x_dims {
+            [tokens, cols] => {
+                if *tokens != index_dims[0] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
+                    );
+                }
+                (*tokens, index_dims[1], *cols, false)
+            }
+            [tokens, x_topk, cols] => {
+                if *tokens != index_dims[0] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
+                    );
+                }
+                if *x_topk != 1 && *x_topk != index_dims[1] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input route dimension {} does not match top-k {}",
+                        x_topk,
+                        index_dims[1]
+                    );
+                }
+                (*tokens, index_dims[1], *cols, *x_topk != 1)
+            }
+            _ => candle_core::bail!(
+                "GPT-OSS MXFP4 streaming expects rank-2 or rank-3 input, got rank {}",
+                x_dims.len()
+            ),
+        };
+
+        if k != self.in_dim || !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
             candle_core::bail!(
                 "GPT-OSS MXFP4 streaming input K {k} does not match expected {}",
                 self.in_dim
