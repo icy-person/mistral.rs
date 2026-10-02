@@ -272,10 +272,11 @@ impl MxFp4StreamCache {
             guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
         }
         while guard.used_bytes.saturating_add(len) > capacity {
-            let Some((&victim, _)) = guard
+            let Some(victim) = guard
                 .entries
                 .iter()
                 .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
             else {
                 break;
             };
