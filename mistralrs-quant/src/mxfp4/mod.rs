@@ -351,9 +351,15 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
 
+        // Compute each routed expert once over all of its route rows. The previous
+        // implementation parallelized over route rows and decoded the full expert
+        // matrix independently for every route, which is especially expensive for
+        // prompt batches where the same expert can serve multiple tokens.
+        //
+        // The grouped path below parallelizes over output rows, decodes each MXFP4
+        // weight block once per row, and reuses that decoded block across every route
+        // selecting the same expert.
         if self.raw_weights.len() > 1 {
-            // Gate and up are independent projections. While we compute one projection,
-            // the worker pool can continue reading the other projection's experts.
             for component in 0..self.raw_weights.len() {
                 for &expert_idx in &experts {
                     let key = MxFp4StreamKey {
@@ -364,7 +370,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         if !expert_data.contains_key(&key) {
                             let handle = pending_map.remove(&key).ok_or_else(|| {
                                 candle_core::Error::Msg(
-                                    "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
+                                    "GPT-OSS MXFP4 streamed expert request was not scheduled"
+                                        .to_string(),
                                 )
                             })?;
                             let data = self.cache.resolve(&key, handle)?;
@@ -372,32 +379,72 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         }
                     }
                     let expert = expert_data.get(&key).ok_or_else(|| {
-                        candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                        candle_core::Error::Msg(
+                            "GPT-OSS MXFP4 streamed expert was not loaded".into(),
+                        )
                     })?;
-
-                    output
-                        .par_chunks_mut(self.out_dim)
-                        .enumerate()
-                        .for_each(|(route_row, out_row)| {
-                            if indices_data[route_row] as usize != expert_idx {
-                                return;
-                            }
-                            let token_idx = route_row / topk;
-                            let x_offset = if x_has_topk {
+                    let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
+                        candle_core::Error::Msg(
+                            "GPT-OSS MXFP4 route table lost a selected expert".into(),
+                        )
+                    })?;
+                    let route_x_offsets: Vec<usize> = routes
+                        .iter()
+                        .map(|&route_row| {
+                            if x_has_topk {
                                 route_row * self.in_dim
                             } else {
-                                token_idx * self.in_dim
-                            };
-                            let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                            for row in 0..self.component_out_dim {
-                                let out_index = row * 2 + component;
-                                Self::dot_row(x_row, expert, row, out_row, out_index);
+                                (route_row / topk) * self.in_dim
+                            }
+                        })
+                        .collect();
+
+                    let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
+                    let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                    let route_count = routes.len();
+                    let mut partial = vec![0f32; self.component_out_dim * route_count];
+
+                    partial
+                        .par_chunks_mut(route_count)
+                        .enumerate()
+                        .for_each(|(row, accs)| {
+                            let row_start = row * row_bytes;
+                            for block_idx in 0..blocks_per_row {
+                                let block_start =
+                                    row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                let scale = expert[block_start] as usize;
+                                let dequant = &MXFP4Layer::DEQUANT_LUT[scale];
+                                let packed =
+                                    &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                let col_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                                for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
+                                    let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                                    let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
+                                    let mut dot = 0f32;
+                                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                        let packed_byte = packed[byte_idx];
+                                        dot += x_block[byte_idx]
+                                            * dequant[(packed_byte & 0x0f) as usize];
+                                        dot += x_block[MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                            * dequant[(packed_byte >> 4) as usize];
+                                    }
+                                    accs[route_idx] += dot;
+                                }
                             }
                         });
+
+                    for (route_idx, &route_row) in routes.iter().enumerate() {
+                        let out_row = &mut output
+                            [route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                        for row in 0..self.component_out_dim {
+                            out_row[row * 2 + component] +=
+                                partial[row * route_count + route_idx];
+                        }
+                    }
                 }
             }
         } else {
-            // Down projection is a single component and fills the whole output.
             let component = 0usize;
             for &expert_idx in &experts {
                 let key = MxFp4StreamKey {
@@ -408,7 +455,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     if !expert_data.contains_key(&key) {
                         let handle = pending_map.remove(&key).ok_or_else(|| {
                             candle_core::Error::Msg(
-                                "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
+                                "GPT-OSS MXFP4 streamed expert request was not scheduled"
+                                    .to_string(),
                             )
                         })?;
                         let data = self.cache.resolve(&key, handle)?;
@@ -416,25 +464,64 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     }
                 }
                 let expert = expert_data.get(&key).ok_or_else(|| {
-                    candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                    candle_core::Error::Msg(
+                        "GPT-OSS MXFP4 streamed expert was not loaded".into(),
+                    )
                 })?;
+                let routes = routes_by_expert.get(&expert_idx).ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "GPT-OSS MXFP4 route table lost a selected expert".into(),
+                    )
+                })?;
+                let route_x_offsets: Vec<usize> = routes
+                    .iter()
+                    .map(|&route_row| route_row * self.in_dim)
+                    .collect();
 
-                output
-                    .par_chunks_mut(self.out_dim)
+                let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
+                let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let route_count = routes.len();
+                let mut partial = vec![0f32; self.component_out_dim * route_count];
+
+                partial
+                    .par_chunks_mut(route_count)
                     .enumerate()
-                    .for_each(|(route_row, out_row)| {
-                        if indices_data[route_row] as usize != expert_idx {
-                            return;
-                        }
-                        let x_row =
-                            &x_data[route_row * self.in_dim..(route_row + 1) * self.in_dim];
-                        for row in 0..self.component_out_dim {
-                            Self::dot_row(x_row, expert, row, out_row, row);
+                    .for_each(|(row, accs)| {
+                        let row_start = row * row_bytes;
+                        for block_idx in 0..blocks_per_row {
+                            let block_start =
+                                row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                            let scale = expert[block_start] as usize;
+                            let dequant = &MXFP4Layer::DEQUANT_LUT[scale];
+                            let packed =
+                                &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                            let col_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                            for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
+                                let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                                let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
+                                let mut dot = 0f32;
+                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                    let packed_byte = packed[byte_idx];
+                                    dot += x_block[byte_idx]
+                                        * dequant[(packed_byte & 0x0f) as usize];
+                                    dot += x_block[MXFP4_BLOCK_SIZE / 2 + byte_idx]
+                                        * dequant[(packed_byte >> 4) as usize];
+                                }
+                                accs[route_idx] += dot;
+                            }
                         }
                     });
+
+                for (route_idx, &route_row) in routes.iter().enumerate() {
+                    let out_row = &mut output
+                        [route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                    for row in 0..self.component_out_dim {
+                        out_row[row] += partial[row * route_count + route_idx];
+                    }
+                }
             }
         }
-
         if let Some(bias) = &self.bias {
             let bias_data = bias
                 .to_dtype(DType::F32)?
