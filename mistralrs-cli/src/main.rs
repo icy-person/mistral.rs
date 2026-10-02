@@ -70,7 +70,6 @@ async fn main() -> Result<()> {
             video,
             audio,
             adapter,
-            moe_stream,
         } => {
             let model_type = resolve_model_type(model_type, default_model)?;
             run_interactive(
@@ -86,7 +85,6 @@ async fn main() -> Result<()> {
                 video,
                 audio,
                 adapter,
-                moe_stream,
             )
             .await?;
         }
