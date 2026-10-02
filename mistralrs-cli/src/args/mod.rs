@@ -1696,6 +1696,31 @@ mod tests {
     }
 
     #[test]
+    fn moe_stream_full_invocation_parses_without_a_required_field() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "run",
+            "--cpu",
+            "--moe-stream",
+            "--cache-mb",
+            "1536",
+            "--io-threads",
+            "4",
+            "--moe-stats",
+            "-f",
+            "/tmp/gpt-oss-20b-MXFP4.gguf",
+        ]).unwrap();
+
+        let Command::Run { runtime, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(runtime.moe_stream);
+        assert_eq!(runtime.moe_cache_mb, "1536");
+        assert_eq!(runtime.moe_io_threads, 4);
+        assert!(runtime.moe_stats);
+    }
+
+    #[test]
     fn moe_stream_flag_is_optional_when_omitted() {
         let cli = Cli::try_parse_from([
             "mistralrs",
