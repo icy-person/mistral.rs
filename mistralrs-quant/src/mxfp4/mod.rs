@@ -345,7 +345,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let mut expert_data = HashMap::with_capacity(requests.len());
         if pending.is_none() {
             for (key, range) in requests {
-                expert_data.insert(key, self.cache.load(key, range)?);
+                expert_data.insert(key.clone(), self.cache.load(&key, range)?);
             }
         }
 
@@ -367,7 +367,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                     "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
                                 )
                             })?;
-                            let data = self.cache.resolve(key, handle)?;
+                            let data = self.cache.resolve(&key, handle)?;
                             expert_data.insert(key, data);
                         }
                     }
