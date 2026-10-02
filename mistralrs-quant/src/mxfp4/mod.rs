@@ -62,6 +62,7 @@ pub struct MXFP4Layer {
 #[derive(Debug)]
 pub struct MxFp4StreamingExpertLayer {
     raw_weights: Vec<String>,
+    cache_sources: Vec<Arc<str>>,
     num_experts: usize,
     component_out_dim: usize,
     in_dim: usize,
@@ -195,8 +196,14 @@ impl MxFp4StreamingExpertLayer {
             None
         };
 
+        let cache_sources = raw_weights
+            .iter()
+            .map(|source| Arc::<str>::from(source.as_str()))
+            .collect();
+
         Ok(Self {
             raw_weights,
+            cache_sources,
             num_experts,
             component_out_dim,
             in_dim,
@@ -1145,14 +1152,14 @@ impl MxFp4StreamingExpertLayer {
             for &expert in &experts {
                 requests.push((
                     MxFp4StreamKey {
-                        source: gate_up.raw_weights[0].clone(),
+                        source: gate_up.cache_sources[0].clone(),
                         expert_index: expert,
                     },
                     gate_up.raw_expert_range(0, expert)?,
                 ));
                 requests.push((
                     MxFp4StreamKey {
-                        source: down.raw_weights[0].clone(),
+                        source: down.cache_sources[0].clone(),
                         expert_index: expert,
                     },
                     down.raw_expert_range(0, expert)?,
@@ -1603,7 +1610,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             for weight_idx in 0..self.raw_weights.len() {
                 requests.push((
                     MxFp4StreamKey {
-                        source: self.raw_weights[weight_idx].clone(),
+                        source: self.cache_sources[weight_idx].clone(),
                         expert_index: expert_idx,
                     },
                     self.raw_expert_range(weight_idx, expert_idx)?,
@@ -1662,7 +1669,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 }
 
                 let key = MxFp4StreamKey {
-                    source: self.raw_weights[component].clone(),
+                    source: self.cache_sources[component].clone(),
                     expert_index: expert_idx,
                 };
                 let expert_data = if let Some(pending_queue) = pending.as_mut() {
@@ -1683,7 +1690,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
 
                 if pair_single_route && component == 0 {
                     let key_up = MxFp4StreamKey {
-                        source: self.raw_weights[1].clone(),
+                        source: self.cache_sources[1].clone(),
                         expert_index: expert_idx,
                     };
                     let expert_up_data = if let Some(pending_queue) = pending.as_mut() {
