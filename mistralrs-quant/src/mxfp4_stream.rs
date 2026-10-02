@@ -11,8 +11,10 @@ use std::{
     thread,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
@@ -222,7 +224,7 @@ impl MxFp4StreamCache {
                     );
                     let _ = job.reply.send(result);
                 })
-                .map_err(|err| io::Error::other(format!("failed to start MXFP4 I/O worker: {err}")))?;
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to start MXFP4 I/O worker: {err}")))?;
         }
 
         Ok(cache)
@@ -234,9 +236,10 @@ impl MxFp4StreamCache {
 
     fn lookup(&self, key: MxFp4StreamKey) -> Option<Arc<Vec<u8>>> {
         let mut guard = self.inner.lock().ok()?;
-        let entry = guard.entries.get_mut(&key)?;
         guard.clock = guard.clock.wrapping_add(1);
-        entry.last_used = guard.clock;
+        let now = guard.clock;
+        let entry = guard.entries.get_mut(&key)?;
+        entry.last_used = now;
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
         Some(entry.data.clone())
     }
