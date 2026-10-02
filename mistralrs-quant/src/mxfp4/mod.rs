@@ -38,8 +38,9 @@ pub struct MXFP4Layer {
 
 /// File-backed GPT-OSS MXFP4 expert projection.
 ///
-/// The packed expert bank remains in the GGUF mmap. gather_forward_raw decodes
-/// only the routed expert rows into a temporary output buffer.
+/// The packed expert bank remains file-backed in GGUF. gather_forward_raw loads
+/// only routed experts through the shared bounded stream cache and decodes them
+/// into a temporary output buffer.
 #[derive(Debug)]
 pub struct MxFp4StreamingExpertLayer {
     archive: Arc<crate::GgufArchive>,
