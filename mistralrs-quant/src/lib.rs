@@ -38,6 +38,7 @@ mod lora;
 #[cfg(feature = "cuda")]
 pub mod moe;
 mod mxfp4;
+mod mxfp4_stream;
 pub mod nvfp4;
 mod pending_layer;
 mod pertensor_fp8;
