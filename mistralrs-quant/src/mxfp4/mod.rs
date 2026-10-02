@@ -270,7 +270,7 @@ impl MxFp4StreamingExpertLayer {
         }
 
         #[inline(always)]
-        unsafe fn decode8_normal_e8m0(nibbles: __m256i, scale: u32) -> __m256 {
+        unsafe fn decode8_normal_e8m0(nibbles: __m256i, scale_offset: __m256i) -> __m256 {
             // E2M1 is exactly representable in IEEE-754. For normal E8M0 scales
             // (2..253), multiplication by 2^(scale-128) is just an exponent-field
             // adjustment. This avoids the four permutes + four FP multiplies that
@@ -278,7 +278,7 @@ impl MxFp4StreamingExpertLayer {
             let mag = _mm256_and_si256(nibbles, _mm256_set1_epi32(7));
             let exponent = _mm256_add_epi32(
                 _mm256_srli_epi32(mag, 1),
-                _mm256_set1_epi32((scale as i32) - 2),
+                scale_offset,
             );
             let exponent_bits = _mm256_slli_epi32(exponent, 23);
             let mantissa_bits = _mm256_slli_epi32(
@@ -317,11 +317,12 @@ impl MxFp4StreamingExpertLayer {
 
         let s = raw_expert[block_start] as u32;
         if (2..=253).contains(&s) {
+            let scale_offset = _mm256_set1_epi32((s as i32) - 2);
             [
-                decode8_normal_e8m0(lo0, s),
-                decode8_normal_e8m0(lo1, s),
-                decode8_normal_e8m0(hi0, s),
-                decode8_normal_e8m0(hi1, s),
+                decode8_normal_e8m0(lo0, scale_offset),
+                decode8_normal_e8m0(lo1, scale_offset),
+                decode8_normal_e8m0(hi0, scale_offset),
+                decode8_normal_e8m0(hi1, scale_offset),
             ]
         } else {
             // E8M0 special values x=0,1 are the subnormal floor encodings.
