@@ -26,6 +26,7 @@ pub(crate) struct MxFp4StreamConfig {
     pub cache_mb: Option<usize>,
     pub cache_floor_mb: usize,
     pub cache_ceil_mb: Option<usize>,
+    pub cache_per_source: usize,
     pub io_threads: usize,
     pub overlap: bool,
     pub o_direct: bool,
@@ -158,12 +159,54 @@ struct CacheInner {
 
 #[derive(Debug)]
 struct ReadJob {
-    path: PathBuf,
+    shard: usize,
     offset: u64,
     len: usize,
     file_len: usize,
-    o_direct: bool,
     reply: SyncSender<io::Result<Vec<u8>>>,
+}
+
+struct WorkerFiles {
+    normal: Vec<File>,
+    direct: Vec<Option<File>>,
+}
+
+impl WorkerFiles {
+    fn new(paths: &[PathBuf], want_direct: bool) -> io::Result<Self> {
+        let mut normal = Vec::with_capacity(paths.len());
+        let mut direct = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            normal.push(File::open(path)?);
+
+            #[cfg(target_os = "linux")]
+            let direct_file = if want_direct {
+                match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)
+                {
+                    Ok(file) => Some(file),
+                    Err(err) => {
+                        tracing::debug!(
+                            "O_DIRECT unavailable for {}: {err}",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let direct_file = None;
+
+            direct.push(direct_file);
+        }
+
+        Ok(Self { normal, direct })
+    }
 }
 
 pub(crate) enum MxFp4StreamHandle {
@@ -218,24 +261,46 @@ impl MxFp4StreamCache {
 
         for worker_id in 0..config.io_threads {
             let receiver = receiver.clone();
+            let worker_paths = paths.clone();
+            let want_direct = config.o_direct;
             thread::Builder::new()
                 .name(format!("mxfp4-io-{worker_id}"))
-                .spawn(move || loop {
-                    let job = match receiver.lock() {
-                        Ok(lock) => lock.recv(),
-                        Err(_) => return,
+                .spawn(move || {
+                    let files = match WorkerFiles::new(&worker_paths, want_direct) {
+                        Ok(files) => files,
+                        Err(err) => {
+                            tracing::error!(
+                                "failed to open GPT-OSS MXFP4 shard files for worker {worker_id}: {err}"
+                            );
+                            return;
+                        }
                     };
-                    let Ok(job) = job else {
-                        return;
-                    };
-                    let result = read_file_range(
-                        &job.path,
-                        job.offset,
-                        job.len,
-                        job.file_len,
-                        job.o_direct,
-                    );
-                    let _ = job.reply.send(result);
+
+                    loop {
+                        let job = match receiver.lock() {
+                            Ok(lock) => lock.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else {
+                            return;
+                        };
+                        let Some(file) = files.normal.get(job.shard) else {
+                            let _ = job.reply.send(Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "MXFP4 shard index out of range",
+                            )));
+                            continue;
+                        };
+                        let direct_file = files.direct.get(job.shard).and_then(Option::as_ref);
+                        let result = read_file_range(
+                            file,
+                            direct_file,
+                            job.offset,
+                            job.len,
+                            job.file_len,
+                        );
+                        let _ = job.reply.send(result);
+                    }
                 })
                 .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to start MXFP4 I/O worker: {err}")))?;
         }
@@ -299,20 +364,20 @@ impl MxFp4StreamCache {
     }
 
     fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
-        let path = self
-            .paths
-            .get(range.shard)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 shard index out of range"))?
-            .clone();
+        if range.shard >= self.paths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MXFP4 shard index out of range",
+            ));
+        }
         let (tx, rx) = mpsc::sync_channel(1);
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
         self.queue
             .send(ReadJob {
-                path,
+                shard: range.shard,
                 offset: range.offset,
                 len: range.len,
                 file_len: range.file_len,
-                o_direct: self.config.o_direct,
                 reply: tx,
             })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MXFP4 I/O workers stopped"))?;
@@ -420,11 +485,11 @@ impl MxFp4StreamCache {
 }
 
 fn read_file_range(
-    path: &PathBuf,
+    file: &File,
+    direct_file: Option<&File>,
     offset: u64,
     len: usize,
     file_len: usize,
-    want_direct: bool,
 ) -> io::Result<Vec<u8>> {
     let end = offset
         .checked_add(len as u64)
@@ -437,38 +502,33 @@ fn read_file_range(
     }
 
     #[cfg(target_os = "linux")]
-    if want_direct {
+    if let Some(direct) = direct_file {
         let aligned_start = offset / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
         let aligned_end = end.div_ceil(DIRECT_ALIGNMENT as u64) * DIRECT_ALIGNMENT;
         if aligned_start < aligned_end && aligned_end <= file_len as u64 {
             let aligned_len = usize::try_from(aligned_end - aligned_start)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "aligned MXFP4 read too large"))?;
-            match read_direct(path, aligned_start, aligned_len) {
+            match read_direct(direct, aligned_start, aligned_len) {
                 Ok(buf) => {
                     let begin = usize::try_from(offset - aligned_start).unwrap_or(0);
                     return Ok(buf[begin..begin + len].to_vec());
                 }
                 Err(err) => {
-                    tracing::debug!("O_DIRECT MXFP4 read fallback for {}: {err}", path.display());
+                    tracing::debug!("O_DIRECT MXFP4 read fallback for range {offset}..{end}: {err}");
                 }
             }
         }
     }
 
-    let file = File::open(path)?;
     let mut buf = vec![0u8; len];
-    read_exact_at(&file, offset, &mut buf)?;
+    read_exact_at(file, offset, &mut buf)?;
     Ok(buf)
 }
 
 #[cfg(target_os = "linux")]
-fn read_direct(path: &PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)?;
+fn read_direct(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut aligned = AlignedBuffer::new(len)?;
-    read_exact_at(&file, offset, aligned.as_mut_slice())?;
+    read_exact_at(file, offset, aligned.as_mut_slice())?;
     Ok(aligned.to_vec())
 }
 
@@ -557,6 +617,7 @@ mod tests {
             cache_mb: Some(4096),
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(2048),
+            cache_per_source: 5,
             io_threads: 4,
             overlap: true,
             o_direct: false,
