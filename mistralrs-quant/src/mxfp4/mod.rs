@@ -1463,6 +1463,30 @@ mod tests {
         assert!(MXFP4Layer::device_supported(&Device::Cpu));
     }
 
+    #[test]
+    fn streaming_dot_row_uses_output_column_once() -> Result<()> {
+        let x = vec![1.0f32; MXFP4_BLOCK_SIZE];
+        // Four output rows, one 32-value MXFP4 block per row: 1 scale byte + 16 packed bytes.
+        let raw_expert = vec![127u8; 4 * (MXFP4_BLOCK_SIZE / 2 + 1)];
+        let mut output = vec![0.0f32; 4];
+
+        // This targets the last output column. Before the fix, adding row to the
+        // final column offset made the computed index 6 and panicked here.
+        MxFp4StreamingExpertLayer::dot_row(
+            &x,
+            &raw_expert,
+            3,
+            3,
+            &mut output,
+            0,
+            4,
+        );
+
+        assert!(output[3].is_finite());
+        Ok(())
+    }
+
+
     use super::*;
 
     const TEST_HIDDEN_SIZE: usize = 64;
