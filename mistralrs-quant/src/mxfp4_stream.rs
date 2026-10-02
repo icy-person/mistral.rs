@@ -313,52 +313,58 @@ impl MxFp4StreamCache {
         }
 
         let mut queues = Vec::with_capacity(config.io_threads);
-        for worker_id in 0..config.io_threads {
-            let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
-            queues.push(queue_tx);
-            let worker_paths = paths.clone();
-            let want_direct = config.o_direct;
-            thread::Builder::new()
-                .name(format!("mxfp4-io-{worker_id}"))
-                .spawn(move || {
-                    let files = match WorkerFiles::new(&worker_paths, want_direct) {
-                        Ok(files) => files,
-                        Err(err) => {
-                            tracing::error!(
-                                "failed to open GPT-OSS MXFP4 shard files for worker {worker_id}: {err}"
-                            );
-                            return;
-                        }
-                    };
+        let needs_io_workers = maps.iter().any(Option::is_none);
 
-                    while let Ok(job) = queue_rx.recv() {
-                        let Some(file) = files.normal.get(job.shard) else {
-                            let _ = job.reply.send(Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "MXFP4 shard index out of range",
-                            )));
-                            continue;
+        if needs_io_workers {
+            for worker_id in 0..config.io_threads {
+                let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
+                queues.push(queue_tx);
+                let worker_paths = paths.clone();
+                let want_direct = config.o_direct;
+                thread::Builder::new()
+                    .name(format!("mxfp4-io-{worker_id}"))
+                    .spawn(move || {
+                        let files = match WorkerFiles::new(&worker_paths, want_direct) {
+                            Ok(files) => files,
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to open GPT-OSS MXFP4 shard files for worker {worker_id}: {err}"
+                                );
+                                return;
+                            }
                         };
-                        let direct_file = files.direct.get(job.shard).and_then(Option::as_ref);
-                        let result = read_file_range(
-                            file,
-                            direct_file,
-                            None,
-                            job.offset,
-                            job.len,
-                            job.file_len,
+
+                        while let Ok(job) = queue_rx.recv() {
+                            let Some(file) = files.normal.get(job.shard) else {
+                                let _ = job.reply.send(Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "MXFP4 shard index out of range",
+                                )));
+                                continue;
+                            };
+                            let direct_file =
+                                files.direct.get(job.shard).and_then(Option::as_ref);
+                            let result = read_file_range(
+                                file,
+                                direct_file,
+                                None,
+                                job.offset,
+                                job.len,
+                                job.file_len,
+                            )
+                            .map(Arc::new);
+                            let _ = job.reply.send(result);
+                        }
+                    })
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to start MXFP4 I/O worker: {err}"),
                         )
-                        .map(Arc::new);
-                        let _ = job.reply.send(result);
-                    }
-                })
-                .map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to start MXFP4 I/O worker: {err}"),
-                    )
-                })?;
+                    })?;
+            }
         }
+
 
         let cache = Arc::new(Self {
             inner: Mutex::new(CacheInner {
