@@ -347,6 +347,68 @@ impl MxFp4StreamingExpertLayer {
         0
     }
 
+    const GEMM_MIN_ROUTES: usize = 4;
+
+    fn decode_expert_f32(
+        raw_expert: &[u8],
+        out_rows: usize,
+        in_dim: usize,
+    ) -> Vec<f32> {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let mut weights = vec![0f32; out_rows * in_dim];
+
+        weights
+            .par_chunks_mut(in_dim)
+            .enumerate()
+            .for_each(|(row, dst)| {
+                let row_start = row * row_bytes;
+                for block_idx in 0..blocks_per_row {
+                    let block_start =
+                        row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                    let dequant = &MXFP4Layer::DEQUANT_LUT[raw_expert[block_start] as usize];
+                    let packed =
+                        &raw_expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                    let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                        let packed_byte = packed[byte_idx];
+                        dst[col_start + byte_idx] =
+                            dequant[(packed_byte & 0x0f) as usize];
+                        dst[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx] =
+                            dequant[(packed_byte >> 4) as usize];
+                    }
+                }
+            });
+
+        weights
+    }
+
+    fn gemm_routes(
+        x_data: &[f32],
+        route_x_offsets: &[usize],
+        raw_expert: &[u8],
+        out_rows: usize,
+        in_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let route_count = route_x_offsets.len();
+        if route_count < Self::GEMM_MIN_ROUTES {
+            return Err(candle_core::Error::Msg(
+                "route count below streamed GEMM threshold".into(),
+            ));
+        }
+
+        let mut x_routes = Vec::with_capacity(route_count * in_dim);
+        for &x_offset in route_x_offsets {
+            x_routes.extend_from_slice(&x_data[x_offset..x_offset + in_dim]);
+        }
+
+        let weights = Self::decode_expert_f32(raw_expert, out_rows, in_dim);
+        let x = Tensor::from_vec(x_routes, (route_count, in_dim), &Device::Cpu)?;
+        let w = Tensor::from_vec(weights, (out_rows, in_dim), &Device::Cpu)?;
+        let y = x.matmul(&w.t()?)?;
+        y.flatten_all()?.to_vec1::<f32>()
+    }
+
     #[inline(always)]
     fn dot_streamed_row_group(
         x_data: &[f32],
@@ -896,7 +958,36 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
                     let route_count = routes.len();
 
-                    if route_count == 1 {
+                    if route_count >= Self::GEMM_MIN_ROUTES {
+                        let result =
+                            Self::gemm_routes(&x_data, &route_x_offsets, expert, self.component_out_dim, self.in_dim)?;
+                        for (route_idx, &route_row) in routes.iter().enumerate() {
+                            let out_row = &mut output
+                                [route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                            let base = route_idx * self.component_out_dim;
+                            for row in 0..self.component_out_dim {
+                                out_row[row * 2 + component] += result[base + row];
+                            }
+                        }
+                        continue;
+                    }
+
+                if route_count >= Self::GEMM_MIN_ROUTES {
+                    let result =
+                        Self::gemm_routes(&x_data, &route_x_offsets, expert, self.component_out_dim, self.in_dim)?;
+                    for (route_idx, &route_row) in routes.iter().enumerate() {
+                        let out_row = &mut output
+                            [route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                        let base = route_idx * self.component_out_dim;
+                        out_row[..self.component_out_dim]
+                            .iter_mut()
+                            .enumerate()
+                            .for_each(|(row, value)| *value += result[base + row]);
+                    }
+                    continue;
+                }
+
+                if route_count == 1 {
                         let route_row = routes[0];
                         let x_offset = route_x_offsets[0];
                         let x_row = &x_data[x_offset..x_offset + self.in_dim];
