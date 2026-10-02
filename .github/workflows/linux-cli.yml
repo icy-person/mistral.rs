@@ -37,10 +37,10 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Fetch Rust dependencies
+      - name: Resolve and fetch Rust dependencies
         run: |
           for i in 1 2 3 4 5; do
-            cargo fetch --locked && break
+            cargo fetch && break
             if [ "$i" = 5 ]; then
               exit 1
             fi
@@ -48,7 +48,7 @@ jobs:
           done
 
       - name: Build Linux CLI
-        run: cargo build --release --locked --offline -p mistralrs-cli
+        run: cargo build --release --offline -p mistralrs-cli
 
       - name: Verify executable
         run: |
