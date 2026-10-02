@@ -398,47 +398,56 @@ impl MxFp4StreamCache {
             guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
         }
 
-        let source = key.source.clone();
-        while guard
-            .entries
-            .iter()
-            .filter(|(entry_key, _)| entry_key.source == source)
-            .count()
-            >= self.config.cache_per_source
-        {
-            let Some(victim) = guard
+        // ArchiveMapped entries are just tiny descriptors pointing at the
+        // existing GGUF mmap, so they consume no heap-cache budget. Do not
+        // evict them by the per-source quota: keeping the full routed-expert
+        // working set avoids repeated cache misses and repeated page advice.
+        let heap_backed = len != 0;
+
+        if heap_backed {
+            let source = key.source.clone();
+            while guard
                 .entries
                 .iter()
                 .filter(|(entry_key, _)| entry_key.source == source)
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(entry_key, _)| entry_key.clone())
-            else {
-                break;
-            };
+                .count()
+                >= self.config.cache_per_source
+            {
+                let Some(victim) = guard
+                    .entries
+                    .iter()
+                    .filter(|(entry_key, _)| entry_key.source == source)
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(entry_key, _)| entry_key.clone())
+                else {
+                    break;
+                };
 
-            if let Some(old) = guard.entries.remove(&victim) {
-                guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                if let Some(old) = guard.entries.remove(&victim) {
+                    guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            while guard.used_bytes.saturating_add(len) > self.budget_bytes {
+                let Some(victim) = guard
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(entry_key, _)| entry_key.clone())
+                else {
+                    break;
+                };
+
+                if let Some(old) = guard.entries.remove(&victim) {
+                    guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
-        while guard.used_bytes.saturating_add(len) > self.budget_bytes {
-            let Some(victim) = guard
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(entry_key, _)| entry_key.clone())
-            else {
-                break;
-            };
-
-            if let Some(old) = guard.entries.remove(&victim) {
-                guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        if guard.used_bytes.saturating_add(len) <= self.budget_bytes {
+        // Zero-copy mappings are not constrained by the heap byte budget.
+        if !heap_backed || guard.used_bytes.saturating_add(len) <= self.budget_bytes {
             guard.used_bytes = guard.used_bytes.saturating_add(len);
             guard.entries.insert(
                 key,
