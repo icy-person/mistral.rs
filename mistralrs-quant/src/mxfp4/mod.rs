@@ -1,4 +1,13 @@
-use std::{collections::HashMap, sync::{atomic::AtomicUsize, Arc}};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, Arc},
+};
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{
+    __m256, _mm256_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_hadd_ps,
+    _mm256_loadu_ps, _mm256_mul_ps, _mm_add_ss, _mm_cvtss_f32, _mm256_fmadd_ps, _mm256_setzero_ps,
+};
 
 use candle_core::{DType, Device, Result, Storage, Tensor};
 use rayon::prelude::*;
@@ -200,6 +209,120 @@ impl MxFp4StreamingExpertLayer {
         })
     }
 
+    #[inline(always)]
+    fn dot_block(x: &[f32], w: &[f32], kernel: u8) -> f32 {
+        debug_assert_eq!(x.len(), MXFP4_BLOCK_SIZE);
+        debug_assert_eq!(w.len(), MXFP4_BLOCK_SIZE);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if kernel >= 2 {
+                return unsafe { Self::dot_block_avx2_fma(x, w) };
+            }
+            if kernel == 1 {
+                return unsafe { Self::dot_block_avx2(x, w) };
+            }
+        }
+
+        let mut acc = 0f32;
+        for i in 0..MXFP4_BLOCK_SIZE {
+            acc += x[i] * w[i];
+        }
+        acc
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dot_block_avx2(x: &[f32], w: &[f32]) -> f32 {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i < 32 {
+            let xv0 = _mm256_loadu_ps(x.as_ptr().add(i));
+            let wv0 = _mm256_loadu_ps(w.as_ptr().add(i));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(xv0, wv0));
+
+            let xv1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
+            let wv1 = _mm256_loadu_ps(w.as_ptr().add(i + 8));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(xv1, wv1));
+
+            let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 16));
+            let wv2 = _mm256_loadu_ps(w.as_ptr().add(i + 16));
+            a2 = _mm256_add_ps(a2, _mm256_mul_ps(xv2, wv2));
+
+            let xv3 = _mm256_loadu_ps(x.as_ptr().add(i + 24));
+            let wv3 = _mm256_loadu_ps(w.as_ptr().add(i + 24));
+            a3 = _mm256_add_ps(a3, _mm256_mul_ps(xv3, wv3));
+            i += 32;
+        }
+        Self::hsum4(a0, a1, a2, a3)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot_block_avx2_fma(x: &[f32], w: &[f32]) -> f32 {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i < 32 {
+            a0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(i)),
+                _mm256_loadu_ps(w.as_ptr().add(i)),
+                a0,
+            );
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(i + 8)),
+                _mm256_loadu_ps(w.as_ptr().add(i + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(i + 16)),
+                _mm256_loadu_ps(w.as_ptr().add(i + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(x.as_ptr().add(i + 24)),
+                _mm256_loadu_ps(w.as_ptr().add(i + 24)),
+                a3,
+            );
+            i += 32;
+        }
+        Self::hsum4(a0, a1, a2, a3)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn hsum4(a0: __m256, a1: __m256, a2: __m256, a3: __m256) -> f32 {
+        let s01 = _mm256_add_ps(a0, a1);
+        let s23 = _mm256_add_ps(a2, a3);
+        let sum = _mm256_add_ps(s01, s23);
+        let h1 = _mm256_hadd_ps(sum, sum);
+        let h2 = _mm256_hadd_ps(h1, h1);
+        let lo = _mm256_castps256_ps128(h2);
+        let hi = _mm256_extractf128_ps(h2, 1);
+        _mm_cvtss_f32(_mm_add_ss(lo, hi))
+    }
+
+    #[inline(always)]
+    fn dot_kernel() -> u8 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                if std::is_x86_feature_detected!("fma") {
+                    return 2;
+                }
+                return 1;
+            }
+        }
+        0
+    }
+
     fn dot_row(
         x: &[f32],
         raw_expert: &[u8],
@@ -350,6 +473,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         }
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+        let kernel = Self::dot_kernel();
 
         // Compute each routed expert once over all of its route rows. The previous
         // implementation parallelized over route rows and decoded the full expert
@@ -503,19 +627,22 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                             let packed =
                                 &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
                             let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                            let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
+                            for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                let packed_byte = packed[byte_idx];
+                                w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
+                                w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
+                                    dequant[(packed_byte >> 4) as usize];
+                            }
 
                             for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
                                 let x_row = &x_data[x_offset..x_offset + self.in_dim];
                                 let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                let mut dot = 0f32;
-                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                                    let packed_byte = packed[byte_idx];
-                                    dot += x_block[byte_idx]
-                                        * dequant[(packed_byte & 0x0f) as usize];
-                                    dot += x_block[MXFP4_BLOCK_SIZE / 2 + byte_idx]
-                                        * dequant[(packed_byte >> 4) as usize];
-                                }
-                                accs[route_idx] += dot;
+                                accs[route_idx] += Self::dot_block(
+                                    x_block,
+                                    &w_block,
+                                    kernel,
+                                );
                             }
                         }
                     });
