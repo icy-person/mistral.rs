@@ -1065,11 +1065,9 @@ impl MXFP4Layer {
         ];
         let mut s = 0u32;
         while s < 256 {
-            let scale_factor = if s == 255 {
-                f32::NAN
-            } else {
-                2.0f32.powi(s as i32 - 127)
-            };
+            // GGML's E8M0 conversion uses the exponent range directly:
+            // e=0 -> 2^-127, e=1 -> 2^-126, ..., e=255 -> 2^127.
+            let scale_factor = 2.0f32.powi(s as i32 - 127);
             let mut n = 0;
             while n < 16 {
                 lut[s as usize][n] = fp4[n] * scale_factor;
@@ -1710,6 +1708,14 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = Tensor::from_vec(expected_values, (1, MXFP4_BLOCK_SIZE), &Device::Cpu)?;
         assert_close(&actual, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mxfp4_e8m0_endpoints_match_ggml() -> Result<()> {
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[0][2], 2.0f32.powi(-126));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[1][2], 2.0f32.powi(-125));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[255][2], 2.0f32.powi(127));
         Ok(())
     }
 
