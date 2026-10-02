@@ -187,6 +187,25 @@ impl GgufMatMul {
         ))
     }
 
+    /// Construct one quantized matrix from an exact raw GGUF byte range.
+    ///
+    /// This is used by CPU MoE expert streaming: one routed expert is converted into a
+    /// standalone quantized matrix without materializing the full [E, out, in] expert stack.
+    pub fn from_gguf_bytes(
+        dtype: GgmlDType,
+        tensor_data: &[u8],
+        dims: Vec<usize>,
+        b: Option<Tensor>,
+        device: &Device,
+    ) -> Result<Self> {
+        let w = qtensor_from_ggml(dtype, tensor_data, dims, device)?;
+        Ok(Self::from_parts(
+            QMatMul::QTensor(Arc::new(w)),
+            b,
+            crate::ImatrixLayerStats::empty(),
+        ))
+    }
+
     /// Construct without `QMatMul::from_arc`: densifying would bypass the gather kernels
     /// expert stacks rely on.
     pub(crate) fn from_qtensor(w: QTensor, b: Option<Tensor>) -> Self {

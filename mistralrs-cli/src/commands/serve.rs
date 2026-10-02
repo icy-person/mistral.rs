@@ -48,6 +48,7 @@ pub async fn run_server(
     }
 
     agent_options.apply_to(&mut runtime);
+    runtime.apply_moe_stream_env();
     apply_agent_mode(&mut runtime);
     validate_agent_options(&runtime)?;
     log_agent_runtime(&runtime, server.max_tool_rounds);

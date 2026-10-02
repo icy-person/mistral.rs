@@ -11,6 +11,7 @@ mod checkpoint;
 pub(crate) use checkpoint::{expert_stack_available, rebuild_expert_projection};
 mod config;
 mod forward;
+mod streaming;
 
 use candle_core::{Device, Result, Tensor};
 use mistralrs_quant::{
@@ -32,6 +33,7 @@ use backends::CutlassExpertsWeights;
 use backends::{
     experts_are_prequantized, FastExpertsWeights, FusedExpertsWeights, StackedExpertWeights,
 };
+use streaming::StreamedExpertsWeights;
 use checkpoint::ExpertCheckpoint;
 use config::{BackendChoice, MoEExpertsBackend};
 use forward::{MoEForward, MoEForwardConfig, MoEForwardShape};
@@ -57,6 +59,7 @@ enum MoEExpertsBackendImpl {
     #[cfg(feature = "cuda")]
     Cutlass(CutlassExpertsWeights),
     Fast(FastExpertsWeights),
+    Streamed(StreamedExpertsWeights),
 }
 
 impl MoEExpertsBackendImpl {
@@ -76,6 +79,7 @@ impl MoEExpertsBackendImpl {
                 .forward_impl(forward, config)
                 .map_err(|err| err.context("moe experts cutlass")),
             Self::Fast(w) => w.forward_impl(forward, config),
+            Self::Streamed(w) => w.forward_impl(forward, config),
         }
     }
 }
@@ -108,6 +112,17 @@ impl MoEExperts {
         act: Activation,
     ) -> Result<Self> {
         let experts_vb = vb.pp("experts").set_device(layer_device.clone());
+        if let Some(streamed) =
+            StreamedExpertsWeights::try_new(cfg, &experts_vb, &layer_device, comm, loading_isq)?
+        {
+            return Ok(Self::from_backend(
+                MoEExpertsBackendImpl::Streamed(streamed),
+                None,
+                cfg,
+                comm,
+                act,
+            ));
+        }
         if let Some(fast) = FastExpertsWeights::from_weight_source(cfg, &experts_vb, comm)? {
             let lora_site = Self::register_lora_site(cfg, &experts_vb, comm, fast.sharded)?;
             return Ok(Self::from_backend(
@@ -199,6 +214,17 @@ impl MoEExperts {
         quantization_config: &Option<QuantizedConfig>,
         act: Activation,
     ) -> Result<Self> {
+        if let Some(streamed) =
+            StreamedExpertsWeights::try_new(cfg, &experts_vb, &experts_vb.device().clone(), comm, loading_isq)?
+        {
+            return Ok(Self::from_backend(
+                MoEExpertsBackendImpl::Streamed(streamed),
+                None,
+                cfg,
+                comm,
+                act,
+            ));
+        }
         if let Some(fast) = FastExpertsWeights::from_weight_source(cfg, &experts_vb, comm)? {
             let lora_site = Self::register_lora_site(cfg, &experts_vb, comm, fast.sharded)?;
             return Ok(Self::from_backend(

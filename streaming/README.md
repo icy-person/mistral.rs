@@ -64,6 +64,33 @@ Custom endpoint/model:
 
 The CLI flushes stdout after each received chunk, so generated text becomes visible immediately.
 
+## CLI flags
+
+The CLI is streaming-first: it flushes each received delta immediately. Options are parsed by
+Clap, and the endpoint/model can be configured by flags or environment variables.
+
+```bash
+# Basic streaming (reasoning is hidden by default)
+cargo run --release -- --model Qwen3.5-2B "سلام، خودت را معرفی کن"
+
+# Show reasoning and timing/throughput statistics
+cargo run --release -- --show-reasoning --stats "Explain mixture-of-experts models"
+
+# Tune generation
+cargo run --release -- --max-tokens 1024 --temperature 0.2 --top-p 0.9 "Write a concise summary"
+
+# JSON Lines events, suitable for piping into another program
+cargo run --release -- --output jsonl "Hello"
+
+# Reconnect only when the server supports SSE event IDs and replay
+cargo run --release -- --reconnect --max-retries 5 "Continue this task"
+```
+
+Supported flags include `--base-url`, `--model`, `--api-key`, `--max-tokens`,
+`--temperature`, `--top-p`, `--show-reasoning`, `--stats`, `--output text|jsonl`,
+`--reconnect`, and `--max-retries`. The `MISTRALRS_BASE_URL`, `MODEL`, and
+`OPENAI_API_KEY` environment variables are also supported. Use `--help` for the full list.
+
 ## Library usage
 
     use futures_util::StreamExt;
