@@ -14,7 +14,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(not(unix))]
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -343,7 +343,7 @@ impl MxFp4StreamCache {
     ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
         let mut result = HashMap::with_capacity(requests.len());
         for (key, range) in requests.iter().cloned() {
-            if let Some(data) = self.lookup(key) {
+            if let Some(data) = self.lookup(&key) {
                 result.insert(key, MxFp4StreamHandle::Ready(data));
             } else {
                 result.insert(
