@@ -4,6 +4,7 @@ use candle_core::{DType, Device, Result, Storage, Tensor};
 use safetensors::tensor::Dtype;
 
 use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
+use crate::mxfp4_stream::{MxFp4StreamCache, MxFp4StreamKey, MxFp4StreamRange};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UqffReader, UqffTensor,
@@ -48,6 +49,7 @@ pub struct MxFp4StreamingExpertLayer {
     in_dim: usize,
     out_dim: usize,
     bias: Option<Tensor>,
+    cache: Arc<MxFp4StreamCache>,
 }
 
 impl MxFp4StreamingExpertLayer {
@@ -58,6 +60,7 @@ impl MxFp4StreamingExpertLayer {
         in_dim: usize,
         out_dim: usize,
         bias: Option<Tensor>,
+        cache: Arc<MxFp4StreamCache>,
     ) -> Result<Self> {
         if raw_weights.is_empty() || raw_weights.len() > 2 {
             candle_core::bail!("GPT-OSS MXFP4 streaming expects one or two raw expert tensors");
@@ -139,15 +142,20 @@ impl MxFp4StreamingExpertLayer {
             in_dim,
             out_dim,
             bias,
+            cache,
         })
     }
 
-    fn raw_expert_bytes(&self, weight_idx: usize, expert_idx: usize) -> Result<&[u8]> {
+
+    fn raw_expert_range(
+        &self,
+        weight_idx: usize,
+        expert_idx: usize,
+    ) -> Result<MxFp4StreamRange> {
         let name = self
             .raw_weights
             .get(weight_idx)
             .ok_or_else(|| candle_core::Error::Msg("invalid streamed MXFP4 weight index".into()))?;
-
         if expert_idx >= self.num_experts {
             candle_core::bail!(
                 "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
@@ -155,28 +163,39 @@ impl MxFp4StreamingExpertLayer {
             );
         }
 
-        let data = self.archive.tensor_data(name)?.bytes();
-        let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row
-            .checked_mul(MXFP4_BLOCK_SIZE / 2 + 1)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 row byte-size overflow".into()))?;
-        let expert_bytes = self
-            .component_out_dim
-            .checked_mul(row_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert byte-size overflow".into()))?;
-        let start = expert_idx
-            .checked_mul(expert_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
-        let end = start
-            .checked_add(expert_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert range overflow".into()))?;
-
-        if end > data.len() {
-            candle_core::bail!(
-                "GPT-OSS MXFP4 streamed expert range {start}..{end} exceeds tensor {name}"
-            );
+        let info = self.archive.tensor_info(name)?;
+        let data_len = info.byte_len().ok_or_else(|| {
+            candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no exact byte range"))
+        })?;
+        let expert_len = data_len
+            .checked_div(self.num_experts)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert count is invalid".into()))?;
+        if expert_len == 0 || expert_len.saturating_mul(self.num_experts) != data_len {
+            candle_core::bail!("GPT-OSS MXFP4 tensor {name} has an invalid expert byte layout");
         }
-        Ok(&data[start..end])
+        let base = info
+            .data_range()
+            .ok_or_else(|| candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no data range")))?
+            .start;
+        let offset = u64::try_from(
+            base.checked_add(
+                expert_idx.checked_mul(expert_len).ok_or_else(|| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into())
+                })?
+            ).ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?
+        ).map_err(|_| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset exceeds u64".into()))?;
+        let file_len = self
+            .archive
+            .shards()
+            .get(info.shard_index())
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 shard index out of range".into()))?
+            .file_len();
+        Ok(MxFp4StreamRange {
+            shard: info.shard_index(),
+            offset,
+            len: expert_len,
+            file_len,
+        })
     }
 
     fn dot_row(
@@ -303,6 +322,35 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
+        let mut needed = std::collections::HashSet::new();
+        for &expert in &indices_data {
+            needed.insert(expert as usize);
+        }
+
+        let mut requests = Vec::with_capacity(needed.len() * self.raw_weights.len());
+        for weight_idx in 0..self.raw_weights.len() {
+            for &expert_idx in &needed {
+                let range = self.raw_expert_range(weight_idx, expert_idx)?;
+                requests.push((
+                    MxFp4StreamKey {
+                        weight_index: weight_idx,
+                        expert_index: expert_idx,
+                    },
+                    range,
+                ));
+            }
+        }
+
+        let expert_data = if self.cache.overlap() {
+            self.cache.prefetch(&requests)?
+        } else {
+            let mut loaded = std::collections::HashMap::with_capacity(requests.len());
+            for (key, range) in requests {
+                loaded.insert(key, self.cache.load(key, range)?);
+            }
+            loaded
+        };
+
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
         let bias_data = self
             .bias
@@ -345,10 +393,14 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 let x_row = &x_data[x_offset..x_offset + self.in_dim];
 
                 for component in 0..self.raw_weights.len() {
-                    let expert = self.raw_expert_bytes(component, expert_idx)?;
+                    let key = MxFp4StreamKey {
+                        weight_index: component,
+                        expert_index: expert_idx,
+                    };
+                    let expert = expert_data.get(&key).ok_or_else(|| {
+                        candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                    })?;
                     for row in 0..self.component_out_dim {
-                        // Native GPT-OSS gate/up tensors are interleaved along the
-                        // output dimension: gate0, up0, gate1, up1, ...
                         let out_index = if self.raw_weights.len() == 2 {
                             row * 2 + component
                         } else {
@@ -366,9 +418,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     }
                 }
 
-                // Expert bias is selected per route; broadcasting [experts, out]
-                // over [tokens, topk, out] is not valid and would also apply the
-                // wrong expert bias.
                 if let Some(bias) = &bias_data {
                     let bias_offset = expert_idx * self.out_dim;
                     let output_offset = route_row * self.out_dim;
@@ -378,6 +427,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 }
             }
         }
+
+        self.cache.log_stats();
 
         let result =
             Tensor::from_vec(output, (num_tokens, topk, self.out_dim), &Device::Cpu)?;
