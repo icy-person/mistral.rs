@@ -1152,6 +1152,7 @@ impl MxFp4StreamingExpertLayer {
         let down_bias = down.bias_cpu.as_deref();
         let mut output = vec![0.0f32; num_tokens * hidden_dim];
         let mut route_x_offsets = Vec::with_capacity(topk.max(1));
+        let mut activation_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
         let mut gate_values = Vec::new();
         let mut up_values = Vec::new();
@@ -1197,8 +1198,10 @@ impl MxFp4StreamingExpertLayer {
             let route_count = routes.len();
 
             route_x_offsets.clear();
-            for &route_row in routes {
+            activation_offsets.clear();
+            for (route_idx, &route_row) in routes.iter().enumerate() {
                 route_x_offsets.push((route_row / topk) * hidden_dim);
+                activation_offsets.push(route_idx * down.in_dim);
             }
 
             let activation_len = route_count * down.in_dim;
@@ -1305,8 +1308,7 @@ impl MxFp4StreamingExpertLayer {
                     });
             }
 
-                let activation_offsets: Vec<usize> =
-                (0..route_count).map(|route| route * down.in_dim).collect();
+                let activation_offsets = &activation_offsets[..route_count];
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
             let down_kernel = kernel;
 
