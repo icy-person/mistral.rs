@@ -453,11 +453,14 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             }
             routes_by_expert[expert].push(route);
         }
-        let experts = routes_by_expert
+        let mut experts = routes_by_expert
             .iter()
             .enumerate()
             .filter_map(|(expert, routes)| (!routes.is_empty()).then_some(expert))
             .collect::<Vec<_>>();
+        // Load low-frequency experts first so the per-source cache quota retains
+        // the most frequently routed experts at the end of the pass.
+        experts.sort_unstable_by_key(|&expert| (routes_by_expert[expert].len(), expert));
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
         for weight_idx in 0..self.raw_weights.len() {
