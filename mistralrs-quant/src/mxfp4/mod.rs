@@ -269,14 +269,29 @@ impl MxFp4StreamingExpertLayer {
     }
 
     #[inline(always)]
-    fn adaptive_parallel(route_count: usize, out_rows: usize, blocks_per_row: usize) -> bool {
-        if rayon::current_num_threads() <= 1 {
+    fn adaptive_parallel_with_threads(
+        threads: usize,
+        route_count: usize,
+        out_rows: usize,
+        blocks_per_row: usize,
+    ) -> bool {
+        if threads <= 1 {
             return false;
         }
         let work = route_count
             .saturating_mul(out_rows)
             .saturating_mul(blocks_per_row);
         work >= 8192 && out_rows >= 32
+    }
+
+    #[inline(always)]
+    fn adaptive_parallel(route_count: usize, out_rows: usize, blocks_per_row: usize) -> bool {
+        Self::adaptive_parallel_with_threads(
+            rayon::current_num_threads(),
+            route_count,
+            out_rows,
+            blocks_per_row,
+        )
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1182,6 +1197,7 @@ impl MxFp4StreamingExpertLayer {
         let mut gate_values = Vec::new();
         let mut up_values = Vec::new();
         let kernel = Self::dot_kernel();
+        let moe_threads = Self::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
                 let gate_key = MxFp4StreamKey {
@@ -1362,7 +1378,12 @@ impl MxFp4StreamingExpertLayer {
 
             const STACK_ROUTES: usize = 8;
             let parallel_down = route_count <= STACK_ROUTES
-                && Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row);
+                && Self::adaptive_parallel_with_threads(
+                    moe_threads,
+                    route_count,
+                    down.out_dim,
+                    blocks_per_row,
+                );
 
             if parallel_down {
                 let output_ptr = output.as_mut_ptr();
