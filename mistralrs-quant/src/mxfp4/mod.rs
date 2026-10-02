@@ -1045,7 +1045,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     let x_row = &x_data[route_x_offsets[0]..route_x_offsets[0] + self.in_dim];
                     let out_row = &mut output[routes[0] * self.out_dim..(routes[0] + 1) * self.out_dim];
 
-                    for row in 0..self.component_out_dim {
+                    let compute_pair = |row: usize, pair: &mut [f32]| {
                         let (gate, up) = if kernel >= 2 {
                             #[cfg(target_arch = "x86_64")]
                             {
@@ -1103,9 +1103,21 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                             }
                             (gate, up)
                         };
+                        pair[0] += gate;
+                        pair[1] += up;
+                    };
 
-                        out_row[row * 2] += gate;
-                        out_row[row * 2 + 1] += up;
+                    let parallel =
+                        Self::adaptive_parallel(1, self.component_out_dim, blocks_per_row);
+                    if parallel {
+                        out_row
+                            .par_chunks_mut(2)
+                            .enumerate()
+                            .for_each(|(row, pair)| compute_pair(row, pair));
+                    } else {
+                        for (row, pair) in out_row.chunks_mut(2).enumerate() {
+                            compute_pair(row, pair);
+                        }
                     }
                     continue;
                 }
