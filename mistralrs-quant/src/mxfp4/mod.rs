@@ -358,8 +358,8 @@ impl MxFp4StreamingExpertLayer {
         let (lo1, hi1) = unpack8(packed.add(8));
 
         let s = raw_expert[block_start] as u32;
-        if (2..=252).contains(&s) {
-            let scale_offset = _mm256_set1_epi32((s as i32) - 2);
+        if (2..=253).contains(&s) {
+            let scale_offset = _mm256_set1_epi32((s as i32) - 1);
             [
                 decode8_normal_e8m0(lo0, scale_offset),
                 decode8_normal_e8m0(lo1, scale_offset),
@@ -3354,6 +3354,49 @@ mod tests {
                 "got={got} want={want} diff={}",
                 (got - want).abs()
             );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn streaming_fused_dequant_matches_reference_all_normal_scales() {
+        let mut raw = vec![0u8; MXFP4_BLOCK_SIZE / 2 + 1];
+        for scale in 2u16..=253 {
+            raw[0] = scale as u8;
+            for i in 0..MXFP4_BLOCK_SIZE / 2 {
+                // Cover every nibble value repeatedly, including signed FP4 values.
+                raw[i + 1] = (((i * 7) & 0x0f) as u8)
+                    | ((((i * 11 + 3) & 0x0f) as u8) << 4);
+            }
+
+            let vectors = unsafe {
+                MxFp4StreamingExpertLayer::load_fused_weight_vectors_avx2(&raw, 0)
+            };
+            let mut actual = [0.0f32; MXFP4_BLOCK_SIZE];
+            unsafe {
+                _mm256_storeu_ps(actual.as_mut_ptr(), vectors[0]);
+                _mm256_storeu_ps(actual.as_mut_ptr().add(8), vectors[1]);
+                _mm256_storeu_ps(actual.as_mut_ptr().add(16), vectors[2]);
+                _mm256_storeu_ps(actual.as_mut_ptr().add(24), vectors[3]);
+            }
+
+            let dequant = &MXFP4Layer::DEQUANT_LUT[scale as usize];
+            for i in 0..MXFP4_BLOCK_SIZE / 2 {
+                let packed = raw[i + 1];
+                let expected_lo = dequant[(packed & 0x0f) as usize];
+                let expected_hi = dequant[(packed >> 4) as usize];
+                assert_eq!(
+                    actual[i].to_bits(),
+                    expected_lo.to_bits(),
+                    "scale={scale} lane={i} low"
+                );
+                assert_eq!(
+                    actual[16 + i].to_bits(),
+                    expected_hi.to_bits(),
+                    "scale={scale} lane={} high",
+                    16 + i
+                );
+            }
         }
     }
 
