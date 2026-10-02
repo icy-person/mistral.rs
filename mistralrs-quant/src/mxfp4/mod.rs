@@ -991,6 +991,18 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     .par_chunks_mut(route_count)
                     .enumerate()
                     .for_each(|(row, accs)| {
+                        if let Some(grouped) = Self::dot_streamed_row_group(
+                            &x_data,
+                            &route_x_offsets,
+                            expert,
+                            row,
+                            self.in_dim,
+                            route_count,
+                        ) {
+                            accs[..route_count].copy_from_slice(&grouped[..route_count]);
+                            return;
+                        }
+
                         if route_count == 1 {
                             let x_offset = route_x_offsets[0];
                             let x_row = &x_data[x_offset..x_offset + self.in_dim];
