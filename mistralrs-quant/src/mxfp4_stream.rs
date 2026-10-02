@@ -128,7 +128,7 @@ fn available_memory_bytes() -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MxFp4StreamKey {
-    pub weight_index: usize,
+    pub source: String,
     pub expert_index: usize,
 }
 
