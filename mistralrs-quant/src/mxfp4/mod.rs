@@ -411,7 +411,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
                             )
                         })?;
-                        let data = self.cache.resolve(key, handle)?;
+                        let data = self.cache.resolve(&key, handle)?;
                         expert_data.insert(key, data);
                     }
                 }
