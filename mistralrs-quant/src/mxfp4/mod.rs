@@ -251,17 +251,16 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    #[inline]
+    #[inline(always)]
     unsafe fn dot_block_pair_avx2(
         x_data: &[f32],
-        x_offsets: &[usize],
+        x_offset0: usize,
+        x_offset1: usize,
         x_start: usize,
         w: &[f32],
     ) -> [f32; 2] {
-        debug_assert_eq!(x_offsets.len(), 2);
-
-        let x0 = x_data.as_ptr().add(x_offsets[0] + x_start);
-        let x1 = x_data.as_ptr().add(x_offsets[1] + x_start);
+        let x0 = x_data.as_ptr().add(x_offset0 + x_start);
+        let x1 = x_data.as_ptr().add(x_offset1 + x_start);
         let w_ptr = w.as_ptr();
 
         let w0 = _mm256_loadu_ps(w_ptr);
@@ -283,17 +282,16 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    #[inline]
+    #[inline(always)]
     unsafe fn dot_block_pair_avx2_fma(
         x_data: &[f32],
-        x_offsets: &[usize],
+        x_offset0: usize,
+        x_offset1: usize,
         x_start: usize,
         w: &[f32],
     ) -> [f32; 2] {
-        debug_assert_eq!(x_offsets.len(), 2);
-
-        let x0 = x_data.as_ptr().add(x_offsets[0] + x_start);
-        let x1 = x_data.as_ptr().add(x_offsets[1] + x_start);
+        let x0 = x_data.as_ptr().add(x_offset0 + x_start);
+        let x1 = x_data.as_ptr().add(x_offset1 + x_start);
         let w_ptr = w.as_ptr();
 
         let w0 = _mm256_loadu_ps(w_ptr);
@@ -1093,7 +1091,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         let pair = unsafe {
                                             Self::dot_block_pair_avx2_fma(
                                                 &x_data,
-                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                route_x_offsets[pair_start],
+                                                route_x_offsets[pair_start + 1],
                                                 col_start,
                                                 &w_block,
                                             )
@@ -1108,7 +1107,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         let pair = unsafe {
                                             Self::dot_block_pair_avx2(
                                                 &x_data,
-                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                route_x_offsets[pair_start],
+                                                route_x_offsets[pair_start + 1],
                                                 col_start,
                                                 &w_block,
                                             )
@@ -1237,7 +1237,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         let pair = unsafe {
                                             Self::dot_block_pair_avx2_fma(
                                                 &x_data,
-                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                route_x_offsets[pair_start],
+                                                route_x_offsets[pair_start + 1],
                                                 col_start,
                                                 &w_block,
                                             )
@@ -1252,7 +1253,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         let pair = unsafe {
                                             Self::dot_block_pair_avx2(
                                                 &x_data,
-                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                route_x_offsets[pair_start],
+                                                route_x_offsets[pair_start + 1],
                                                 col_start,
                                                 &w_block,
                                             )
