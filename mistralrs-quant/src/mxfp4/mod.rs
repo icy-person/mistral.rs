@@ -342,15 +342,17 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             }
         }
 
-        let expert_data = if self.cache.overlap() {
-            self.cache.prefetch(&requests)?
+        let mut pending = if self.cache.overlap() {
+            Some(self.cache.prefetch(&requests)?)
         } else {
-            let mut loaded = std::collections::HashMap::with_capacity(requests.len());
-            for (key, range) in requests {
-                loaded.insert(key, self.cache.load(key, range)?);
-            }
-            loaded
+            None
         };
+        let mut expert_data = std::collections::HashMap::with_capacity(requests.len());
+        if pending.is_none() {
+            for (key, range) in requests {
+                expert_data.insert(key, self.cache.load(key, range)?);
+            }
+        }
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
         let bias_data = self
@@ -398,6 +400,17 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         source: self.raw_weights[component].clone(),
                         expert_index: expert_idx,
                     };
+                    if let Some(pending_map) = pending.as_mut() {
+                        if !expert_data.contains_key(&key) {
+                            let handle = pending_map.remove(&key).ok_or_else(|| {
+                                candle_core::Error::Msg(
+                                    "GPT-OSS MXFP4 streamed expert request was not scheduled",
+                                )
+                            })?;
+                            let data = self.cache.resolve(key, handle)?;
+                            expert_data.insert(key, data);
+                        }
+                    }
                     let expert = expert_data.get(&key).ok_or_else(|| {
                         candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
                     })?;
