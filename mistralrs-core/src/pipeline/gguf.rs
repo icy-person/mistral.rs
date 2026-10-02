@@ -163,7 +163,7 @@ pub struct GGUFLoader {
     moe_streaming: bool,
 }
 
-#[derive(Clone, Default)
+#[derive(Clone, Default)]
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
