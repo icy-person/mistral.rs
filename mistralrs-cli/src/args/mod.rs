@@ -711,7 +711,13 @@ pub struct RuntimeOptions {
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 
     /// Stream routed MoE expert weights from GGUF instead of materializing the full expert stack.
-    #[arg(long = "moe-stream", env = "MISTRALRS_MOE_STREAM")]
+    #[arg(
+        long = "moe-stream",
+        visible_alias = "moe_stream",
+        action = clap::ArgAction::SetTrue,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_STREAM"
+    )]
     #[serde(default)]
     pub moe_stream: bool,
 
@@ -1668,6 +1674,40 @@ mod tests {
         assert_eq!(default_model.multimodal.max_edge, Some(2048));
         assert_eq!(default_model.multimodal.max_num_images, Some(5));
         assert_eq!(default_model.multimodal.max_image_length, Some(1536));
+    }
+
+    #[test]
+    fn moe_stream_flag_accepts_hyphenated_and_legacy_spelling() {
+        for flag in ["--moe-stream", "--moe_stream"] {
+            let cli = Cli::try_parse_from([
+                "mistralrs",
+                "run",
+                "-m",
+                "org/model",
+                flag,
+            ])
+            .unwrap_or_else(|error| panic!("failed to parse {flag}: {error}"));
+
+            let Command::Run { runtime, .. } = cli.command else {
+                panic!("expected run command");
+            };
+            assert!(runtime.moe_stream);
+        }
+    }
+
+    #[test]
+    fn moe_stream_flag_is_optional_when_omitted() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "run",
+            "-m",
+            "org/model",
+        ]).unwrap();
+
+        let Command::Run { runtime, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(!runtime.moe_stream);
     }
 
     #[test]
