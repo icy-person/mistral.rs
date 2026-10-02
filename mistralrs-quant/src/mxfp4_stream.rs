@@ -1,7 +1,10 @@
+use memmap2::Mmap;
+
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{self},
+    ops::Deref,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -27,6 +30,7 @@ pub(crate) struct MxFp4StreamConfig {
     pub cache_floor_mb: usize,
     pub cache_ceil_mb: Option<usize>,
     pub cache_per_source: usize,
+    pub mmap: bool,
     pub io_threads: usize,
     pub overlap: bool,
     pub o_direct: bool,
@@ -40,6 +44,7 @@ impl Default for MxFp4StreamConfig {
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
             cache_per_source: 5,
+            mmap: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,
@@ -70,8 +75,9 @@ impl MxFp4StreamConfig {
             cache_per_source: env_usize(
                 "MISTRALRS_MOE_CACHE_PER_SOURCE",
                 defaults.cache_per_source,
-            )
+)
             .clamp(1, 32),
+            mmap: env_bool("MISTRALRS_MOE_MMAP", defaults.mmap),
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
             o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
@@ -151,7 +157,7 @@ pub(crate) struct MxFp4StreamRange {
 
 #[derive(Debug)]
 struct CacheEntry {
-    data: Arc<Vec<u8>>,
+    data: Arc<MxFp4StreamData>,
     bytes: usize,
     last_used: u64,
 }
@@ -169,21 +175,67 @@ struct ReadJob {
     offset: u64,
     len: usize,
     file_len: usize,
-    reply: SyncSender<io::Result<Vec<u8>>>,
+    reply: SyncSender<io::Result<Arc<MxFp4StreamData>>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum MxFp4StreamData {
+    Owned(Arc<[u8]>),
+    Mapped {
+        map: Arc<Mmap>,
+        start: usize,
+        len: usize,
+    },
+}
+
+impl MxFp4StreamData {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(data) => data.len(),
+            Self::Mapped { len, .. } => *len,
+        }
+    }
+}
+
+impl Deref for MxFp4StreamData {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(data) => data,
+            Self::Mapped { map, start, len } => &map[*start..*start + *len],
+        }
+    }
 }
 
 struct WorkerFiles {
     normal: Vec<File>,
     direct: Vec<Option<File>>,
+    maps: Vec<Option<Arc<Mmap>>>,
 }
 
 impl WorkerFiles {
-    fn new(paths: &[PathBuf], want_direct: bool) -> io::Result<Self> {
+    fn new(paths: &[PathBuf], want_direct: bool, want_mmap: bool) -> io::Result<Self> {
         let mut normal = Vec::with_capacity(paths.len());
         let mut direct = Vec::with_capacity(paths.len());
+        let mut maps = Vec::with_capacity(paths.len());
 
         for path in paths {
-            normal.push(File::open(path)?);
+            let file = File::open(path)?;
+            let map = if want_mmap && !want_direct {
+                match unsafe { memmap2::MmapOptions::new().map(&file) } {
+                    Ok(map) => Some(Arc::new(map)),
+                    Err(err) => {
+                        tracing::debug!("mmap unavailable for {}: {err}", path.display());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            normal.push(file);
 
             #[cfg(target_os = "linux")]
             let direct_file = if want_direct {
@@ -209,15 +261,16 @@ impl WorkerFiles {
             let direct_file = None;
 
             direct.push(direct_file);
+            maps.push(map);
         }
 
-        Ok(Self { normal, direct })
+        Ok(Self { normal, direct, maps })
     }
 }
 
 pub(crate) enum MxFp4StreamHandle {
-    Ready(Arc<Vec<u8>>),
-    Pending(Receiver<io::Result<Vec<u8>>>),
+    Ready(Arc<MxFp4StreamData>),
+    Pending(Receiver<io::Result<Arc<MxFp4StreamData>>>),
 }
 
 #[derive(Debug, Default)]
@@ -269,10 +322,11 @@ impl MxFp4StreamCache {
             let receiver = receiver.clone();
             let worker_paths = paths.clone();
             let want_direct = config.o_direct;
+            let want_mmap = config.mmap;
             thread::Builder::new()
                 .name(format!("mxfp4-io-{worker_id}"))
                 .spawn(move || {
-                    let files = match WorkerFiles::new(&worker_paths, want_direct) {
+                    let files = match WorkerFiles::new(&worker_paths, want_direct, want_mmap) {
                         Ok(files) => files,
                         Err(err) => {
                             tracing::error!(
@@ -298,13 +352,16 @@ impl MxFp4StreamCache {
                             continue;
                         };
                         let direct_file = files.direct.get(job.shard).and_then(Option::as_ref);
+                        let map = files.maps.get(job.shard).and_then(Option::as_ref);
                         let result = read_file_range(
                             file,
                             direct_file,
+                            map,
                             job.offset,
                             job.len,
                             job.file_len,
-                        );
+                        )
+                        .map(Arc::new);
                         let _ = job.reply.send(result);
                     }
                 })
@@ -369,7 +426,7 @@ impl MxFp4StreamCache {
         }
     }
 
-    fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Arc<MxFp4StreamData>>>> {
         if range.shard >= self.paths.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -473,7 +530,7 @@ impl MxFp4StreamCache {
         };
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, mmap={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
             self.budget_bytes / MIB,
@@ -486,6 +543,7 @@ impl MxFp4StreamCache {
             evictions,
             self.config.io_threads,
             self.config.overlap,
+            self.config.mmap,
             self.config.o_direct,
         );
     }
@@ -494,10 +552,11 @@ impl MxFp4StreamCache {
 fn read_file_range(
     file: &File,
     direct_file: Option<&File>,
+    map: Option<&Arc<Mmap>>,
     offset: u64,
     len: usize,
     file_len: usize,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<MxFp4StreamData> {
     let end = offset
         .checked_add(len as u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 read range overflow"))?;
@@ -506,6 +565,26 @@ fn read_file_range(
             io::ErrorKind::UnexpectedEof,
             format!("MXFP4 read range {offset}..{end} exceeds file length {file_len}"),
         ));
+    }
+
+    if let Some(map) = map {
+        let start = usize::try_from(offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 mmap offset exceeds usize")
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 mmap range overflow"))?;
+        if end > map.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "MXFP4 mmap range exceeds mapped file",
+            ));
+        }
+        return Ok(MxFp4StreamData::Mapped {
+            map: map.clone(),
+            start,
+            len,
+        });
     }
 
     #[cfg(target_os = "linux")]
@@ -518,7 +597,9 @@ fn read_file_range(
             match read_direct(direct, aligned_start, aligned_len) {
                 Ok(buf) => {
                     let begin = usize::try_from(offset - aligned_start).unwrap_or(0);
-                    return Ok(buf[begin..begin + len].to_vec());
+                    return Ok(MxFp4StreamData::Owned(Arc::<[u8]>::from(
+                        buf[begin..begin + len].to_vec(),
+                    )));
                 }
                 Err(err) => {
                     tracing::debug!("O_DIRECT MXFP4 read fallback for range {offset}..{end}: {err}");
@@ -529,7 +610,7 @@ fn read_file_range(
 
     let mut buf = vec![0u8; len];
     read_exact_at(file, offset, &mut buf)?;
-    Ok(buf)
+    Ok(MxFp4StreamData::Owned(Arc::<[u8]>::from(buf)))
 }
 
 #[cfg(target_os = "linux")]
@@ -625,6 +706,7 @@ mod tests {
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(2048),
             cache_per_source: 5,
+            mmap: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,
