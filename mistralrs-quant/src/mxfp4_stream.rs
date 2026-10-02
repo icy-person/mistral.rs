@@ -489,7 +489,7 @@ impl MxFp4StreamCache {
         &self,
         key: &MxFp4StreamKey,
         handle: MxFp4StreamHandle,
-    ) -> crate::Result<Arc<Vec<u8>>> {
+    ) -> crate::Result<Arc<MxFp4StreamData>> {
         match handle {
             MxFp4StreamHandle::Ready(data) => Ok(data),
             MxFp4StreamHandle::Pending(rx) => {
