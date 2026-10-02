@@ -375,7 +375,7 @@ impl MxFp4StreamCache {
         self.config.overlap
     }
 
-    fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<Vec<u8>>> {
+    fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
         let mut guard = self.inner.lock().ok()?;
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
@@ -385,7 +385,7 @@ impl MxFp4StreamCache {
         Some(entry.data.clone())
     }
 
-    fn insert(&self, key: MxFp4StreamKey, data: Arc<Vec<u8>>) {
+    fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
         let len = data.len();
         let capacity = self.budget_bytes;
         if len == 0 || len > capacity {
