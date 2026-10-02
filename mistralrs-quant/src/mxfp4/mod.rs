@@ -417,6 +417,108 @@ impl MxFp4StreamingExpertLayer {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     #[inline]
+    unsafe fn dot_streamed_row_pair_fused_avx2(
+        x: &[f32],
+        raw0: &[u8],
+        raw1: &[u8],
+        row: usize,
+        in_dim: usize,
+    ) -> (f32, f32) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let mut w0_offset = row * row_bytes;
+        let mut w1_offset = row * row_bytes;
+        let mut x_offset = 0usize;
+
+        let mut g0 = _mm256_setzero_ps();
+        let mut g1 = _mm256_setzero_ps();
+        let mut g2 = _mm256_setzero_ps();
+        let mut g3 = _mm256_setzero_ps();
+        let mut u0 = _mm256_setzero_ps();
+        let mut u1 = _mm256_setzero_ps();
+        let mut u2 = _mm256_setzero_ps();
+        let mut u3 = _mm256_setzero_ps();
+
+        for _ in 0..blocks_per_row {
+            let x0 = _mm256_loadu_ps(x.as_ptr().add(x_offset));
+            let x1 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 8));
+            let x2 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 16));
+            let x3 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 24));
+
+            let wg = Self::load_fused_weight_vectors_avx2(raw0, w0_offset);
+            g0 = _mm256_add_ps(g0, _mm256_mul_ps(x0, wg[0]));
+            g1 = _mm256_add_ps(g1, _mm256_mul_ps(x1, wg[1]));
+            g2 = _mm256_add_ps(g2, _mm256_mul_ps(x2, wg[2]));
+            g3 = _mm256_add_ps(g3, _mm256_mul_ps(x3, wg[3]));
+
+            let wu = Self::load_fused_weight_vectors_avx2(raw1, w1_offset);
+            u0 = _mm256_add_ps(u0, _mm256_mul_ps(x0, wu[0]));
+            u1 = _mm256_add_ps(u1, _mm256_mul_ps(x1, wu[1]));
+            u2 = _mm256_add_ps(u2, _mm256_mul_ps(x2, wu[2]));
+            u3 = _mm256_add_ps(u3, _mm256_mul_ps(x3, wu[3]));
+
+            w0_offset += MXFP4_BLOCK_SIZE / 2 + 1;
+            w1_offset += MXFP4_BLOCK_SIZE / 2 + 1;
+            x_offset += MXFP4_BLOCK_SIZE;
+        }
+
+        (Self::hsum4(g0, g1, g2, g3), Self::hsum4(u0, u1, u2, u3))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot_streamed_row_pair_fused_avx2_fma(
+        x: &[f32],
+        raw0: &[u8],
+        raw1: &[u8],
+        row: usize,
+        in_dim: usize,
+    ) -> (f32, f32) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let mut w0_offset = row * row_bytes;
+        let mut w1_offset = row * row_bytes;
+        let mut x_offset = 0usize;
+
+        let mut g0 = _mm256_setzero_ps();
+        let mut g1 = _mm256_setzero_ps();
+        let mut g2 = _mm256_setzero_ps();
+        let mut g3 = _mm256_setzero_ps();
+        let mut u0 = _mm256_setzero_ps();
+        let mut u1 = _mm256_setzero_ps();
+        let mut u2 = _mm256_setzero_ps();
+        let mut u3 = _mm256_setzero_ps();
+
+        for _ in 0..blocks_per_row {
+            let x0 = _mm256_loadu_ps(x.as_ptr().add(x_offset));
+            let x1 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 8));
+            let x2 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 16));
+            let x3 = _mm256_loadu_ps(x.as_ptr().add(x_offset + 24));
+
+            let wg = Self::load_fused_weight_vectors_avx2(raw0, w0_offset);
+            g0 = _mm256_fmadd_ps(x0, wg[0], g0);
+            g1 = _mm256_fmadd_ps(x1, wg[1], g1);
+            g2 = _mm256_fmadd_ps(x2, wg[2], g2);
+            g3 = _mm256_fmadd_ps(x3, wg[3], g3);
+
+            let wu = Self::load_fused_weight_vectors_avx2(raw1, w1_offset);
+            u0 = _mm256_fmadd_ps(x0, wu[0], u0);
+            u1 = _mm256_fmadd_ps(x1, wu[1], u1);
+            u2 = _mm256_fmadd_ps(x2, wu[2], u2);
+            u3 = _mm256_fmadd_ps(x3, wu[3], u3);
+
+            w0_offset += MXFP4_BLOCK_SIZE / 2 + 1;
+            w1_offset += MXFP4_BLOCK_SIZE / 2 + 1;
+            x_offset += MXFP4_BLOCK_SIZE;
+        }
+
+        (Self::hsum4(g0, g1, g2, g3), Self::hsum4(u0, u1, u2, u3))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn dot_streamed_routes_fused_avx2(
         x_data: &[f32],
         x_offsets: &[usize],
@@ -838,8 +940,10 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         }
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
-        for weight_idx in 0..self.raw_weights.len() {
-            for &expert_idx in &experts {
+        // Expert-major ordering keeps gate/up requests adjacent, allowing the
+        // single-route GPT-OSS fast path to consume both handles in one pass.
+        for &expert_idx in &experts {
+            for weight_idx in 0..self.raw_weights.len() {
                 requests.push((
                     MxFp4StreamKey {
                         source: self.raw_weights[weight_idx].clone(),
@@ -876,11 +980,34 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
 
         for component in 0..self.raw_weights.len() {
             for &expert_idx in &experts {
+                let route_start = expert_offsets[expert_idx];
+                let route_end = expert_offsets[expert_idx + 1];
+                let routes = &routes_flat[route_start..route_end];
+                let route_count = routes.len();
+                let pair_single_route = interleaved_gate_up && route_count == 1;
+
+                // Component 0 owns the paired gate/up fast path. Component 1 is
+                // skipped only when component 0 already consumed both experts.
+                if component == 1 && pair_single_route {
+                    continue;
+                }
+
+                route_x_offsets.clear();
+                if route_x_offsets.capacity() < route_count {
+                    route_x_offsets.reserve(route_count - route_x_offsets.capacity());
+                }
+                for &route_row in routes {
+                    route_x_offsets.push(if x_has_topk {
+                        route_row * self.in_dim
+                    } else {
+                        (route_row / topk) * self.in_dim
+                    });
+                }
+
                 let key = MxFp4StreamKey {
                     source: self.raw_weights[component].clone(),
                     expert_index: expert_idx,
                 };
-
                 let expert_data = if let Some(pending_queue) = pending.as_mut() {
                     let handle = pending_queue.pop_front().ok_or_else(|| {
                         candle_core::Error::Msg(
@@ -895,24 +1022,93 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 };
                 let expert = expert_data.as_ref();
 
-                let route_start = expert_offsets[expert_idx];
-                let route_end = expert_offsets[expert_idx + 1];
-                let routes = &routes_flat[route_start..route_end];
-                let route_count = routes.len();
-
-                route_x_offsets.clear();
-                if route_x_offsets.capacity() < route_count {
-                    route_x_offsets.reserve(route_count - route_x_offsets.capacity());
-                }
-                for &route_row in routes {
-                    route_x_offsets.push(if x_has_topk {
-                        route_row * self.in_dim
-                    } else {
-                        (route_row / topk) * self.in_dim
-                    });
-                }
-
                 let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
+
+                if pair_single_route && component == 0 {
+                    let key_up = MxFp4StreamKey {
+                        source: self.raw_weights[1].clone(),
+                        expert_index: expert_idx,
+                    };
+                    let expert_up_data = if let Some(pending_queue) = pending.as_mut() {
+                        let handle = pending_queue.pop_front().ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "GPT-OSS MXFP4 paired gate/up request was not scheduled"
+                                    .to_string(),
+                            )
+                        })?;
+                        self.cache.resolve(&key_up, handle)?
+                    } else {
+                        let range = self.raw_expert_range(1, expert_idx)?;
+                        self.cache.load(&key_up, range)?
+                    };
+                    let expert_up = expert_up_data.as_ref();
+                    let x_row = &x_data[route_x_offsets[0]..route_x_offsets[0] + self.in_dim];
+                    let out_row = &mut output[routes[0] * self.out_dim..(routes[0] + 1) * self.out_dim];
+
+                    for row in 0..self.component_out_dim {
+                        let (gate, up) = if kernel >= 2 {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                unsafe {
+                                    Self::dot_streamed_row_pair_fused_avx2_fma(
+                                        x_row,
+                                        expert,
+                                        expert_up,
+                                        row,
+                                        self.in_dim,
+                                    )
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                (0.0, 0.0)
+                            }
+                        } else if kernel == 1 {
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                unsafe {
+                                    Self::dot_streamed_row_pair_fused_avx2(
+                                        x_row,
+                                        expert,
+                                        expert_up,
+                                        row,
+                                        self.in_dim,
+                                    )
+                                }
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            let mut gate = 0.0f32;
+                            let mut up = 0.0f32;
+                            let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                            for block_idx in 0..blocks_per_row {
+                                let block_start = row * row_bytes
+                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                                let dequant_gate = &MXFP4Layer::DEQUANT_LUT[expert[block_start] as usize];
+                                let dequant_up = &MXFP4Layer::DEQUANT_LUT[expert_up[block_start] as usize];
+                                let packed_gate = &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                let packed_up = &expert_up[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
+                                let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                    let pg = packed_gate[byte_idx];
+                                    let pu = packed_up[byte_idx];
+                                    gate += x_row[col_start + byte_idx] * dequant_gate[(pg & 0x0f) as usize];
+                                    gate += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx] * dequant_gate[(pg >> 4) as usize];
+                                    up += x_row[col_start + byte_idx] * dequant_up[(pu & 0x0f) as usize];
+                                    up += x_row[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx] * dequant_up[(pu >> 4) as usize];
+                                }
+                            }
+                            (gate, up)
+                        };
+
+                        out_row[row * 2] += gate;
+                        out_row[row * 2 + 1] += up;
+                    }
+                    continue;
+                }
 
                 if route_count >= Self::GEMM_MIN_ROUTES {
                     let result = Self::gemm_routes(
