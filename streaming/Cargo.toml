@@ -6,7 +6,6 @@ rust-version = "1.94"
 publish = false
 description = "Low-overhead OpenAI-compatible SSE streaming client for mistral.rs"
 
-[workspace]
 
 [dependencies]
 bytes = "1.10"

@@ -275,8 +275,7 @@ impl StreamingClient {
     pub async fn stream(
         &self,
         mut request: ChatRequest,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         self.stream_with_options(&mut request, None, None).await
     }
 
@@ -284,8 +283,7 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         cancellation: tokio_util::sync::CancellationToken,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         self.stream_with_options(&mut request, Some(cancellation), None)
             .await
     }
@@ -294,10 +292,23 @@ impl StreamingClient {
         &self,
         mut request: ChatRequest,
         last_event_id: impl AsRef<str>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         self.stream_with_options(&mut request, None, Some(last_event_id.as_ref().to_owned()))
             .await
+    }
+
+    pub async fn stream_with_resume_and_cancellation(
+        &self,
+        mut request: ChatRequest,
+        last_event_id: impl AsRef<str>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
+        self.stream_with_options(
+            &mut request,
+            Some(cancellation),
+            Some(last_event_id.as_ref().to_owned()),
+        )
+        .await
     }
 
     pub async fn stream_with_reconnect(
@@ -409,6 +420,10 @@ impl StreamingClient {
                         );
                     }
                     Some(Err(error)) => {
+                        if let Some(id) = current.last_event_id() {
+                            last_event_id = Some(id.to_owned());
+                        }
+
                         let retryable = is_retryable_stream_error(&error);
                         let resumable = last_event_id
                             .as_deref()
@@ -454,7 +469,7 @@ impl StreamingClient {
         request: ChatRequest,
         last_event_id: Option<&str>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<ChatStream<DynBody>, StreamingError> {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         let mut request = request;
         request.stream = true;
         let started = Instant::now();
@@ -496,7 +511,7 @@ impl StreamingClient {
             cancellation,
             cancelled,
             finished: false,
-            last_event_id: last_event_id.filter(|id| !id.is_empty()).map(str::to_owned),
+            last_event_id: last_event_id.map(str::to_owned),
         })
     }
 
@@ -505,8 +520,7 @@ impl StreamingClient {
         request: &mut ChatRequest,
         cancellation: Option<tokio_util::sync::CancellationToken>,
         last_event_id: Option<String>,
-    ) -> Result<ChatStream<impl Stream<Item = Result<Bytes, reqwest::Error>> + Send>, StreamingError>
-    {
+    ) -> Result<ChatStream<ChatByteStream>, StreamingError> {
         request.stream = true;
         let started = Instant::now();
 
@@ -539,7 +553,7 @@ impl StreamingClient {
         let cancelled = Box::pin(cancellation.clone().cancelled_owned());
 
         Ok(ChatStream {
-            body: Some(response.bytes_stream()),
+            body: Some(Box::pin(response.bytes_stream())),
             parser: SseParser::new(),
             stats: StreamStats {
                 started: Some(started),
@@ -553,7 +567,7 @@ impl StreamingClient {
     }
 }
 
-type DynBody = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+pub type ChatByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 fn is_retryable_stream_error(error: &StreamingError) -> bool {
     match error {
@@ -615,7 +629,7 @@ where
         loop {
             if let Some(result) = this.parser.next_event() {
                 if let Some(id) = this.parser.last_event_id() {
-                    this.last_event_id = (!id.is_empty()).then_some(id.to_owned());
+                    this.last_event_id = Some(id.to_owned());
                 }
 
                 match result {
@@ -739,6 +753,12 @@ impl SseParser {
     pub fn next_event(&mut self) -> Option<Result<StreamEvent, StreamingError>> {
         loop {
             let (frame_len, separator_len) = find_boundary(&self.buffer, &mut self.scan_pos)?;
+            if frame_len > MAX_EVENT_BYTES {
+                self.buffer.advance(frame_len + separator_len);
+                self.scan_pos = 0;
+                return Some(Err(StreamingError::EventTooLarge));
+            }
+
             let frame = self.buffer.split_to(frame_len);
             self.buffer.advance(separator_len);
             self.scan_pos = 0;
@@ -1107,6 +1127,18 @@ data: {"id":"x","choices":[]}
     }
 
     #[test]
+    fn rejects_oversized_complete_event() {
+        let mut p = parser();
+        let mut data = vec![b'x'; MAX_EVENT_BYTES + 1];
+        data.extend_from_slice(b"\n\n");
+        p.push(&data).unwrap();
+        assert!(matches!(
+            p.next_event(),
+            Some(Err(StreamingError::EventTooLarge))
+        ));
+    }
+
+    #[test]
     fn rejects_oversized_incomplete_event() {
         let mut p = parser();
         let data = vec![b'x'; MAX_EVENT_BYTES];
@@ -1124,6 +1156,38 @@ data: {"id":"x","choices":[]}
             }
         }
         assert!(p.next_event().is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_stream_preserves_empty_event_id_as_cursor_reset() {
+        let body = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(
+                b"id: one\ndata: {\"id\":\"x\",\"choices\":[]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"id:\ndata: [DONE]\n\n")),
+        ]);
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancelled = Box::pin(cancellation.clone().cancelled_owned());
+
+        let mut stream = ChatStream {
+            body: Some(body),
+            parser: SseParser::new(),
+            stats: StreamStats::default(),
+            cancellation,
+            cancelled,
+            finished: false,
+            last_event_id: None,
+        };
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamEvent::Chunk(_)))
+        ));
+        assert_eq!(stream.last_event_id(), Some("one"));
+
+        assert!(matches!(stream.next().await, Some(Ok(StreamEvent::Done))));
+        assert_eq!(stream.last_event_id(), Some(""));
     }
 
     #[tokio::test]
@@ -1166,10 +1230,7 @@ data: {"id":"x","choices":[]}
         impl Stream for DropProbe {
             type Item = Result<Bytes, reqwest::Error>;
 
-            fn poll_next(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-            ) -> Poll<Option<Self::Item>> {
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
                 Poll::Pending
             }
         }
@@ -1190,7 +1251,10 @@ data: {"id":"x","choices":[]}
         };
 
         stream.cancel();
-        assert!(matches!(stream.next().await, Some(Err(StreamingError::Cancelled))));
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(StreamingError::Cancelled))
+        ));
         assert!(dropped.load(Ordering::SeqCst));
         assert!(stream.next().await.is_none());
     }

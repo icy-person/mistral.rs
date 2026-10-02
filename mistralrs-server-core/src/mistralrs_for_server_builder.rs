@@ -303,6 +303,9 @@ pub struct MistralRsForServerBuilder {
     code_exec_config: Option<mistralrs_core::CodeExecutionConfig>,
     /// Shell execution configuration
     shell_config: Option<mistralrs_core::ShellConfig>,
+
+    /// Keep supported MoE expert banks file-backed and load only routed experts.
+    moe_streaming: bool,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -350,6 +353,7 @@ impl Default for MistralRsForServerBuilder {
             disable_eos_stop: false,
             code_exec_config: None,
             shell_config: None,
+            moe_streaming: false,
         }
     }
 }
@@ -719,6 +723,12 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Enables BigMoe-style routed-expert streaming for supported GGUF MoE models.
+    pub fn with_moe_streaming(mut self, enabled: bool) -> Self {
+        self.moe_streaming = enabled;
+        self
+    }
+
     /// Sets whether to force CPU-only execution.
     pub fn with_cpu(mut self, cpu: bool) -> Self {
         self.cpu = cpu;
@@ -831,7 +841,11 @@ impl MistralRsForServerBuilder {
             init_device(self.cpu, self.seed)?
         };
 
-        let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params);
+        let mapper = init_mapper(
+            &self.num_device_layers,
+            &auto_device_map_params,
+            self.cpu || device.is_cpu(),
+        );
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
 
         let cache_config = reserve_external_mtp_memory_with_runtime(
@@ -862,6 +876,7 @@ impl MistralRsForServerBuilder {
 
         // Configure this last to prevent arg moves
         let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+            .with_moe_streaming(self.moe_streaming)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(self.chat_template)
             .with_jinja_explicit(self.jinja_explicit)
@@ -928,6 +943,7 @@ impl MistralRsForServerBuilder {
             hf_config_overrides: hf_config_overrides_for_config,
             mtp_config: self.mtp_config.clone(),
             encoder_cache_memory_bytes: self.encoder_cache_memory_bytes,
+            moe_streaming: self.moe_streaming,
         };
 
         let mut builder = MistralRsBuilder::new(
@@ -1010,6 +1026,7 @@ impl MistralRsForServerBuilder {
             .map(NonZeroUsize::get)
             .or(self.encoder_cache_memory_bytes);
         let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+            .with_moe_streaming(self.moe_streaming)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(first_chat_template.clone())
             .with_jinja_explicit(first_jinja_explicit.clone())
@@ -1027,6 +1044,7 @@ impl MistralRsForServerBuilder {
                 .clone()
                 .or(self.num_device_layers.clone()),
             &auto_device_map_params,
+            self.cpu || device.is_cpu(),
         );
         let mapper_for_config = mapper.clone();
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
@@ -1144,6 +1162,7 @@ impl MistralRsForServerBuilder {
             hf_config_overrides: first_hf_config_overrides,
             mtp_config: self.mtp_config.clone(),
             encoder_cache_memory_bytes: first_encoder_cache_memory_bytes,
+            moe_streaming: self.moe_streaming,
         };
 
         // Create the first MistralRs instance with the first model
@@ -1211,6 +1230,7 @@ impl MistralRsForServerBuilder {
                 .or(self.hf_config_overrides.clone());
 
             let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+                .with_moe_streaming(self.moe_streaming)
                 .with_no_kv_cache(self.no_kv_cache)
                 .with_chat_template(chat_template.clone())
                 .with_jinja_explicit(jinja_explicit.clone())
@@ -1230,6 +1250,7 @@ impl MistralRsForServerBuilder {
                     .clone()
                     .or(self.num_device_layers.clone()),
                 &auto_device_map_params,
+                self.cpu || device.is_cpu(),
             );
             let mapper_for_config = mapper.clone();
 
@@ -1309,6 +1330,7 @@ impl MistralRsForServerBuilder {
                     .encoder_cache_memory_bytes
                     .map(NonZeroUsize::get)
                     .or(self.encoder_cache_memory_bytes),
+                moe_streaming: self.moe_streaming,
             };
             let mut add_model_config = mistralrs_core::AddModelConfig::new(engine_config)
                 .with_loader_config(loader_config);
@@ -1412,7 +1434,21 @@ fn init_device(force_cpu: bool, seed: Option<u64>) -> Result<candle_core::Device
 fn init_mapper(
     num_device_layers: &Option<Vec<String>>,
     auto_device_map_params: &AutoDeviceMapParams,
+    force_cpu: bool,
 ) -> DeviceMapSetting {
+    // A CPU-backed run has exactly one physical execution device. Avoid the
+    // automatic layer mapper here: it cannot improve placement and its
+    // available-memory check would reject models that intentionally rely on
+    // host virtual memory (for example a large GGUF with swap/zram).
+    if force_cpu && num_device_layers.is_none() {
+        return DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(vec![
+            DeviceLayerMapMetadata {
+                ordinal: 0,
+                layers: 0,
+            },
+        ]));
+    }
+
     // Parse device mapper
     if let Some(device_layers) = num_device_layers {
         if device_layers.len() == 1 && device_layers[0].parse::<usize>().is_ok() {

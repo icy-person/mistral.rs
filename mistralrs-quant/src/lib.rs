@@ -74,6 +74,16 @@ pub trait QuantizedWeightSource: Send + Sync {
         shard: Shard,
     ) -> Result<Option<Arc<dyn QuantMethod>>>;
 
+    /// Load a lazily file-backed MoE projection, when the source supports it.
+    fn load_moe_streaming_linear(
+        &self,
+        _key: &str,
+        _device: &Device,
+        _shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        Ok(None)
+    }
+
     fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>>;
 
     fn shard_alignment(&self, key: &str) -> Result<usize>;
@@ -108,6 +118,15 @@ impl<T: QuantizedWeightSource + ?Sized> QuantizedWeightSource for Arc<T> {
         shard: Shard,
     ) -> Result<Option<Arc<dyn QuantMethod>>> {
         (**self).load_linear(key, device, shard)
+    }
+
+    fn load_moe_streaming_linear(
+        &self,
+        key: &str,
+        device: &Device,
+        shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        (**self).load_moe_streaming_linear(key, device, shard)
     }
 
     fn load_optional_tensor(&self, name: &str, device: &Device) -> Result<Option<Tensor>> {

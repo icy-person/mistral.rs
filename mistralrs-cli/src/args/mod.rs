@@ -111,9 +111,72 @@ pub enum Command {
         #[arg(long, requires = "input")]
         audio: Vec<String>,
 
+        /// Enable BigMoe-style routed-expert streaming for supported GGUF MoE models.
+        /// This keeps GPT-OSS MXFP4 expert banks file-backed and loads only routed experts.
+        /// Requires CPU execution.
+        #[arg(long)]
+        moe_stream: bool,
+
         /// LoRA adapter alias to use for requests. Omit to run the base model.
         #[arg(long)]
         adapter: Option<String>,
+    },
+
+    /// Stream chat completions from an OpenAI-compatible HTTP endpoint.
+    ///
+    /// This exercises the optimized mistralrs-streaming SSE client directly.
+    Stream {
+        /// OpenAI-compatible base URL, e.g. http://127.0.0.1:1234/v1
+        #[arg(long, default_value = "http://127.0.0.1:1234/v1")]
+        base_url: String,
+
+        /// Model id exposed by the HTTP server
+        #[arg(short = 'm', long, default_value = "default")]
+        model: String,
+
+        /// One-shot text prompt
+        #[arg(short = 'i', long)]
+        input: String,
+
+        /// Maximum generated tokens
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+
+        /// Sampling temperature
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Nucleus sampling probability
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Connect timeout in milliseconds
+        #[arg(long, default_value_t = 10_000)]
+        connect_timeout_ms: u64,
+
+        /// Optional whole-request timeout in milliseconds
+        #[arg(long)]
+        request_timeout_ms: Option<u64>,
+
+        /// Reconnect after retryable stream failures. Requires a server-emitted SSE event id.
+        #[arg(long, default_value_t = 0)]
+        reconnect: u32,
+
+        /// Initial reconnect backoff in milliseconds
+        #[arg(long, default_value_t = 250)]
+        reconnect_backoff_ms: u64,
+
+        /// Maximum reconnect backoff in milliseconds
+        #[arg(long, default_value_t = 4_000)]
+        reconnect_max_backoff_ms: u64,
+
+        /// Start from this SSE event id. Useful for explicit resume testing.
+        #[arg(long)]
+        resume_id: Option<String>,
+
+        /// Do not print final streaming statistics
+        #[arg(long)]
+        no_stats: bool,
     },
 
     /// Generate shell completions
@@ -1381,6 +1444,62 @@ mod tests {
     #[test]
     fn rejects_zero_max_model_len() {
         assert!(resolve_run(&["-m", "org/model", "--max-model-len", "0"]).is_err());
+    }
+
+    #[test]
+    fn stream_command_parses_streaming_controls() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "stream",
+            "-m",
+            "gpt-oss-20b",
+            "-i",
+            "hello",
+            "--max-tokens",
+            "256",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+            "--reconnect",
+            "5",
+            "--reconnect-backoff-ms",
+            "100",
+            "--reconnect-max-backoff-ms",
+            "2000",
+            "--resume-id",
+            "event-7",
+            "--no-stats",
+        ])
+        .unwrap();
+
+        let Command::Stream {
+            model,
+            input,
+            max_tokens,
+            temperature,
+            top_p,
+            reconnect,
+            reconnect_backoff_ms,
+            reconnect_max_backoff_ms,
+            resume_id,
+            no_stats,
+            ..
+        } = cli.command
+        else {
+            panic!("expected stream command");
+        };
+
+        assert_eq!(model, "gpt-oss-20b");
+        assert_eq!(input, "hello");
+        assert_eq!(max_tokens, 256);
+        assert_eq!(temperature, Some(0.2));
+        assert_eq!(top_p, Some(0.9));
+        assert_eq!(reconnect, 5);
+        assert_eq!(reconnect_backoff_ms, 100);
+        assert_eq!(reconnect_max_backoff_ms, 2000);
+        assert_eq!(resume_id.as_deref(), Some("event-7"));
+        assert!(no_stats);
     }
 
     #[test]

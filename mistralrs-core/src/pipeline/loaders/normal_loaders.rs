@@ -5611,6 +5611,25 @@ impl DeviceMappedModelLoader for GptOssLoader {
     ) -> Result<Vec<usize>> {
         let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
 
+        let (expert_weight_elems, expert_weight_bytes) = if matches!(
+            cfg.quantization_config.as_ref(),
+            Some(mistralrs_quant::QuantizedConfig::MXFP4 {})
+        ) {
+            // Native GPT-OSS MXFP4 experts are already counted in packed
+            // resident bytes: 16 data bytes + 1 E8M0 scale byte per
+            // 32 FP4 weights.
+            let gate_up = cfg.num_local_experts * cfg.intermediate_size * 2 * cfg.hidden_size;
+            let down = cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size;
+            (
+                0,
+                gate_up / 2 + down / 2 + gate_up / 32 + down / 32,
+            )
+        } else {
+            let projection = cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size
+                / weight_pack_factor;
+            (projection * 3, 0)
+        };
+
         let per_layer_elems = {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
@@ -5627,19 +5646,6 @@ impl DeviceMappedModelLoader for GptOssLoader {
                 size_in * size_kv / weight_pack_factor + bias_if!(cfg.attention_bias, size_kv);
             let o_proj =
                 size_q * size_in / weight_pack_factor + bias_if!(cfg.attention_bias, size_in);
-
-            let expert_weights = if matches!(
-                cfg.quantization_config.as_ref(),
-                Some(mistralrs_quant::QuantizedConfig::MXFP4 {})
-            ) {
-                let gate_up = cfg.num_local_experts * cfg.intermediate_size * 2 * cfg.hidden_size;
-                let down = cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size;
-                gate_up / 2 + down / 2 + gate_up / 32 + down / 32
-            } else {
-                let projection = cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size
-                    / weight_pack_factor;
-                projection * 3
-            };
             let gate_up_bias = cfg.num_local_experts * cfg.intermediate_size * 2;
             let down_bias = cfg.num_local_experts * cfg.hidden_size;
             let router = cfg.hidden_size * cfg.num_local_experts + cfg.num_local_experts;
@@ -5651,14 +5657,16 @@ impl DeviceMappedModelLoader for GptOssLoader {
                 + k_proj
                 + v_proj
                 + o_proj
-                + expert_weights
+                + expert_weight_elems
                 + gate_up_bias
                 + down_bias
                 + router
                 + sinks
         };
+        let per_layer_bytes =
+            per_layer_elems * dtype.size_in_bytes() + expert_weight_bytes;
         Ok(vec![
-            per_layer_elems * dtype.size_in_bytes();
+            per_layer_bytes;
             cfg.num_hidden_layers
         ])
     }

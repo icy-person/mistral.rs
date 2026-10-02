@@ -20,7 +20,7 @@ use clap_complete::generate;
 use args::{resolve_model_type, resolve_quantize_model_type, CacheCommand, Cli, Command};
 use commands::{
     run_bench, run_cache_delete, run_cache_list, run_doctor, run_from_config, run_interactive,
-    run_login, run_quantize, run_server, run_tune, run_uninstall, run_update, run_uqff,
+    run_login, run_quantize, run_server, run_stream, run_tune, run_uninstall, run_update, run_uqff,
     BenchRunConfig,
 };
 use mistralrs_core::{initialize_mistralrs_logging, LogVerbosity};
@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
             video,
             audio,
             adapter,
+            moe_stream,
         } => {
             let model_type = resolve_model_type(model_type, default_model)?;
             run_interactive(
@@ -85,6 +86,41 @@ async fn main() -> Result<()> {
                 video,
                 audio,
                 adapter,
+                moe_stream,
+            )
+            .await?;
+        }
+
+        Command::Stream {
+            base_url,
+            model,
+            input,
+            max_tokens,
+            temperature,
+            top_p,
+            connect_timeout_ms,
+            request_timeout_ms,
+            reconnect,
+            reconnect_backoff_ms,
+            reconnect_max_backoff_ms,
+            resume_id,
+            no_stats,
+        } => {
+            run_stream(
+                base_url,
+                model,
+                input,
+                max_tokens,
+                temperature,
+                top_p,
+                connect_timeout_ms,
+                request_timeout_ms,
+                reconnect,
+                reconnect_backoff_ms,
+                reconnect_max_backoff_ms,
+                resume_id,
+                no_stats,
+                cli.global,
             )
             .await?;
         }

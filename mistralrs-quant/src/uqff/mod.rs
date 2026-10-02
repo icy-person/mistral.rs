@@ -346,6 +346,7 @@ pub struct ShardedVarBuilder {
     lora_registry: Option<Arc<crate::LoraLayerRegistry>>,
     raw_safetensors: Option<Arc<crate::safetensors::MmapedSafetensors>>,
     raw_gguf: Option<Arc<crate::GgufArchive>>,
+    moe_streaming: bool,
 }
 
 impl ShardedVarBuilder {
@@ -358,6 +359,7 @@ impl ShardedVarBuilder {
             lora_registry: None,
             raw_safetensors: None,
             raw_gguf: None,
+            moe_streaming: false,
         }
     }
 
@@ -416,6 +418,7 @@ impl ShardedVarBuilder {
             lora_registry: self.lora_registry.clone(),
             raw_safetensors: self.raw_safetensors.clone(),
             raw_gguf: self.raw_gguf.clone(),
+            moe_streaming: self.moe_streaming,
         }
     }
 
@@ -524,6 +527,16 @@ impl ShardedVarBuilder {
 
     pub fn weight_source(&self) -> Option<&Arc<dyn QuantizedWeightSource>> {
         self.weight_source.as_ref()
+    }
+
+    /// Enable BigMoe-style routed expert streaming for supported GGUF MoE weights.
+    pub fn with_moe_streaming(mut self, enabled: bool) -> Self {
+        self.moe_streaming = enabled;
+        self
+    }
+
+    pub fn moe_streaming(&self) -> bool {
+        self.moe_streaming
     }
 
     pub fn with_uqff_reader(self, reader: Arc<UqffReader>) -> Self {

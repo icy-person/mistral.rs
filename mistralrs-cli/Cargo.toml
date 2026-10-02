@@ -24,12 +24,14 @@ mistralrs-core = { workspace = true }
 mistralrs-server-core = { workspace = true }
 mistralrs = { workspace = true }
 mistralrs-sandbox = { workspace = true }
+mistralrs-streaming = { path = "../streaming" }
 mistralrs-quant = { workspace = true }
 candle-core = { workspace = true }
 
 clap = { workspace = true }
 clap_complete = "4.5"
 tokio = { workspace = true }
+tokio-util = "0.7.18"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

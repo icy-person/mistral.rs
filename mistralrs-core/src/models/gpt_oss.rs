@@ -383,6 +383,29 @@ fn load_gpt_oss_packed_expert_projection(
     vb: ShardedVarBuilder,
 ) -> Result<Arc<dyn QuantMethod>> {
     let projection_vb = vb.pp(name);
+    if projection_vb.moe_streaming() {
+        if get_immediate_isq().is_some_and(|params| params.capture == IsqCaptureMode::Immediate) {
+            candle_core::bail!(
+                "GPT-OSS MXFP4 expert streaming cannot be combined with immediate ISQ;                  disable --isq when using --moe-stream"
+            );
+        }
+
+        if let Some(source) = vb.weight_source() {
+            let load_device = mistralrs_quant::weight_source_load_device(&projection_vb);
+            if let Some(layer) = source.load_moe_streaming_linear(
+                &projection_vb.prefix(),
+                &load_device,
+                Shard::default(),
+            )? {
+                return Ok(layer);
+            }
+        }
+
+        candle_core::bail!(
+            "GPT-OSS --moe-stream was requested but the GGUF does not expose              native MXFP4 expert tensors"
+        );
+    }
+
     if get_immediate_isq().is_some_and(|params| params.capture == IsqCaptureMode::Immediate) {
         if let Some(target) = immediate_isq_match(&projection_vb).and_then(|matched| matched.ty) {
             if !MXFP4Layer::supports_stacked_isq(target) {
