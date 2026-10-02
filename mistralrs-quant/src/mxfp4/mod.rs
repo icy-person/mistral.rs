@@ -1237,8 +1237,6 @@ impl MxFp4StreamingExpertLayer {
         let mut route_x_offsets = Vec::with_capacity(topk.max(1));
         let mut activation_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
-        let mut gate_values = Vec::new();
-        let mut up_values = Vec::new();
         let kernel = Self::dot_kernel();
         let moe_threads = Self::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
@@ -1314,125 +1312,91 @@ impl MxFp4StreamingExpertLayer {
             let down_raw = down_data.as_ref();
             let gate_bias_ref = gate_bias;
 
-            if gate_values.len() < activation_len {
-                gate_values.resize(activation_len, 0.0);
-                up_values.resize(activation_len, 0.0);
-            }
-            gate_values[..activation_len].fill(0.0);
-            up_values[..activation_len].fill(0.0);
-
+            // Full graph fusion: gate/up dot -> clamp -> SwiGLU directly into
+            // activation scratch. No persistent gate_values/up_values tensors.
             Self::moe_thread_pool().install(|| {
-                gate_values[..activation_len]
-                    .par_iter_mut()
-                    .zip(up_values[..activation_len].par_iter_mut())
+                activations[..activation_len]
+                    .par_chunks_mut(8)
                     .enumerate()
-                    .for_each(|(flat_idx, (gate_dst, up_dst))| {
-                        let route_idx = flat_idx / down.in_dim;
-                        let row = flat_idx % down.in_dim;
-                        let x_offset = route_x_offsets[route_idx];
-                        let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
+                    .for_each(|(chunk_idx, out_chunk)| {
+                        let base_flat = chunk_idx * 8;
+                        let mut gates = [0.0f32; 8];
+                        let mut ups = [0.0f32; 8];
 
-                        let (gate_value, up_value) = if kernel >= 2 {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
-                                    x_row,
-                                    gate_raw,
-                                    row * 2,
-                                    row * 2 + 1,
-                                    gate_up.in_dim,
-                                )
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                unreachable!()
-                            }
-                        } else {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
-                                    x_row,
-                                    gate_raw,
-                                    row * 2,
-                                    row * 2 + 1,
-                                    gate_up.in_dim,
-                                )
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                unreachable!()
-                            }
-                        };
+                        for lane in 0..out_chunk.len() {
+                            let flat_idx = base_flat + lane;
+                            let route_idx = flat_idx / down.in_dim;
+                            let row = flat_idx % down.in_dim;
+                            let x_offset = route_x_offsets[route_idx];
+                            let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
 
-                        *gate_dst = gate_bias_ref
-                            .map(|bias| gate_value + bias[expert_idx * gate_up.out_dim + row * 2])
-                            .unwrap_or(gate_value)
-                            .min(limit);
-                        *up_dst = gate_bias_ref
-                            .map(|bias| up_value + bias[expert_idx * gate_up.out_dim + row * 2 + 1])
-                            .unwrap_or(up_value)
-                            .clamp(-limit, limit);
-                    });
-            });
-
-            if Self::approx_swiglu_enabled() {
-                #[cfg(target_arch = "x86_64")]
-                Self::moe_thread_pool().install(|| {
-                    gate_values[..activation_len]
-                        .par_chunks(8)
-                        .zip(up_values[..activation_len].par_chunks(8))
-                        .zip(activations[..activation_len].par_chunks_mut(8))
-                        .for_each(|((gate_chunk, up_chunk), out_chunk)| {
-                            if gate_chunk.len() == 8 {
+                            let (gate_value, up_value) = if kernel >= 2 {
+                                #[cfg(target_arch = "x86_64")]
                                 unsafe {
-                                    let g = _mm256_loadu_ps(gate_chunk.as_ptr());
-                                    let u = _mm256_loadu_ps(up_chunk.as_ptr());
-                                    let y = Self::swiglu8_avx2(g, u, alpha);
-                                    _mm256_storeu_ps(out_chunk.as_mut_ptr(), y);
+                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
+                                        x_row,
+                                        gate_raw,
+                                        row * 2,
+                                        row * 2 + 1,
+                                        gate_up.in_dim,
+                                    )
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    unreachable!()
                                 }
                             } else {
-                                for i in 0..gate_chunk.len() {
-                                    out_chunk[i] = (up_chunk[i] + 1.0)
-                                        * gate_chunk[i]
-                                        / (1.0 + (-gate_chunk[i] * alpha).exp());
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
+                                        x_row,
+                                        gate_raw,
+                                        row * 2,
+                                        row * 2 + 1,
+                                        gate_up.in_dim,
+                                    )
                                 }
-                            }
-                        });
-                });
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    activations[..activation_len]
-                        .par_iter_mut()
-                        .zip(gate_values[..activation_len].par_iter())
-                        .zip(up_values[..activation_len].par_iter())
-                        .for_each(|((dst, gate), up)| {
-                            *dst = (up + 1.0) * gate
-                                / (1.0 + (-gate * alpha).exp());
-                        });
-                }
-            } else {
-                activations[..activation_len]
-                    .par_iter_mut()
-                    .zip(gate_values[..activation_len].par_iter())
-                    .zip(up_values[..activation_len].par_iter())
-                    .for_each(|((dst, gate), up)| {
-                        *dst = (up + 1.0) * gate
-                            / (1.0 + (-gate * alpha).exp());
-                    });
-            }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                {
+                                    unreachable!()
+                                }
+                            };
 
-            // Apply the top-k weight once to the intermediate vector instead of
-            // multiplying every final hidden output element.
-            let routes_ref = routes;
-            activations[..activation_len]
-                .par_chunks_mut(down.in_dim)
-                .enumerate()
-                .for_each(|(route_idx, activation)| {
-                    let weight = route_weights[routes_ref[route_idx]];
-                    for value in activation {
-                        *value *= weight;
-                    }
-                });
+                            gates[lane] = gate_bias_ref
+                                .map(|bias| {
+                                    gate_value
+                                        + bias[expert_idx * gate_up.out_dim + row * 2]
+                                })
+                                .unwrap_or(gate_value)
+                                .min(limit);
+                            ups[lane] = gate_bias_ref
+                                .map(|bias| {
+                                    up_value
+                                        + bias[expert_idx * gate_up.out_dim + row * 2 + 1]
+                                })
+                                .unwrap_or(up_value)
+                                .clamp(-limit, limit);
+                        }
+
+                        if Self::approx_swiglu_enabled() && out_chunk.len() == 8 {
+                            #[cfg(target_arch = "x86_64")]
+                            unsafe {
+                                let g = _mm256_loadu_ps(gates.as_ptr());
+                                let u = _mm256_loadu_ps(ups.as_ptr());
+                                let y = Self::swiglu8_avx2(g, u, alpha);
+                                _mm256_storeu_ps(out_chunk.as_mut_ptr(), y);
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            unreachable!();
+                        } else {
+                            for lane in 0..out_chunk.len() {
+                                out_chunk[lane] = (ups[lane] + 1.0)
+                                    * gates[lane]
+                                    / (1.0 + (-gates[lane] * alpha).exp());
+                            }
+                        }
+                    });
+            });
 
             let activation_offsets = &activation_offsets[..route_count];
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
