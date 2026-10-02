@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -126,7 +126,7 @@ fn available_memory_bytes() -> usize {
     0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MxFp4StreamKey {
     pub source: String,
     pub expert_index: usize,
@@ -176,6 +176,7 @@ struct Stats {
     report_calls: AtomicU64,
 }
 
+#[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
     queue: SyncSender<ReadJob>,
@@ -284,7 +285,7 @@ impl MxFp4StreamCache {
                 CacheEntry {
                     data,
                     bytes: len,
-                    last_used: guard.clock,
+                    last_used: now,
                 },
             );
         }
