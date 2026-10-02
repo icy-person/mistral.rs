@@ -45,7 +45,7 @@ pub async fn run_interactive(
 
     let request_adapter = normalize_requested_adapter(&model_type, request_adapter.as_deref())?;
 
-    if moe_stream {
+    if runtime.moe_stream {
         runtime.max_seqs = 1;
     }
     agent_options.apply_to(&mut runtime);
@@ -86,7 +86,7 @@ pub async fn run_interactive(
         .with_prefix_cache_n(runtime.prefix_cache_n)
         .set_paged_attn(paged_attn)
         .with_cpu(cpu)
-        .with_moe_streaming(moe_stream)
+        .with_moe_streaming(runtime.moe_stream)
         .with_enable_search(runtime.enable_search)
         .with_seed_optional(global.seed)
         .with_log_optional(global.log.as_ref().map(|p| p.to_string_lossy().to_string()))
