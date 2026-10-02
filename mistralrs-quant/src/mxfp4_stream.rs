@@ -451,7 +451,7 @@ impl MxFp4StreamCache {
         &self,
         key: &MxFp4StreamKey,
         range: MxFp4StreamRange,
-    ) -> crate::Result<Arc<Vec<u8>>> {
+    ) -> crate::Result<Arc<MxFp4StreamData>> {
         if let Some(data) = self.lookup(key) {
             return Ok(data);
         }
@@ -499,7 +499,6 @@ impl MxFp4StreamCache {
                     .map_err(candle_core::Error::wrap)?;
                 self.stats.reads.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-                let data = Arc::new(data);
                 self.insert(key.clone(), data.clone());
                 Ok(data)
             }
