@@ -1,6 +1,18 @@
 use candle_core::{Result, Tensor};
 
 use super::NormalCache;
+use std::sync::OnceLock;
+
+fn cache_growth_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("MISTRALRS_KV_GROW_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value >= 64)
+            .unwrap_or(2048)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct SingleCacheSnapshot {
@@ -113,8 +125,9 @@ impl SingleCache {
         // Expand kv cache
         if self.current_seq_len + seq_len > self.capacity_seq_len {
             let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
-            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
-            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
+            let growth = cache_growth_size();
+            let n_blocks_needed = diff.div_ceil(growth);
+            self.capacity_seq_len += n_blocks_needed * growth;
             if self.capacity_seq_len > self.max_seq_len {
                 candle_core::bail!(
                     "kv-cache: requested capacity ({}) above max seq len ({})",
