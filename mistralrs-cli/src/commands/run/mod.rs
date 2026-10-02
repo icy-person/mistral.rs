@@ -38,7 +38,6 @@ pub async fn run_interactive(
     videos: Vec<String>,
     audios: Vec<String>,
     request_adapter: Option<String>,
-    moe_stream: bool,
 ) -> Result<()> {
     initialize_logging();
     resolve_reasoning_controls(thinking, reasoning_effort)?;
