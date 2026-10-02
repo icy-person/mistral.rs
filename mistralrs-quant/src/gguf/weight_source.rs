@@ -832,7 +832,20 @@ impl QuantizedWeightSource for GgufWeightSource {
             component_out_dim
         };
 
-        let bias = self.load_bias(key, &Device::Cpu, None, 3)?;
+        // GPT-OSS binds its native MXFP4 expert biases under projection-specific names
+        // (gate_up_proj_bias / down_proj_bias) because there is no native .bias tensor
+        // for the synthesized canonical projection.
+        let bias_key = match projection {
+            "gate_up_proj" => format!("model.layers.{layer}.mlp.experts.gate_up_proj_bias"),
+            "down_proj" => format!("model.layers.{layer}.mlp.experts.down_proj_bias"),
+            _ => unreachable!("projection was validated above"),
+        };
+        let bias = if self.bindings.contains_key(&bias_key) {
+            Some(self.materialize_tensor(&bias_key, &Device::Cpu)?)
+        } else {
+            None
+        };
+
         let layer = MxFp4StreamingExpertLayer::from_gguf(
             self.archive.clone(),
             raw_names,
