@@ -566,6 +566,29 @@ impl GptOssMoE {
             .transpose()?
             .flatten();
         let routed_input = xs_flat.unsqueeze(1)?;
+        // Native streamed MXFP4 fast path: fuse gate/up -> SwiGLU -> down ->
+        // top-k weighted combine without materializing intermediate tensors.
+        if expert_lora.is_none() {
+            if let GptOssExpertProjections::Interleaved { gate_up, down } = &self.projections {
+                if let (Some(gate_up_stream), Some(down_stream)) =
+                    (gate_up.as_mxfp4_streaming(), down.as_mxfp4_streaming())
+                {
+                    gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
+                    down.process_routed_stats(&xs_flat, &topk_ids)?;
+                    return mistralrs_quant::fused_gptoss_mlp(
+                        gate_up_stream,
+                        down_stream,
+                        &xs_flat,
+                        &topk_ids,
+                        &topk_weights,
+                        self.alpha,
+                        self.limit,
+                    )?
+                    .reshape((b_size, seq_len, hidden_dim));
+                }
+            }
+        }
+
 
         let activated = match &self.projections {
             GptOssExpertProjections::Interleaved { gate_up, .. } => {
