@@ -517,6 +517,19 @@ mod tests {
     }
 
     #[test]
+    fn cache_keys_include_tensor_source() {
+        let gate_l0 = MxFp4StreamKey {
+            source: "blk.0.ffn_gate_exps.weight".to_string(),
+            expert_index: 0,
+        };
+        let gate_l1 = MxFp4StreamKey {
+            source: "blk.1.ffn_gate_exps.weight".to_string(),
+            expert_index: 0,
+        };
+        assert_ne!(gate_l0, gate_l1);
+    }
+
+    #[test]
     fn explicit_cache_budget_is_capped() {
         let cfg = MxFp4StreamConfig {
             cache_mb: Some(4096),
