@@ -368,7 +368,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 )
                             })?;
                             let data = self.cache.resolve(&key, handle)?;
-                            expert_data.insert(key, data);
+                            expert_data.insert(key.clone(), data);
                         }
                     }
                     let expert = expert_data.get(&key).ok_or_else(|| {
@@ -412,7 +412,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                             )
                         })?;
                         let data = self.cache.resolve(&key, handle)?;
-                        expert_data.insert(key, data);
+                        expert_data.insert(key.clone(), data);
                     }
                 }
                 let expert = expert_data.get(&key).ok_or_else(|| {
