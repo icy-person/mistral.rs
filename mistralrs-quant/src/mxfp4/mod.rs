@@ -347,7 +347,7 @@ impl MxFp4StreamingExpertLayer {
         0
     }
 
-    const GEMM_MIN_ROUTES: usize = 4;
+    const GEMM_MIN_ROUTES: usize = 8;
 
     fn decode_expert_f32(
         raw_expert: &[u8],
@@ -971,21 +971,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         }
                         continue;
                     }
-
-                if route_count >= Self::GEMM_MIN_ROUTES {
-                    let result =
-                        Self::gemm_routes(&x_data, &route_x_offsets, expert, self.component_out_dim, self.in_dim)?;
-                    for (route_idx, &route_row) in routes.iter().enumerate() {
-                        let out_row = &mut output
-                            [route_row * self.out_dim..(route_row + 1) * self.out_dim];
-                        let base = route_idx * self.component_out_dim;
-                        out_row[..self.component_out_dim]
-                            .iter_mut()
-                            .enumerate()
-                            .for_each(|(row, value)| *value += result[base + row]);
-                    }
-                    continue;
-                }
 
                 if route_count == 1 {
                         let route_row = routes[0];
