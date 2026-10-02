@@ -48,8 +48,11 @@ jobs:
             sleep $((i * 20))
           done
 
+      - name: Validate resolved lockfile
+        run: cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
+
       - name: Build Linux CLI
-        run: cargo build --release --offline -p mistralrs-cli
+        run: cargo build --release --locked --offline -p mistralrs-cli
 
       - name: Verify executable
         run: |
