@@ -575,7 +575,7 @@ impl GptOssMoE {
                 {
                     gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
                     down.process_routed_stats(&xs_flat, &topk_ids)?;
-                    return mistralrs_quant::fused_gptoss_mlp(
+                    if let Some(fused) = mistralrs_quant::fused_gptoss_mlp(
                         gate_up_stream,
                         down_stream,
                         &xs_flat,
@@ -583,8 +583,9 @@ impl GptOssMoE {
                         &topk_weights,
                         self.alpha,
                         self.limit,
-                    )?
-                    .reshape((b_size, seq_len, hidden_dim));
+                    )? {
+                        return Ok(fused.reshape((b_size, seq_len, hidden_dim))?);
+                    }
                 }
             }
         }
