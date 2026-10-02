@@ -1,5 +1,5 @@
 use std::{
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{atomic::AtomicUsize, Arc, OnceLock},
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -233,6 +233,31 @@ impl MxFp4StreamingExpertLayer {
             })?)
             .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
         Ok(MxFp4StreamRange { offset, ..base })
+    }
+
+    fn moe_thread_pool() -> &'static rayon::ThreadPool {
+        static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let default_threads = candle_core::utils::get_num_threads().max(1);
+            let threads = std::env::var("MISTRALRS_MOE_THREADS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value > 0)
+                .unwrap_or(default_threads);
+            let affinity = std::env::var("MISTRALRS_MOE_AFFINITY")
+                .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+                .unwrap_or(true);
+
+            let mut builder = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|idx| format!("mistralrs-moe-{idx}"));
+            if affinity {
+                builder = builder.start_handler(|_| candle_core::utils::set_thread_affinity());
+            }
+            builder
+                .build()
+                .expect("failed to build GPT-OSS MXFP4 CPU thread pool")
+        })
     }
 
     #[inline(always)]
@@ -1093,10 +1118,11 @@ impl MxFp4StreamingExpertLayer {
             let down_raw = down_data.as_ref();
             let gate_bias_ref = gate_bias;
 
-            activations
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(flat_idx, dst)| {
+            Self::moe_thread_pool().install(|| {
+                activations
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(flat_idx, dst)| {
                     let route_idx = flat_idx / down.in_dim;
                     let row = flat_idx % down.in_dim;
                     let x_offset = route_x_offsets[route_idx];
@@ -1143,8 +1169,9 @@ impl MxFp4StreamingExpertLayer {
                         .unwrap_or(up_value)
                         .clamp(-limit, limit);
 
-                    *dst = (up + 1.0) * gate / (1.0 + (-gate * alpha).exp());
-                });
+                        *dst = (up + 1.0) * gate / (1.0 + (-gate * alpha).exp());
+                    });
+            });
 
             let activation_offsets: Vec<usize> =
                 (0..route_count).map(|route| route * down.in_dim).collect();
@@ -1161,7 +1188,8 @@ impl MxFp4StreamingExpertLayer {
                 let weights_ptr = route_weights.as_ptr();
                 let activation_offsets_ref = activation_offsets.as_slice();
                 let down_bias_ref = down_bias;
-                (0..down.out_dim).into_par_iter().for_each(|row| {
+                Self::moe_thread_pool().install(|| {
+                    (0..down.out_dim).into_par_iter().for_each(|row| {
                     let mut accs = [0.0f32; STACK_ROUTES];
                     let accs = &mut accs[..route_count];
                     if down_kernel >= 2 {
@@ -1202,6 +1230,7 @@ impl MxFp4StreamingExpertLayer {
                                 weight * (accs[route_idx] + bias);
                         }
                     }
+                    });
                 });
             } else {
                 let mut accs = vec![0.0f32; route_count];
