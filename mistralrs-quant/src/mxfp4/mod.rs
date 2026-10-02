@@ -347,8 +347,9 @@ impl MxFp4StreamingExpertLayer {
         0
     }
 
-    const GEMM_MIN_ROUTES: usize = 8;
+    const GEMM_MIN_ROUTES: usize = 16;
 
+    #[inline]
     fn decode_expert_f32(
         raw_expert: &[u8],
         out_rows: usize,
@@ -383,6 +384,7 @@ impl MxFp4StreamingExpertLayer {
         weights
     }
 
+    #[inline]
     fn gemm_routes(
         x_data: &[f32],
         route_x_offsets: &[usize],
