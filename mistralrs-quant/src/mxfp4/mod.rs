@@ -1149,9 +1149,13 @@ impl MXFP4Layer {
         ];
         let mut s = 0u32;
         while s < 256 {
-            // GGML's E8M0 conversion uses the exponent range directly:
-            // e=0 -> 2^-127, e=1 -> 2^-126, ..., e=255 -> 2^127.
-            let scale_factor = 2.0f32.powi(s as i32 - 127);
+            // GGML E8M0 uses the special encodings x=0,1 for the subnormal
+            // floor, then regular IEEE-754 exponents for x>=2.
+            let scale_factor = if s < 2 {
+                f32::from_bits(0x0020_0000u32 << s)
+            } else {
+                f32::from_bits((s - 1) << 23)
+            };
             let mut n = 0;
             while n < 16 {
                 lut[s as usize][n] = fp4[n] * scale_factor;
