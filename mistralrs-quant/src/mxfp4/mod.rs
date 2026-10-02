@@ -1103,111 +1103,81 @@ pub(crate) fn fused_gptoss_mlp(
         let gate_raw = gate_data.as_ref();
         let down_raw = down_data.as_ref();
         let gate_bias_ref = gate_bias;
-        let activation_ptr = activations.as_mut_ptr();
+        let gate_kernel = Self::dot_kernel();
 
-        for (route_idx, &route_row) in routes.iter().enumerate() {
-            let x_offset = route_row * *hidden_dim;
-            route_x_offsets.push(x_offset);
+        route_x_offsets.reserve(route_count);
+        activations.par_iter_mut().enumerate().for_each(|(flat_idx, dst)| {
+            let route_idx = flat_idx / down.in_dim;
+            let row = flat_idx % down.in_dim;
+            let x_offset = route_x_offsets[route_idx];
             let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
 
-            let row_iter: Box<dyn Iterator<Item = usize>> =
-                Box::new(0..down.in_dim);
-
-            for row in row_iter {
-                let (gate_value, up_value) = if gate_up.in_dim.is_multiple_of(MXFP4_BLOCK_SIZE) {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if std::is_x86_feature_detected!("avx2") {
-                            if std::is_x86_feature_detected!("fma") {
-                                unsafe {
-                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
-                                        x_row,
-                                        gate_raw,
-                                        row * 2,
-                                        row * 2 + 1,
-                                        gate_up.in_dim,
-                                    )
-                                }
-                            } else {
-                                unsafe {
-                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
-                                        x_row,
-                                        gate_raw,
-                                        row * 2,
-                                        row * 2 + 1,
-                                        gate_up.in_dim,
-                                    )
-                                }
-                            }
-                        } else {
-                            let row_bytes = (gate_up.in_dim / MXFP4_BLOCK_SIZE)
-                                * (MXFP4_BLOCK_SIZE / 2 + 1);
-                            let mut gate_value = 0.0f32;
-                            let mut up_value = 0.0f32;
-                            for block_idx in 0..gate_up.in_dim / MXFP4_BLOCK_SIZE {
-                                let block_start = (row * 2) * row_bytes
-                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                                let dequant = &MXFP4Layer::DEQUANT_LUT[gate_raw[block_start] as usize];
-                                let packed = &gate_raw[block_start + 1..block_start + 17];
-                                let col_start = block_idx * MXFP4_BLOCK_SIZE;
-                                for byte_idx in 0..16 {
-                                    let p = packed[byte_idx];
-                                    gate_value += x_row[col_start + byte_idx] * dequant[(p & 0x0f) as usize];
-                                    gate_value += x_row[col_start + 16 + byte_idx] * dequant[(p >> 4) as usize];
-                                }
-                                let block_start = (row * 2 + 1) * row_bytes
-                                    + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-                                let dequant = &MXFP4Layer::DEQUANT_LUT[gate_raw[block_start] as usize];
-                                let packed = &gate_raw[block_start + 1..block_start + 17];
-                                for byte_idx in 0..16 {
-                                    let p = packed[byte_idx];
-                                    up_value += x_row[col_start + byte_idx] * dequant[(p & 0x0f) as usize];
-                                    up_value += x_row[col_start + 16 + byte_idx] * dequant[(p >> 4) as usize];
-                                }
-                            }
-                            (gate_value, up_value)
-                        }
+            let (gate_value, up_value) = if gate_kernel >= 2 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
+                        x_row,
+                        gate_raw,
+                        row * 2,
+                        row * 2 + 1,
+                        gate_up.in_dim,
+                    )
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    (0.0, 0.0)
+                }
+            } else if gate_kernel == 1 {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
+                        x_row,
+                        gate_raw,
+                        row * 2,
+                        row * 2 + 1,
+                        gate_up.in_dim,
+                    )
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    (0.0, 0.0)
+                }
+            } else {
+                let row_bytes =
+                    (gate_up.in_dim / MXFP4_BLOCK_SIZE) * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let mut gate_value = 0.0f32;
+                let mut up_value = 0.0f32;
+                for block_idx in 0..gate_up.in_dim / MXFP4_BLOCK_SIZE {
+                    let base0 =
+                        (row * 2) * row_bytes + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                    let base1 =
+                        (row * 2 + 1) * row_bytes + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                    let d0 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base0] as usize];
+                    let d1 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base1] as usize];
+                    let p0 = &gate_raw[base0 + 1..base0 + 1 + MXFP4_BLOCK_SIZE / 2];
+                    let p1 = &gate_raw[base1 + 1..base1 + 1 + MXFP4_BLOCK_SIZE / 2];
+                    let cs = block_idx * MXFP4_BLOCK_SIZE;
+                    for b in 0..MXFP4_BLOCK_SIZE / 2 {
+                        gate_value += x_row[cs + b] * d0[(p0[b] & 0x0f) as usize];
+                        gate_value += x_row[cs + 16 + b] * d0[(p0[b] >> 4) as usize];
+                        up_value += x_row[cs + b] * d1[(p1[b] & 0x0f) as usize];
+                        up_value += x_row[cs + 16 + b] * d1[(p1[b] >> 4) as usize];
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        let row_bytes = (gate_up.in_dim / MXFP4_BLOCK_SIZE)
-                            * (MXFP4_BLOCK_SIZE / 2 + 1);
-                        let mut gate_value = 0.0f32;
-                        let mut up_value = 0.0f32;
-                        for block_idx in 0..gate_up.in_dim / MXFP4_BLOCK_SIZE {
-                            let base0 = (row * 2) * row_bytes + block_idx * 17;
-                            let base1 = (row * 2 + 1) * row_bytes + block_idx * 17;
-                            let d0 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base0] as usize];
-                            let d1 = &MXFP4Layer::DEQUANT_LUT[gate_raw[base1] as usize];
-                            let p0 = &gate_raw[base0 + 1..base0 + 17];
-                            let p1 = &gate_raw[base1 + 1..base1 + 17];
-                            let cs = block_idx * 32;
-                            for b in 0..16 {
-                                gate_value += x_row[cs+b] * d0[(p0[b]&15) as usize];
-                                gate_value += x_row[cs+16+b] * d0[(p0[b]>>4) as usize];
-                                up_value += x_row[cs+b] * d1[(p1[b]&15) as usize];
-                                up_value += x_row[cs+16+b] * d1[(p1[b]>>4) as usize];
-                            }
-                        }
-                        (gate_value, up_value)
-                    }
-                } else {
-                    candle_core::bail!("gate input dimension not aligned to MXFP4 block size")
-                };
+                }
+                (gate_value, up_value)
+            };
 
-                let gate = gate_bias_ref
-                    .map(|bias| gate_value + bias[expert_idx * gate_up.out_dim + row * 2])
-                    .unwrap_or(gate_value);
-                let up = gate_bias_ref
-                    .map(|bias| up_value + bias[expert_idx * gate_up.out_dim + row * 2 + 1])
-                    .unwrap_or(up_value);
+            let gate = gate_bias_ref
+                .map(|bias| gate_value + bias[expert_idx * gate_up.out_dim + row * 2])
+                .unwrap_or(gate_value)
+                .min(limit);
+            let up = gate_bias_ref
+                .map(|bias| up_value + bias[expert_idx * gate_up.out_dim + row * 2 + 1])
+                .unwrap_or(up_value)
+                .clamp(-limit, limit);
 
-                let gate = gate.min(limit);
-                let up = up.clamp(-limit, limit);
-                let sigmoid = 1.0f32 / (1.0f32 + (-gate * alpha).exp());
-                activations[route_idx * down.in_dim + row] = (up + 1.0) * gate * sigmoid;
-            }
-        }
+            *dst = (up + 1.0) * gate / (1.0 + (-gate * alpha).exp());
+        });
 
         let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
         let parallel = Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row);
@@ -1265,96 +1235,126 @@ pub(crate) fn fused_gptoss_mlp(
             let bias = down_bias.map(|b| &b[expert_idx * down.out_dim + row]);
             for (route_idx, &route_row) in routes.iter().enumerate() {
                 let token = route_row / topk;
-                let weight = weights_data[route_row];
-                let value = down_accs[route_idx] + bias.copied().unwrap_or(0.0);
-                output[token * *hidden_dim + row] += weight * value;
+                    let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
+        let down_kernel = Self::dot_kernel();
+        let activation_offsets: Vec<usize> =
+            (0..route_count).map(|route| route * down.in_dim).collect();
+        let mut down_accs = vec![0.0f32; route_count];
+
+        const STACK_ROUTES: usize = 8;
+        if route_count <= STACK_ROUTES
+            && Self::adaptive_parallel(route_count, down.out_dim, blocks_per_row)
+        {
+            let output_ptr = output.as_mut_ptr();
+            let route_rows_ptr = routes.as_ptr();
+            let weights_ptr = weights_data.as_ptr();
+            let hidden = *hidden_dim;
+            let activation_offsets_ref = activation_offsets.as_slice();
+            let down_bias_ref = down_bias;
+
+            (0..down.out_dim).into_par_iter().for_each(|row| {
+                let mut accs = [0.0f32; STACK_ROUTES];
+                let acc_slice = &mut accs[..route_count];
+
+                if down_kernel >= 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        Self::dot_streamed_routes_fused_avx2_fma(
+                            &activations,
+                            activation_offsets_ref,
+                            down_raw,
+                            row,
+                            down.in_dim,
+                            acc_slice,
+                        );
+                    }
+                } else if down_kernel == 1 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        Self::dot_streamed_routes_fused_avx2(
+                            &activations,
+                            activation_offsets_ref,
+                            down_raw,
+                            row,
+                            down.in_dim,
+                            acc_slice,
+                        );
+                    }
+                }
+
+                for route_idx in 0..route_count {
+                    let route_row = unsafe { *route_rows_ptr.add(route_idx) };
+                    let token = route_row / topk;
+                    let route_weight = unsafe { *weights_ptr.add(route_row) };
+                    let bias = down_bias_ref
+                        .map(|b| b[expert_idx * down.out_dim + row])
+                        .unwrap_or(0.0);
+                    unsafe {
+                        *output_ptr.add(token * hidden + row) +=
+                            route_weight * (acc_slice[route_idx] + bias);
+                    }
+                }
+            });
+        } else {
+            for row in 0..down.out_dim {
+                down_accs.fill(0.0);
+                if down_kernel >= 2 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        Self::dot_streamed_routes_fused_avx2_fma(
+                            &activations,
+                            &activation_offsets,
+                            down_raw,
+                            row,
+                            down.in_dim,
+                            &mut down_accs,
+                        );
+                    }
+                } else if down_kernel == 1 {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        Self::dot_streamed_routes_fused_avx2(
+                            &activations,
+                            &activation_offsets,
+                            down_raw,
+                            row,
+                            down.in_dim,
+                            &mut down_accs,
+                        );
+                    }
+                } else {
+                    for route_idx in 0..route_count {
+                        let act = &activations
+                            [activation_offsets[route_idx]..activation_offsets[route_idx] + down.in_dim];
+                        let mut acc = 0.0f32;
+                        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+                        let row_start = row * row_bytes;
+                        for block_idx in 0..blocks_per_row {
+                            let base = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                            let d = &MXFP4Layer::DEQUANT_LUT[down_raw[base] as usize];
+                            let packed = &down_raw[base + 1..base + 1 + MXFP4_BLOCK_SIZE / 2];
+                            let cs = block_idx * MXFP4_BLOCK_SIZE;
+                            for b in 0..MXFP4_BLOCK_SIZE / 2 {
+                                acc += act[cs + b] * d[(packed[b] & 0x0f) as usize];
+                                acc += act[cs + 16 + b] * d[(packed[b] >> 4) as usize];
+                            }
+                        }
+                        down_accs[route_idx] = acc;
+                    }
+                }
+
+                for (route_idx, &route_row) in routes.iter().enumerate() {
+                    let token = route_row / topk;
+                    let route_weight = weights_data[route_row];
+                    let bias = down_bias
+                        .map(|b| b[expert_idx * down.out_dim + row])
+                        .unwrap_or(0.0);
+                    output[token * *hidden_dim + row] +=
+                        route_weight * (down_accs[route_idx] + bias);
+                }
             }
         }
-
-        let _ = parallel;
-    }
-
-    gate_up.cache.log_stats();
-    if !Arc::ptr_eq(&gate_up.cache, &down.cache) {
-        down.cache.log_stats();
-    }
-
-    Tensor::from_vec(
-        output,
-        (*num_tokens, *hidden_dim),
-        &Device::Cpu,
-    )?
-    .to_device(x.device())?
-    .to_dtype(x.dtype())
-}
-
-impl QuantMethod for MxFp4StreamingExpertLayer {
-    fn as_mxfp4_streaming(&self) -> Option<&crate::MxFp4StreamingExpertLayer> {
-        Some(self)
-    }
-
-    fn new(_method: QuantMethodConfig) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        candle_core::bail!("MxFp4StreamingExpertLayer must be constructed from a GGUF archive")
-    }
-
-    fn dequantize_w(&self) -> Result<Tensor> {
-        candle_core::bail!(
-            "{} keeps expert weights file-backed and supports gather_forward only",
-            self.name()
-        )
-    }
-
-    fn forward_raw(&self, _a: &Tensor) -> Result<Tensor> {
-        candle_core::bail!(
-            "{} is a routed expert layer; use gather_forward",
-            self.name()
-        )
-    }
-
-    fn gather_forward_raw(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        let x_dims = x.dims();
-        let index_dims = indices.dims();
-        if index_dims.len() != 2 {
-            candle_core::bail!(
-                "GPT-OSS MXFP4 streaming expects rank-2 indices, got rank {}",
-                index_dims.len()
-            );
-        }
-
-        let (num_tokens, topk, k, x_has_topk) = match x_dims {
-            [tokens, cols] => {
-                if *tokens != index_dims[0] {
-                    candle_core::bail!(
-                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
-                    );
-                }
-                (*tokens, index_dims[1], *cols, false)
-            }
-            [tokens, x_topk, cols] => {
-                if *tokens != index_dims[0] {
-                    candle_core::bail!(
-                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
-                    );
-                }
-                if *x_topk != 1 && *x_topk != index_dims[1] {
-                    candle_core::bail!(
-                        "GPT-OSS MXFP4 streaming input route dimension {} does not match top-k {}",
-                        x_topk,
-                        index_dims[1]
-                    );
-                }
-                (*tokens, index_dims[1], *cols, *x_topk != 1)
-            }
-            _ => candle_core::bail!(
-                "GPT-OSS MXFP4 streaming expects rank-2 or rank-3 input, got rank {}",
-                x_dims.len()
-            ),
-        };
-
-        if k != self.in_dim || !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
+ k != self.in_dim || !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
             candle_core::bail!(
                 "GPT-OSS MXFP4 streaming input K {k} does not match expected {}",
                 self.in_dim
