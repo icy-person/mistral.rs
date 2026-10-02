@@ -39,8 +39,9 @@ impl Default for MxFp4StreamConfig {
             cache_mb: None,
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
+            cache_per_source: 5,
             io_threads: 4,
-            overlap: false,
+            overlap: true,
             o_direct: false,
             stats: false,
         }
@@ -66,6 +67,11 @@ impl MxFp4StreamConfig {
             cache_mb,
             cache_floor_mb,
             cache_ceil_mb,
+            cache_per_source: env_usize(
+                "MISTRALRS_MOE_CACHE_PER_SOURCE",
+                defaults.cache_per_source,
+            )
+            .clamp(1, 32),
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
             o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
@@ -467,10 +473,11 @@ impl MxFp4StreamCache {
         };
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
             self.budget_bytes / MIB,
+            self.config.cache_per_source,
             hits,
             misses,
             hit_rate * 100.0,
