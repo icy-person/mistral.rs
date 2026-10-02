@@ -333,7 +333,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 let range = self.raw_expert_range(weight_idx, expert_idx)?;
                 requests.push((
                     MxFp4StreamKey {
-                        weight_index: weight_idx,
+                        source: self.raw_weights[weight_idx].clone(),
                         expert_index: expert_idx,
                     },
                     range,
@@ -394,7 +394,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
 
                 for component in 0..self.raw_weights.len() {
                     let key = MxFp4StreamKey {
-                        weight_index: component,
+                        source: self.raw_weights[component].clone(),
                         expert_index: expert_idx,
                     };
                     let expert = expert_data.get(&key).ok_or_else(|| {
