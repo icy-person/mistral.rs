@@ -573,8 +573,6 @@ impl GptOssMoE {
                 if let (Some(gate_up_stream), Some(down_stream)) =
                     (gate_up.as_mxfp4_streaming(), down.as_mxfp4_streaming())
                 {
-                    gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
-                    down.process_routed_stats(&xs_flat, &topk_ids)?;
                     if let Some(fused) = mistralrs_quant::fused_gptoss_mlp(
                         gate_up_stream,
                         down_stream,
