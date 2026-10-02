@@ -1057,6 +1057,18 @@ impl MxFp4StreamingExpertLayer {
         if idx_tokens != num_tokens || topk == 0 || weights.dims2()? != (num_tokens, topk) {
             return Ok(None);
         }
+        // Whole-MLP fusion is tuned for autoregressive decode. Larger token
+        // batches stay on the existing GEMM/routed path, which is usually better
+        // for prompt processing on CPU.
+        let fused_route_limit = std::env::var("MISTRALRS_MOE_FUSED_ROUTE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(16);
+        if num_tokens.saturating_mul(topk) > fused_route_limit {
+            return Ok(None);
+        }
+
         if gate_up.num_experts != down.num_experts
             || gate_up.raw_weights.len() != 1
             || down.raw_weights.len() != 1
