@@ -213,29 +213,15 @@ impl Deref for MxFp4StreamData {
 struct WorkerFiles {
     normal: Vec<File>,
     direct: Vec<Option<File>>,
-    maps: Vec<Option<Arc<Mmap>>>,
 }
 
 impl WorkerFiles {
-    fn new(paths: &[PathBuf], want_direct: bool, want_mmap: bool) -> io::Result<Self> {
+    fn new(paths: &[PathBuf], want_direct: bool) -> io::Result<Self> {
         let mut normal = Vec::with_capacity(paths.len());
         let mut direct = Vec::with_capacity(paths.len());
-        let mut maps = Vec::with_capacity(paths.len());
 
         for path in paths {
-            let file = File::open(path)?;
-            let map = if want_mmap && !want_direct {
-                match unsafe { memmap2::MmapOptions::new().map(&file) } {
-                    Ok(map) => Some(Arc::new(map)),
-                    Err(err) => {
-                        tracing::debug!("mmap unavailable for {}: {err}", path.display());
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            normal.push(file);
+            normal.push(File::open(path)?);
 
             #[cfg(target_os = "linux")]
             let direct_file = if want_direct {
@@ -261,10 +247,9 @@ impl WorkerFiles {
             let direct_file = None;
 
             direct.push(direct_file);
-            maps.push(map);
         }
 
-        Ok(Self { normal, direct, maps })
+        Ok(Self { normal, direct })
     }
 }
 
@@ -289,6 +274,7 @@ pub(crate) struct MxFp4StreamCache {
     queues: Vec<SyncSender<ReadJob>>,
     next_queue: AtomicUsize,
     paths: Vec<PathBuf>,
+    maps: Vec<Option<Arc<Mmap>>>,
     config: MxFp4StreamConfig,
     budget_bytes: usize,
     stats: Stats,
@@ -303,20 +289,39 @@ impl MxFp4StreamCache {
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
         let queue_size = 8usize;
-        let mut queues = Vec::with_capacity(config.io_threads);
+
+        let mut maps = Vec::with_capacity(paths.len());
+        if config.mmap && !config.o_direct {
+            for path in &paths {
+                let map = match File::open(path) {
+                    Ok(file) => match unsafe { memmap2::MmapOptions::new().map(&file) } {
+                        Ok(map) => Some(Arc::new(map)),
+                        Err(err) => {
+                            tracing::debug!("mmap unavailable for {}: {err}", path.display());
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        tracing::debug!("failed to open {} for mmap: {err}", path.display());
+                        None
+                    }
+                };
+                maps.push(map);
+            }
+        } else {
+            maps.resize(paths.len(), None);
+        }
 
         let mut queues = Vec::with_capacity(config.io_threads);
-
         for worker_id in 0..config.io_threads {
             let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
             queues.push(queue_tx);
             let worker_paths = paths.clone();
             let want_direct = config.o_direct;
-            let want_mmap = config.mmap;
             thread::Builder::new()
                 .name(format!("mxfp4-io-{worker_id}"))
                 .spawn(move || {
-                    let files = match WorkerFiles::new(&worker_paths, want_direct, want_mmap) {
+                    let files = match WorkerFiles::new(&worker_paths, want_direct) {
                         Ok(files) => files,
                         Err(err) => {
                             tracing::error!(
@@ -335,11 +340,10 @@ impl MxFp4StreamCache {
                             continue;
                         };
                         let direct_file = files.direct.get(job.shard).and_then(Option::as_ref);
-                        let map = files.maps.get(job.shard).and_then(Option::as_ref);
                         let result = read_file_range(
                             file,
                             direct_file,
-                            map,
+                            None,
                             job.offset,
                             job.len,
                             job.file_len,
@@ -365,6 +369,7 @@ impl MxFp4StreamCache {
             queues,
             next_queue: AtomicUsize::new(0),
             paths: paths.clone(),
+            maps,
             budget_bytes: config.cache_budget_bytes(),
             config,
             stats: Stats::default(),
@@ -455,6 +460,24 @@ impl MxFp4StreamCache {
         }
     }
 
+    fn mapped_range(&self, range: MxFp4StreamRange) -> Option<Arc<MxFp4StreamData>> {
+        let map = self.maps.get(range.shard).and_then(Option::as_ref)?;
+        let start = usize::try_from(range.offset).ok()?;
+        let end = start.checked_add(range.len)?;
+        if end > map.len() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let _ = map.advise_range(memmap2::Advice::WillNeed, start, range.len);
+        }
+        Some(Arc::new(MxFp4StreamData::Mapped {
+            map: map.clone(),
+            start,
+            len: range.len,
+        }))
+    }
+
     fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Arc<MxFp4StreamData>>>> {
         if range.shard >= self.paths.len() {
             return Err(io::Error::new(
@@ -487,6 +510,10 @@ impl MxFp4StreamCache {
         if let Some(data) = self.lookup(key) {
             return Ok(data);
         }
+        if let Some(data) = self.mapped_range(range) {
+            self.insert(key.clone(), data.clone());
+            return Ok(data);
+        }
         let rx = self.submit(range)?;
         let data = rx
             .recv()
@@ -506,6 +533,9 @@ impl MxFp4StreamCache {
         let mut result = HashMap::with_capacity(requests.len());
         for (key, range) in requests.iter().cloned() {
             if let Some(data) = self.lookup(&key) {
+                result.insert(key, MxFp4StreamHandle::Ready(data));
+            } else if let Some(data) = self.mapped_range(range) {
+                self.insert(key.clone(), data.clone());
                 result.insert(key, MxFp4StreamHandle::Ready(data));
             } else {
                 result.insert(
