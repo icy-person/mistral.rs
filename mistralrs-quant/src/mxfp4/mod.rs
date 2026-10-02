@@ -4,7 +4,7 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m128i, __m256, _mm256_add_epi32, _mm256_add_ps, _mm256_castps256_ps128,
+    __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_castps256_ps128,
     _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps,
     _mm256_i32gather_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_epi32,
     _mm256_setzero_ps, _mm_add_ss, _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64,
@@ -801,7 +801,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 .par_iter_mut()
                                 .enumerate()
                                 .for_each(|(row, value)| {
-                                    let value = if kernel >= 2 {
+                                    let dot = if kernel >= 2 {
                                         #[cfg(target_arch = "x86_64")]
                                         {
                                             unsafe {
@@ -856,7 +856,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         }
                                         acc
                                     };
-                                    *value += value;
+                                    *value += dot;
                                 });
                         }
                     } else {
@@ -971,10 +971,9 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 let scratch_len = self.component_out_dim * route_count;
                 if partial.len() < scratch_len {
                     partial.resize(scratch_len, 0.0);
-                } else {
-                    partial[..scratch_len].fill(0.0);
-                    partial.truncate(scratch_len);
                 }
+                partial[..scratch_len].fill(0.0);
+                partial.truncate(scratch_len);
 
                 let parallel = Self::adaptive_parallel(route_count, self.component_out_dim, blocks_per_row);
                 let compute_rows = |partial: &mut [f32]| {
