@@ -2749,6 +2749,7 @@ impl MistralRs {
                     .is_some_and(MtpConfig::is_builtin),
             )
             .with_encoder_cache_memory_bytes(loader_config.encoder_cache_memory_bytes)
+            .with_moe_streaming(loader_config.moe_streaming)
             .build()
             .map_err(|e| MistralRsError::ReloadFailed(format!("Failed to build loader: {e}")))?;
 
