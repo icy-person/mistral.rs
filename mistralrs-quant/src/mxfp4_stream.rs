@@ -402,7 +402,7 @@ impl MxFp4StreamCache {
             target: "mistralrs_moe_stream",
             "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
             guard.entries.len(),
-            guard.used_bytes / MIB as u64,
+            guard.used_bytes / MIB,
             self.budget_bytes / MIB,
             hits,
             misses,
