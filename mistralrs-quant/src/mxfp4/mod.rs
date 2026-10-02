@@ -239,25 +239,34 @@ impl MxFp4StreamingExpertLayer {
         let mut a1 = _mm256_setzero_ps();
         let mut a2 = _mm256_setzero_ps();
         let mut a3 = _mm256_setzero_ps();
-        let mut i = 0usize;
-        while i < 32 {
-            let xv0 = _mm256_loadu_ps(x.as_ptr().add(i));
-            let wv0 = _mm256_loadu_ps(w.as_ptr().add(i));
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(xv0, wv0));
-
-            let xv1 = _mm256_loadu_ps(x.as_ptr().add(i + 8));
-            let wv1 = _mm256_loadu_ps(w.as_ptr().add(i + 8));
-            a1 = _mm256_add_ps(a1, _mm256_mul_ps(xv1, wv1));
-
-            let xv2 = _mm256_loadu_ps(x.as_ptr().add(i + 16));
-            let wv2 = _mm256_loadu_ps(w.as_ptr().add(i + 16));
-            a2 = _mm256_add_ps(a2, _mm256_mul_ps(xv2, wv2));
-
-            let xv3 = _mm256_loadu_ps(x.as_ptr().add(i + 24));
-            let wv3 = _mm256_loadu_ps(w.as_ptr().add(i + 24));
-            a3 = _mm256_add_ps(a3, _mm256_mul_ps(xv3, wv3));
-            i += 32;
-        }
+        a0 = _mm256_add_ps(
+            a0,
+            _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr()),
+                _mm256_loadu_ps(w.as_ptr()),
+            ),
+        );
+        a1 = _mm256_add_ps(
+            a1,
+            _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(8)),
+                _mm256_loadu_ps(w.as_ptr().add(8)),
+            ),
+        );
+        a2 = _mm256_add_ps(
+            a2,
+            _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(16)),
+                _mm256_loadu_ps(w.as_ptr().add(16)),
+            ),
+        );
+        a3 = _mm256_add_ps(
+            a3,
+            _mm256_mul_ps(
+                _mm256_loadu_ps(x.as_ptr().add(24)),
+                _mm256_loadu_ps(w.as_ptr().add(24)),
+            ),
+        );
         Self::hsum4(a0, a1, a2, a3)
     }
 
@@ -269,30 +278,26 @@ impl MxFp4StreamingExpertLayer {
         let mut a1 = _mm256_setzero_ps();
         let mut a2 = _mm256_setzero_ps();
         let mut a3 = _mm256_setzero_ps();
-        let mut i = 0usize;
-        while i < 32 {
-            a0 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(i)),
-                _mm256_loadu_ps(w.as_ptr().add(i)),
-                a0,
-            );
-            a1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(i + 8)),
-                _mm256_loadu_ps(w.as_ptr().add(i + 8)),
-                a1,
-            );
-            a2 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(i + 16)),
-                _mm256_loadu_ps(w.as_ptr().add(i + 16)),
-                a2,
-            );
-            a3 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(i + 24)),
-                _mm256_loadu_ps(w.as_ptr().add(i + 24)),
-                a3,
-            );
-            i += 32;
-        }
+        a0 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(x.as_ptr()),
+            _mm256_loadu_ps(w.as_ptr()),
+            a0,
+        );
+        a1 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(x.as_ptr().add(8)),
+            _mm256_loadu_ps(w.as_ptr().add(8)),
+            a1,
+        );
+        a2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(x.as_ptr().add(16)),
+            _mm256_loadu_ps(w.as_ptr().add(16)),
+            a2,
+        );
+        a3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(x.as_ptr().add(24)),
+            _mm256_loadu_ps(w.as_ptr().add(24)),
+            a3,
+        );
         Self::hsum4(a0, a1, a2, a3)
     }
 
@@ -436,15 +441,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
-        let mut routes_by_expert = HashMap::<usize, Vec<usize>>::new();
+        let mut routes_by_expert = vec![Vec::<usize>::new(); self.num_experts];
         for (route, &expert) in indices_data.iter().enumerate() {
-            routes_by_expert
-                .entry(expert as usize)
-                .or_default()
-                .push(route);
+            let expert = expert as usize;
+            if expert >= self.num_experts {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 expert index {} out of range for {} experts",
+                    expert,
+                    self.num_experts
+                );
+            }
+            routes_by_expert[expert].push(route);
         }
-        let mut experts = routes_by_expert.keys().copied().collect::<Vec<_>>();
-        experts.sort_unstable();
+        let experts = routes_by_expert
+            .iter()
+            .enumerate()
+            .filter_map(|(expert, routes)| (!routes.is_empty()).then_some(expert))
+            .collect::<Vec<_>>();
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
         for weight_idx in 0..self.raw_weights.len() {
@@ -481,9 +494,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         // prompt batches where the same expert can serve multiple tokens.
         //
         // The grouped path below parallelizes over output rows, decodes each MXFP4
-        // weight block once per row, and reuses it across all matching routes.
-        // weight block once per row, and reuses that decoded block across every route
-        // selecting the same expert.
+        // weight block once per row, and reuses it across all matching routes..
         if self.raw_weights.len() > 1 {
             for component in 0..self.raw_weights.len() {
                 for &expert_idx in &experts {
@@ -542,19 +553,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 let packed =
                                     &expert[block_start + 1..block_start + 1 + MXFP4_BLOCK_SIZE / 2];
                                 let col_start = block_idx * MXFP4_BLOCK_SIZE;
+                                let mut w_block = [0f32; MXFP4_BLOCK_SIZE];
+                                for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
+                                    let packed_byte = packed[byte_idx];
+                                    w_block[byte_idx] = dequant[(packed_byte & 0x0f) as usize];
+                                    w_block[MXFP4_BLOCK_SIZE / 2 + byte_idx] =
+                                        dequant[(packed_byte >> 4) as usize];
+                                }
 
                                 for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
                                     let x_row = &x_data[x_offset..x_offset + self.in_dim];
                                     let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                    let mut dot = 0f32;
-                                    for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
-                                        let packed_byte = packed[byte_idx];
-                                        dot += x_block[byte_idx]
-                                            * dequant[(packed_byte & 0x0f) as usize];
-                                        dot += x_block[MXFP4_BLOCK_SIZE / 2 + byte_idx]
-                                            * dequant[(packed_byte >> 4) as usize];
-                                    }
-                                    accs[route_idx] += dot;
+                                    accs[route_idx] =
+                                        accs[route_idx].mul_add(1.0, Self::dot_block(
+                                            x_block,
+                                            &w_block,
+                                            kernel,
+                                        ));
                                 }
                             }
                         });
