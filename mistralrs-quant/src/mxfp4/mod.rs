@@ -252,6 +252,70 @@ impl MxFp4StreamingExpertLayer {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     #[inline]
+    unsafe fn dot_block_pair_avx2(
+        x_data: &[f32],
+        x_offsets: &[usize],
+        x_start: usize,
+        w: &[f32],
+    ) -> [f32; 2] {
+        debug_assert_eq!(x_offsets.len(), 2);
+
+        let x0 = x_data.as_ptr().add(x_offsets[0] + x_start);
+        let x1 = x_data.as_ptr().add(x_offsets[1] + x_start);
+        let w_ptr = w.as_ptr();
+
+        let w0 = _mm256_loadu_ps(w_ptr);
+        let w1 = _mm256_loadu_ps(w_ptr.add(8));
+        let w2 = _mm256_loadu_ps(w_ptr.add(16));
+        let w3 = _mm256_loadu_ps(w_ptr.add(24));
+
+        let a0 = _mm256_mul_ps(_mm256_loadu_ps(x0), w0);
+        let a1 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(8)), w1);
+        let a2 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(16)), w2);
+        let a3 = _mm256_mul_ps(_mm256_loadu_ps(x0.add(24)), w3);
+        let b0 = _mm256_mul_ps(_mm256_loadu_ps(x1), w0);
+        let b1 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(8)), w1);
+        let b2 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(16)), w2);
+        let b3 = _mm256_mul_ps(_mm256_loadu_ps(x1.add(24)), w3);
+
+        [Self::hsum4(a0, a1, a2, a3), Self::hsum4(b0, b1, b2, b3)]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot_block_pair_avx2_fma(
+        x_data: &[f32],
+        x_offsets: &[usize],
+        x_start: usize,
+        w: &[f32],
+    ) -> [f32; 2] {
+        debug_assert_eq!(x_offsets.len(), 2);
+
+        let x0 = x_data.as_ptr().add(x_offsets[0] + x_start);
+        let x1 = x_data.as_ptr().add(x_offsets[1] + x_start);
+        let w_ptr = w.as_ptr();
+
+        let w0 = _mm256_loadu_ps(w_ptr);
+        let w1 = _mm256_loadu_ps(w_ptr.add(8));
+        let w2 = _mm256_loadu_ps(w_ptr.add(16));
+        let w3 = _mm256_loadu_ps(w_ptr.add(24));
+
+        let a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0), w0, _mm256_setzero_ps());
+        let a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(8)), w1, _mm256_setzero_ps());
+        let a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(16)), w2, _mm256_setzero_ps());
+        let a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.add(24)), w3, _mm256_setzero_ps());
+        let b0 = _mm256_fmadd_ps(_mm256_loadu_ps(x1), w0, _mm256_setzero_ps());
+        let b1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(8)), w1, _mm256_setzero_ps());
+        let b2 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(16)), w2, _mm256_setzero_ps());
+        let b3 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.add(24)), w3, _mm256_setzero_ps());
+
+        [Self::hsum4(a0, a1, a2, a3), Self::hsum4(b0, b1, b2, b3)]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn dot_block_avx2(x: &[f32], w: &[f32]) -> f32 {
         let mut a0 = _mm256_setzero_ps();
         let mut a1 = _mm256_setzero_ps();
@@ -1015,12 +1079,46 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                         dequant[(packed_byte >> 4) as usize];
                                 }
 
-                                for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
-                                    let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                                    let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                    accs[route_idx] +=
-                                        Self::dot_block(x_block, &w_block, kernel);
+                                for pair_start in (0..route_count).step_by(2) {
+                                let pair_len = (route_count - pair_start).min(2);
+                                if pair_len == 2 {
+                                    #[cfg(target_arch = "x86_64")]
+                                    if kernel >= 2 {
+                                        let pair = unsafe {
+                                            Self::dot_block_pair_avx2_fma(
+                                                &x_data,
+                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                col_start,
+                                                &w_block,
+                                            )
+                                        };
+                                        accs[pair_start] += pair[0];
+                                        accs[pair_start + 1] += pair[1];
+                                        continue;
+                                    }
+
+                                    #[cfg(target_arch = "x86_64")]
+                                    if kernel == 1 {
+                                        let pair = unsafe {
+                                            Self::dot_block_pair_avx2(
+                                                &x_data,
+                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                col_start,
+                                                &w_block,
+                                            )
+                                        };
+                                        accs[pair_start] += pair[0];
+                                        accs[pair_start + 1] += pair[1];
+                                        continue;
+                                    }
                                 }
+
+                                let x_offset = route_x_offsets[pair_start];
+                                let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                                let x_block =
+                                    &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
+                                accs[pair_start] +=
+                                    Self::dot_block(x_block, &w_block, kernel);
                             }
                         });
 
@@ -1125,14 +1223,46 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                     dequant[(packed_byte >> 4) as usize];
                             }
 
-                            for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
+                            for pair_start in (0..route_count).step_by(2) {
+                                let pair_len = (route_count - pair_start).min(2);
+                                if pair_len == 2 {
+                                    #[cfg(target_arch = "x86_64")]
+                                    if kernel >= 2 {
+                                        let pair = unsafe {
+                                            Self::dot_block_pair_avx2_fma(
+                                                &x_data,
+                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                col_start,
+                                                &w_block,
+                                            )
+                                        };
+                                        accs[pair_start] += pair[0];
+                                        accs[pair_start + 1] += pair[1];
+                                        continue;
+                                    }
+
+                                    #[cfg(target_arch = "x86_64")]
+                                    if kernel == 1 {
+                                        let pair = unsafe {
+                                            Self::dot_block_pair_avx2(
+                                                &x_data,
+                                                &route_x_offsets[pair_start..pair_start + 2],
+                                                col_start,
+                                                &w_block,
+                                            )
+                                        };
+                                        accs[pair_start] += pair[0];
+                                        accs[pair_start + 1] += pair[1];
+                                        continue;
+                                    }
+                                }
+
+                                let x_offset = route_x_offsets[pair_start];
                                 let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                                let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                accs[route_idx] += Self::dot_block(
-                                    x_block,
-                                    &w_block,
-                                    kernel,
-                                );
+                                let x_block =
+                                    &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
+                                accs[pair_start] +=
+                                    Self::dot_block(x_block, &w_block, kernel);
                             }
                         }
                     });
