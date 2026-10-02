@@ -267,6 +267,7 @@ impl MxFp4StreamCache {
             return;
         };
         guard.clock = guard.clock.wrapping_add(1);
+        let now = guard.clock;
         if let Some(old) = guard.entries.remove(&key) {
             guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
         }
@@ -319,10 +320,10 @@ impl MxFp4StreamCache {
 
     pub(crate) fn load(
         &self,
-        key: MxFp4StreamKey,
+        key: &MxFp4StreamKey,
         range: MxFp4StreamRange,
     ) -> crate::Result<Arc<Vec<u8>>> {
-        if let Some(data) = self.lookup(&key) {
+        if let Some(data) = self.lookup(key) {
             return Ok(data);
         }
         let rx = self.submit(range)?;
@@ -333,7 +334,7 @@ impl MxFp4StreamCache {
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
         let data = Arc::new(data);
-        self.insert(key, data.clone());
+        self.insert(key.clone(), data.clone());
         Ok(data)
     }
 
@@ -357,7 +358,7 @@ impl MxFp4StreamCache {
 
     pub(crate) fn resolve(
         &self,
-        key: MxFp4StreamKey,
+        key: &MxFp4StreamKey,
         handle: MxFp4StreamHandle,
     ) -> crate::Result<Arc<Vec<u8>>> {
         match handle {
@@ -370,7 +371,7 @@ impl MxFp4StreamCache {
                 self.stats.reads.fetch_add(1, Ordering::Relaxed);
                 self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let data = Arc::new(data);
-                self.insert(key, data.clone());
+                self.insert(key.clone(), data.clone());
                 Ok(data)
             }
         }
