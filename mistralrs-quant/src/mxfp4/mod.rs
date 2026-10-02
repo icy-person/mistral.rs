@@ -1298,8 +1298,7 @@ impl MxFp4StreamingExpertLayer {
                         .zip(up_values[..activation_len].par_chunks(8))
                         .zip(activations[..activation_len].par_chunks_mut(8))
                         .for_each(|((gate_chunk, up_chunk), out_chunk)| {
-                            let lanes = gate_chunk.len();
-                            if lanes == 8 {
+                            if gate_chunk.len() == 8 {
                                 unsafe {
                                     let g = _mm256_loadu_ps(gate_chunk.as_ptr());
                                     let u = _mm256_loadu_ps(up_chunk.as_ptr());
@@ -1307,7 +1306,7 @@ impl MxFp4StreamingExpertLayer {
                                     _mm256_storeu_ps(out_chunk.as_mut_ptr(), y);
                                 }
                             } else {
-                                for i in 0..lanes {
+                                for i in 0..gate_chunk.len() {
                                     out_chunk[i] = (up_chunk[i] + 1.0)
                                         * gate_chunk[i]
                                         / (1.0 + (-gate_chunk[i] * alpha).exp());
@@ -1315,6 +1314,17 @@ impl MxFp4StreamingExpertLayer {
                             }
                         });
                 });
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    activations[..activation_len]
+                        .par_iter_mut()
+                        .zip(gate_values[..activation_len].par_iter())
+                        .zip(up_values[..activation_len].par_iter())
+                        .for_each(|((dst, gate), up)| {
+                            *dst = (up + 1.0) * gate
+                                / (1.0 + (-gate * alpha).exp());
+                        });
+                }
             } else {
                 activations[..activation_len]
                     .par_iter_mut()
@@ -1326,7 +1336,20 @@ impl MxFp4StreamingExpertLayer {
                     });
             }
 
-                let activation_offsets = &activation_offsets[..route_count];
+            // Apply the top-k weight once to the intermediate vector instead of
+            // multiplying every final hidden output element.
+            let routes_ref = routes;
+            activations[..activation_len]
+                .par_chunks_mut(down.in_dim)
+                .enumerate()
+                .for_each(|(route_idx, activation)| {
+                    let weight = route_weights[routes_ref[route_idx]];
+                    for value in activation {
+                        *value *= weight;
+                    }
+                });
+
+            let activation_offsets = &activation_offsets[..route_count];
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
             let down_kernel = kernel;
 
@@ -1337,7 +1360,6 @@ impl MxFp4StreamingExpertLayer {
             if parallel_down {
                 let output_ptr = output.as_mut_ptr();
                 let route_rows_ptr = routes.as_ptr();
-                let weights_ptr = route_weights.as_ptr();
                 let activation_offsets_ref = activation_offsets.as_slice();
                 let down_bias_ref = down_bias;
                 Self::moe_thread_pool().install(|| {
@@ -1373,13 +1395,13 @@ impl MxFp4StreamingExpertLayer {
                     for route_idx in 0..route_count {
                         let route_row = unsafe { *route_rows_ptr.add(route_idx) };
                         let token = route_row / topk;
-                        let weight = unsafe { *weights_ptr.add(route_row) };
+                        let weight = route_weights[route_row];
                         let bias = down_bias_ref
                             .map(|b| b[expert_idx * down.out_dim + row])
                             .unwrap_or(0.0);
                         unsafe {
                             *output_ptr.add(token * hidden_dim + row) +=
-                                weight * (accs[route_idx] + bias);
+                                accs[route_idx] + bias * weight;
                         }
                     }
                     });
