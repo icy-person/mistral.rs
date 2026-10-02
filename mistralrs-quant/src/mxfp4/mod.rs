@@ -22,7 +22,9 @@ use rayon::prelude::*;
 use safetensors::tensor::Dtype;
 
 use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
-use crate::mxfp4_stream::{MxFp4StreamCache, MxFp4StreamKey, MxFp4StreamRange};
+use crate::mxfp4_stream::{
+    MxFp4StreamCache, MxFp4StreamData, MxFp4StreamKey, MxFp4StreamRange,
+};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UqffReader, UqffTensor,
@@ -70,6 +72,9 @@ pub struct MxFp4StreamingExpertLayer {
     bias: Option<Tensor>,
     bias_cpu: Option<Arc<Vec<f32>>>,
     expert_ranges: Vec<MxFp4StreamRange>,
+    // Zero-copy entries are immutable mmap descriptors. Keep a tiny per-layer
+    // OnceLock table so hot decode hits bypass the shared cache mutex/hash lookup.
+    zero_copy_experts: Vec<Vec<OnceLock<Arc<MxFp4StreamData>>>,
     cache: Arc<MxFp4StreamCache>,
 }
 
@@ -201,6 +206,10 @@ impl MxFp4StreamingExpertLayer {
             .map(|source| Arc::<str>::from(source.as_str()))
             .collect();
 
+        let zero_copy_experts = (0..raw_weights.len())
+            .map(|_| (0..num_experts).map(|_| OnceLock::new()).collect())
+            .collect();
+
         Ok(Self {
             raw_weights,
             cache_sources,
@@ -211,6 +220,7 @@ impl MxFp4StreamingExpertLayer {
             bias,
             bias_cpu,
             expert_ranges,
+            zero_copy_experts,
             cache,
         })
     }
@@ -241,6 +251,39 @@ impl MxFp4StreamingExpertLayer {
             })?)
             .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
         Ok(MxFp4StreamRange { offset, ..base })
+    }
+
+    #[inline]
+    fn remember_zero_copy_expert(
+        &self,
+        weight_idx: usize,
+        expert_idx: usize,
+        data: Arc<MxFp4StreamData>,
+    ) -> Arc<MxFp4StreamData> {
+        if !self.cache.zero_copy() {
+            return data;
+        }
+        let slot = &self.zero_copy_experts[weight_idx][expert_idx];
+        let _ = slot.set(data.clone());
+        slot.get().cloned().unwrap_or(data)
+    }
+
+    #[inline]
+    fn load_expert_cached(
+        &self,
+        weight_idx: usize,
+        expert_idx: usize,
+        key: &MxFp4StreamKey,
+        range: MxFp4StreamRange,
+    ) -> Result<Arc<MxFp4StreamData>> {
+        if self.cache.zero_copy() {
+            if let Some(data) = self.zero_copy_experts[weight_idx][expert_idx].get() {
+                return Ok(data.clone());
+            }
+        }
+
+        let data = self.cache.load(key, range)?;
+        Ok(self.remember_zero_copy_expert(weight_idx, expert_idx, data))
     }
 
     fn moe_thread_pool() -> &'static rayon::ThreadPool {
@@ -1207,7 +1250,12 @@ impl MxFp4StreamingExpertLayer {
                 let gate_handle = queue.pop_front().ok_or_else(|| {
                     candle_core::Error::Msg("fused GPT-OSS gate request queue underflow".into())
                 })?;
-                let gate_data = gate_up.cache.resolve(&gate_key, gate_handle)?;
+                let gate_data = gate_up
+                    .remember_zero_copy_expert(
+                        0,
+                        expert_idx,
+                        gate_up.cache.resolve(&gate_key, gate_handle)?,
+                    );
 
                 let down_key = MxFp4StreamKey {
                     source: down.raw_weights[0].clone(),
@@ -1216,7 +1264,11 @@ impl MxFp4StreamingExpertLayer {
                 let down_handle = queue.pop_front().ok_or_else(|| {
                     candle_core::Error::Msg("fused GPT-OSS down request queue underflow".into())
                 })?;
-                let down_data = down.cache.resolve(&down_key, down_handle)?;
+                let down_data = down.remember_zero_copy_expert(
+                    0,
+                    expert_idx,
+                    down.cache.resolve(&down_key, down_handle)?,
+                );
                 (gate_data, down_data)
             } else {
                 let gate_key = MxFp4StreamKey {
@@ -1228,8 +1280,18 @@ impl MxFp4StreamingExpertLayer {
                     expert_index: expert_idx,
                 };
                 (
-                    gate_up.cache.load(&gate_key, gate_up.raw_expert_range(0, expert_idx)?)?,
-                    down.cache.load(&down_key, down.raw_expert_range(0, expert_idx)?)?,
+                    gate_up.load_expert_cached(
+                        0,
+                        expert_idx,
+                        &gate_key,
+                        gate_up.raw_expert_range(0, expert_idx)?,
+                    )?,
+                    down.load_expert_cached(
+                        0,
+                        expert_idx,
+                        &down_key,
+                        down.raw_expert_range(0, expert_idx)?,
+                    )?,
                 )
             };
 
@@ -1700,10 +1762,14 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 .to_string(),
                         )
                     })?;
-                    self.cache.resolve(&key, handle)?
+                    self.remember_zero_copy_expert(
+                        component,
+                        expert_idx,
+                        self.cache.resolve(&key, handle)?,
+                    )
                 } else {
                     let range = self.raw_expert_range(component, expert_idx)?;
-                    self.cache.load(&key, range)?
+                    self.load_expert_cached(component, expert_idx, &key, range)?
                 };
                 let expert = expert_data.as_ref();
 
