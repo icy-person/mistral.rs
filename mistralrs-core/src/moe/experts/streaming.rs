@@ -979,7 +979,7 @@ impl StreamedProjection {
                 entry.routes.len(),
                 device,
             )?;
-            output = output.index_copy(&output_indices, &projected, 0)?;
+            output = output.index_add(&output_indices, &projected, 0)?;
         }
 
         Ok(output)
