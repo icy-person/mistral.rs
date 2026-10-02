@@ -364,7 +364,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         if !expert_data.contains_key(&key) {
                             let handle = pending_map.remove(&key).ok_or_else(|| {
                                 candle_core::Error::Msg(
-                                    "GPT-OSS MXFP4 streamed expert request was not scheduled",
+                                    "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
                                 )
                             })?;
                             let data = self.cache.resolve(key, handle)?;
@@ -408,7 +408,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     if !expert_data.contains_key(&key) {
                         let handle = pending_map.remove(&key).ok_or_else(|| {
                             candle_core::Error::Msg(
-                                "GPT-OSS MXFP4 streamed expert request was not scheduled",
+                                "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
                             )
                         })?;
                         let data = self.cache.resolve(key, handle)?;
