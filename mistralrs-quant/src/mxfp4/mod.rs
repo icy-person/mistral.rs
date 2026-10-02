@@ -1028,15 +1028,21 @@ impl MxFp4StreamingExpertLayer {
         )
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[inline]
     fn approx_swiglu_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("MISTRALRS_MOE_APPROX_SWIGLU")
-                .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
-                .unwrap_or(true)
-        })
+        #[cfg(target_arch = "x86_64")]
+        {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| {
+                std::env::var("MISTRALRS_MOE_APPROX_SWIGLU")
+                    .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
+                    .unwrap_or(true)
+            })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 
     /// Fused CPU GPT-OSS path for native streamed MXFP4 experts.
