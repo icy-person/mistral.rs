@@ -169,6 +169,7 @@ struct Stats {
     reads: AtomicU64,
     bytes_read: AtomicU64,
     evictions: AtomicU64,
+    report_calls: AtomicU64,
 }
 
 pub(crate) struct MxFp4StreamCache {
@@ -357,6 +358,10 @@ impl MxFp4StreamCache {
 
     pub(crate) fn log_stats(&self) {
         if !self.config.stats {
+            return;
+        }
+        let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
+        if report != 0 && !report.is_multiple_of(32) {
             return;
         }
         let Ok(guard) = self.inner.lock() else {
