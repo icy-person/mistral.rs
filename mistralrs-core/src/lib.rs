@@ -357,6 +357,8 @@ pub struct ModelLoaderConfig {
     pub mtp_config: Option<MtpConfig>,
     /// Optional logical tensor byte budget for multimodal encoder outputs.
     pub encoder_cache_memory_bytes: Option<usize>,
+    /// Whether to keep supported MoE expert banks file-backed and stream routed experts.
+    pub moe_streaming: bool,
 }
 
 /// State preserved when a model is unloaded.
