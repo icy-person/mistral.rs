@@ -1700,31 +1700,13 @@ mod tests {
             &Device::Cpu,
         )?;
         let actual = layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let fp4 = [
+            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
         let expected_values = (0..16)
-            .map(|j| match j {
-                0 => 0.0,
-                1 => 0.5,
-                2 => 1.0,
-                3 => 1.5,
-                4 => 2.0,
-                5 => 3.0,
-                6 => 4.0,
-                7 => 6.0,
-                _ => j as f32,
-            })
-            .chain((0..16).map(|j| {
-                let nibble = 15 - j;
-                match nibble {
-                    8 => -0.0,
-                    9 => -0.5,
-                    10 => -1.0,
-                    11 => -1.5,
-                    12 => -2.0,
-                    13 => -3.0,
-                    14 => -4.0,
-                    _ => -6.0,
-                }
-            }))
+            .map(|j| fp4[j])
+            .chain((0..16).map(|j| fp4[15 - j]))
             .collect::<Vec<_>>();
         let expected = Tensor::from_vec(expected_values, (1, MXFP4_BLOCK_SIZE), &Device::Cpu)?;
         assert_close(&actual, &expected)?;
