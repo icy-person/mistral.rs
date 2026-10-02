@@ -201,10 +201,13 @@ impl MxFp4StreamingExpertLayer {
             let packed = &block[1..];
 
             let col_start = block_idx * MXFP4_BLOCK_SIZE;
+            // GGML MXFP4 uses split-half packing: low nibbles are elements 0..15,
+            // high nibbles are elements 16..31.
             for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
                 let packed_byte = packed[byte_idx];
-                acc += x[col_start + byte_idx * 2] * dequant[(packed_byte & 0x0f) as usize];
-                acc += x[col_start + byte_idx * 2 + 1]
+                acc += x[col_start + byte_idx]
+                    * dequant[(packed_byte & 0x0f) as usize];
+                acc += x[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
                     * dequant[(packed_byte >> 4) as usize];
             }
         }
@@ -700,8 +703,9 @@ impl MXFP4Layer {
     /// Construct one logical [rows, cols] MXFP4 matrix from canonical GGUF bytes.
     ///
     /// GGUF dtype 39 stores each 32-value block as one E8M0 scale byte followed by 16 packed
-    /// FP4 bytes. Candle uses the same low-nibble/high-nibble ordering, so the raw payload can
-    /// be copied into its packed [rows, cols/2] representation without a dequantize/requantize step.
+    /// FP4 bytes in GGML's split-half layout: byte j low nibble is element j and high nibble
+    /// is element j + 16. Candle's packed representation pairs adjacent elements in each byte,
+    /// so the raw payload must be losslessly repacked.
     pub fn from_gguf_bytes(
         data: &[u8],
         rows: usize,
@@ -739,9 +743,24 @@ impl MXFP4Layer {
             for block in 0..blocks_per_row {
                 let start = block * (1 + packed_bytes_per_block);
                 scales.push(row_data[start]);
-                blocks.extend_from_slice(
-                    &row_data[start + 1..start + 1 + packed_bytes_per_block],
-                );
+                let native = &row_data[start + 1..start + 1 + packed_bytes_per_block];
+
+                // GGML MXFP4 is split-half:
+                //   native[j].lo -> element j
+                //   native[j].hi -> element j + 16.
+                // Repack to Candle's adjacent-pair layout.
+                for pair in 0..packed_bytes_per_block {
+                    let elem0 = pair * 2;
+                    let elem1 = elem0 + 1;
+                    let nibble = |element: usize| -> u8 {
+                        if element < 16 {
+                            native[element] & 0x0f
+                        } else {
+                            native[element - 16] >> 4
+                        }
+                    };
+                    blocks.push(nibble(elem0) | (nibble(elem1) << 4));
+                }
             }
         }
 
@@ -1017,7 +1036,11 @@ impl MXFP4Layer {
         ];
         let mut s = 0u32;
         while s < 256 {
-            let scale_factor = f32::from_bits(s << 23);
+            let scale_factor = if s == 255 {
+                f32::NAN
+            } else {
+                2.0f32.powi(s as i32 - 127)
+            };
             let mut n = 0;
             while n < 16 {
                 lut[s as usize][n] = fp4[n] * scale_factor;
