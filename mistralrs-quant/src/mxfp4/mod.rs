@@ -76,7 +76,20 @@ impl MxFp4StreamingExpertLayer {
 
         for name in &raw_weights {
             let info = archive.tensor_info(name)?;
-            validate_mxfp4(info.dtype().raw(), info.shape(), name)?;
+            if info.dtype().raw() != 39 {
+                candle_core::bail!(
+                    "GGUF tensor `{name}` has dtype {}, expected MXFP4 dtype 39",
+                    info.dtype().raw()
+                );
+            }
+            let Some(last) = info.shape().last() else {
+                candle_core::bail!("GGUF MXFP4 tensor `{name}` has no dimensions");
+            };
+            if !last.is_multiple_of(MXFP4_BLOCK_SIZE) {
+                candle_core::bail!(
+                    "GGUF MXFP4 tensor `{name}` last dimension {last} is not divisible by {MXFP4_BLOCK_SIZE}"
+                );
+            }
             let shape = info.shape();
             if shape.len() != 3
                 || shape[0] != num_experts
@@ -142,7 +155,6 @@ impl MxFp4StreamingExpertLayer {
             );
         }
 
-        let info = self.archive.tensor_info(name)?;
         let data = self.archive.tensor_data(name)?.bytes();
         let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row
