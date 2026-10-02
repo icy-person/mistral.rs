@@ -1119,18 +1119,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                             return;
                         }
 
-                        if route_count == 1 {
-                            let x_offset = route_x_offsets[0];
-                            let x_row = &x_data[x_offset..x_offset + self.in_dim];
-                            accs[0] += Self::dot_streamed_row(
-                                x_row,
-                                expert,
-                                row,
-                                kernel,
-                            );
-                            return;
-                        }
-
                         let row_start = row * row_bytes;
                         for block_idx in 0..blocks_per_row {
                             let block_start =
