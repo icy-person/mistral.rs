@@ -1683,6 +1683,55 @@ mod tests {
     }
 
     #[test]
+    fn gguf_mxfp4_bytes_repack_split_half_layout() -> Result<()> {
+        let mut block = vec![127u8];
+        for j in 0..(MXFP4_BLOCK_SIZE / 2) {
+            // element j uses the low nibble; element j+16 uses the high nibble.
+            let lo = j as u8;
+            let hi = (15 - j) as u8;
+            block.push(lo | (hi << 4));
+        }
+
+        let layer = MXFP4Layer::from_gguf_bytes(
+            &block,
+            1,
+            MXFP4_BLOCK_SIZE,
+            None,
+            &Device::Cpu,
+        )?;
+        let actual = layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let expected_values = (0..16)
+            .map(|j| match j {
+                0 => 0.0,
+                1 => 0.5,
+                2 => 1.0,
+                3 => 1.5,
+                4 => 2.0,
+                5 => 3.0,
+                6 => 4.0,
+                7 => 6.0,
+                _ => j as f32,
+            })
+            .chain((0..16).map(|j| {
+                let nibble = 15 - j;
+                match nibble {
+                    8 => -0.0,
+                    9 => -0.5,
+                    10 => -1.0,
+                    11 => -1.5,
+                    12 => -2.0,
+                    13 => -3.0,
+                    14 => -4.0,
+                    _ => -6.0,
+                }
+            }))
+            .collect::<Vec<_>>();
+        let expected = Tensor::from_vec(expected_values, (1, MXFP4_BLOCK_SIZE), &Device::Cpu)?;
+        assert_close(&actual, &expected)?;
+        Ok(())
+    }
+
+    #[test]
     fn stacked_mxfp4_requantizes_to_ggml_with_bias() -> Result<()> {
         let layer = stacked_test_layer()?;
         let (input, indices) = stacked_test_inputs()?;
