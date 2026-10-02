@@ -2386,7 +2386,7 @@ pub fn try_fused_gemv_shared_lhs_cpu(
     xs: &Tensor,
     ws: &[&dyn QuantMethod],
 ) -> Result<Option<Vec<Tensor>>> {
-    if !xs.device().is_cpu() || xs.dtype() != DType::F32 {
+    if !xs.device().is_cpu() {
         return Ok(None);
     }
     if ws.iter().any(|w| w.has_bias()) {
@@ -2399,8 +2399,18 @@ pub fn try_fused_gemv_shared_lhs_cpu(
         };
         qs.push(q);
     }
-    let refs: Vec<&candle_core::quantized::QTensor> = qs.iter().map(|a| a.as_ref()).collect();
-    candle_core::quantized::QTensor::gemv_fused_shared_lhs(&refs, xs)
+
+    // QTensor::gemv_fused_shared_lhs consumes F32 activations. Convert once here so
+    // CPU Q/K/V (and other shared-LHS projections) do not repeat BF16/F16 -> F32
+    // conversion and packing independently for every projection.
+    let xs_f32 = if xs.dtype() == DType::F32 {
+        xs.clone()
+    } else {
+        xs.to_dtype(DType::F32)?
+    };
+    let refs: Vec<&candle_core::quantized::QTensor> =
+        qs.iter().map(|a| a.as_ref()).collect();
+    candle_core::quantized::QTensor::gemv_fused_shared_lhs(&refs, &xs_f32)
 }
 
 #[cfg(feature = "cuda")]
