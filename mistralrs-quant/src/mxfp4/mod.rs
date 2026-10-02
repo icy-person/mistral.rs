@@ -332,7 +332,7 @@ impl MxFp4StreamingExpertLayer {
         let (lo1, hi1) = unpack8(packed.add(8));
 
         let s = raw_expert[block_start] as u32;
-        if (2..=253).contains(&s) {
+        if (2..=252).contains(&s) {
             let scale_offset = _mm256_set1_epi32((s as i32) - 2);
             [
                 decode8_normal_e8m0(lo0, scale_offset),
