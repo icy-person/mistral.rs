@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
@@ -286,7 +286,8 @@ struct Stats {
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
-    queue: SyncSender<ReadJob>,
+    queues: Vec<SyncSender<ReadJob>>,
+    next_queue: AtomicUsize,
     paths: Vec<PathBuf>,
     config: MxFp4StreamConfig,
     budget_bytes: usize,
@@ -301,9 +302,8 @@ impl MxFp4StreamCache {
             .iter()
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
-        let queue_size = config.io_threads.saturating_mul(8).max(8);
-        let (queue, receiver) = mpsc::sync_channel::<ReadJob>(queue_size);
-        let receiver = Arc::new(Mutex::new(receiver));
+        let queue_size = 8usize;
+        let mut queues = Vec::with_capacity(config.io_threads);
 
         let cache = Arc::new(Self {
             inner: Mutex::new(CacheInner {
@@ -311,7 +311,8 @@ impl MxFp4StreamCache {
                 used_bytes: 0,
                 clock: 0,
             }),
-            queue,
+            queues: Vec::new(),
+            next_queue: AtomicUsize::new(0),
             paths: paths.clone(),
             budget_bytes: config.cache_budget_bytes(),
             config,
@@ -319,7 +320,8 @@ impl MxFp4StreamCache {
         });
 
         for worker_id in 0..config.io_threads {
-            let receiver = receiver.clone();
+            let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
+            queues.push(queue_tx);
             let worker_paths = paths.clone();
             let want_direct = config.o_direct;
             let want_mmap = config.mmap;
@@ -336,14 +338,7 @@ impl MxFp4StreamCache {
                         }
                     };
 
-                    loop {
-                        let job = match receiver.lock() {
-                            Ok(lock) => lock.recv(),
-                            Err(_) => return,
-                        };
-                        let Ok(job) = job else {
-                            return;
-                        };
+                    while let Ok(job) = queue_rx.recv() {
                         let Some(file) = files.normal.get(job.shard) else {
                             let _ = job.reply.send(Err(io::Error::new(
                                 io::ErrorKind::InvalidInput,
@@ -365,9 +360,13 @@ impl MxFp4StreamCache {
                         let _ = job.reply.send(result);
                     }
                 })
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to start MXFP4 I/O worker: {err}")))?;
+                .map_err(|err| io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to start MXFP4 I/O worker: {err}"),
+                ))?;
         }
 
+        cache.queues = queues;
         Ok(cache)
     }
 
@@ -463,7 +462,10 @@ impl MxFp4StreamCache {
         }
         let (tx, rx) = mpsc::sync_channel(1);
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
-        self.queue
+        let worker = self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len().max(1);
+        self.queues
+            .get(worker)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "MXFP4 I/O workers stopped"))?
             .send(ReadJob {
                 shard: range.shard,
                 offset: range.offset,
@@ -471,7 +473,7 @@ impl MxFp4StreamCache {
                 file_len: range.file_len,
                 reply: tx,
             })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MXFP4 I/O workers stopped"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MXFP4 I/O worker stopped"))?;
         Ok(rx)
     }
 
