@@ -275,7 +275,10 @@ impl MxFp4StreamingExpertLayer {
                 _mm256_setr_ps(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
                 idx,
             );
-            let sign = _mm256_castsi256_ps(_mm256_slli_epi32(nibbles, 28));
+            let sign = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_and_si256(nibbles, _mm256_set1_epi32(8)),
+                28,
+            ));
             _mm256_xor_ps(_mm256_mul_ps(magnitude, scale), sign)
         }
 
