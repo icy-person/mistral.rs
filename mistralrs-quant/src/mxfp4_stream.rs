@@ -640,7 +640,7 @@ impl MxFp4StreamCache {
             misses,
             hit_rate * 100.0,
             reads,
-            bytes / MIB,
+            bytes / (MIB as u64),
             evictions,
             self.config.io_threads,
             self.config.overlap,
