@@ -3,6 +3,7 @@ name: Linux CLI
 on:
   push:
     branches:
+      - master
       - linux-cli-only
   pull_request:
     branches:
