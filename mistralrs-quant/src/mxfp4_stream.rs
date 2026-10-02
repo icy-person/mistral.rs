@@ -13,6 +13,8 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -140,18 +142,21 @@ pub(crate) struct MxFp4StreamRange {
     pub file_len: usize,
 }
 
+#[derive(Debug)]
 struct CacheEntry {
     data: Arc<Vec<u8>>,
     bytes: usize,
     last_used: u64,
 }
 
+#[derive(Debug)]
 struct CacheInner {
     entries: HashMap<MxFp4StreamKey, CacheEntry>,
     used_bytes: usize,
     clock: u64,
 }
 
+#[derive(Debug)]
 struct ReadJob {
     path: PathBuf,
     offset: u64,
@@ -166,7 +171,7 @@ pub(crate) enum MxFp4StreamHandle {
     Pending(Receiver<io::Result<Vec<u8>>>),
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Stats {
     hits: AtomicU64,
     misses: AtomicU64,
@@ -242,7 +247,7 @@ impl MxFp4StreamCache {
         self.config.overlap
     }
 
-    fn lookup(&self, key: MxFp4StreamKey) -> Option<Arc<Vec<u8>>> {
+    fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<Vec<u8>>> {
         let mut guard = self.inner.lock().ok()?;
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
@@ -317,7 +322,7 @@ impl MxFp4StreamCache {
         key: MxFp4StreamKey,
         range: MxFp4StreamRange,
     ) -> crate::Result<Arc<Vec<u8>>> {
-        if let Some(data) = self.lookup(key) {
+        if let Some(data) = self.lookup(&key) {
             return Ok(data);
         }
         let rx = self.submit(range)?;
@@ -337,7 +342,7 @@ impl MxFp4StreamCache {
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
     ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
         let mut result = HashMap::with_capacity(requests.len());
-        for &(key, range) in requests {
+        for (key, range) in requests.iter().cloned() {
             if let Some(data) = self.lookup(key) {
                 result.insert(key, MxFp4StreamHandle::Ready(data));
             } else {
@@ -403,7 +408,7 @@ impl MxFp4StreamCache {
             misses,
             hit_rate * 100.0,
             reads,
-            bytes / MIB,
+            bytes / MIB as u64,
             evictions,
             self.config.io_threads,
             self.config.overlap,
