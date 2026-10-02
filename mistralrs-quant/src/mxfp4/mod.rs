@@ -209,7 +209,16 @@ impl MxFp4StreamingExpertLayer {
             }
         }
 
-        output[output_row * output_rows + out_row_offset + row] += acc;
+        // out_row_offset is already the final output column. For
+        // interleaved gate/up tensors it is row * 2 + component; adding
+        // row again would skew every row and can index one element past the
+        // route row at the end of the projection.
+        let output_index = output_row
+            .checked_mul(output_rows)
+            .and_then(|base| base.checked_add(out_row_offset))
+            .expect("GPT-OSS MXFP4 output index overflow");
+        debug_assert!(output_index < output.len());
+        output[output_index] += acc;
     }
 }
 
