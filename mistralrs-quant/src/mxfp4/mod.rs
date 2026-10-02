@@ -1,9 +1,11 @@
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::{collections::HashMap, sync::{atomic::AtomicUsize, Arc}};
 
 use candle_core::{DType, Device, Result, Storage, Tensor};
+use rayon::prelude::*;
 use safetensors::tensor::Dtype;
 
 use crate::uqff::{UqffHeaderMatch, UqffLayerHeaderView};
+use crate::mxfp4_stream::{MxFp4StreamCache, MxFp4StreamKey, MxFp4StreamRange};
 use crate::{
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UqffReader, UqffTensor,
@@ -37,8 +39,9 @@ pub struct MXFP4Layer {
 
 /// File-backed GPT-OSS MXFP4 expert projection.
 ///
-/// The packed expert bank remains in the GGUF mmap. gather_forward_raw decodes
-/// only the routed expert rows into a temporary output buffer.
+/// The packed expert bank remains file-backed in GGUF. gather_forward_raw loads
+/// only routed experts through the shared bounded stream cache and decodes them
+/// into a temporary output buffer.
 #[derive(Debug)]
 pub struct MxFp4StreamingExpertLayer {
     archive: Arc<crate::GgufArchive>,
@@ -48,6 +51,7 @@ pub struct MxFp4StreamingExpertLayer {
     in_dim: usize,
     out_dim: usize,
     bias: Option<Tensor>,
+    cache: Arc<MxFp4StreamCache>,
 }
 
 impl MxFp4StreamingExpertLayer {
@@ -58,6 +62,7 @@ impl MxFp4StreamingExpertLayer {
         in_dim: usize,
         out_dim: usize,
         bias: Option<Tensor>,
+        cache: Arc<MxFp4StreamCache>,
     ) -> Result<Self> {
         if raw_weights.is_empty() || raw_weights.len() > 2 {
             candle_core::bail!("GPT-OSS MXFP4 streaming expects one or two raw expert tensors");
@@ -139,15 +144,20 @@ impl MxFp4StreamingExpertLayer {
             in_dim,
             out_dim,
             bias,
+            cache,
         })
     }
 
-    fn raw_expert_bytes(&self, weight_idx: usize, expert_idx: usize) -> Result<&[u8]> {
+
+    fn raw_expert_range(
+        &self,
+        weight_idx: usize,
+        expert_idx: usize,
+    ) -> Result<MxFp4StreamRange> {
         let name = self
             .raw_weights
             .get(weight_idx)
             .ok_or_else(|| candle_core::Error::Msg("invalid streamed MXFP4 weight index".into()))?;
-
         if expert_idx >= self.num_experts {
             candle_core::bail!(
                 "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
@@ -155,38 +165,47 @@ impl MxFp4StreamingExpertLayer {
             );
         }
 
-        let data = self.archive.tensor_data(name)?.bytes();
-        let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
-        let row_bytes = blocks_per_row
-            .checked_mul(MXFP4_BLOCK_SIZE / 2 + 1)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 row byte-size overflow".into()))?;
-        let expert_bytes = self
-            .component_out_dim
-            .checked_mul(row_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert byte-size overflow".into()))?;
-        let start = expert_idx
-            .checked_mul(expert_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
-        let end = start
-            .checked_add(expert_bytes)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert range overflow".into()))?;
-
-        if end > data.len() {
-            candle_core::bail!(
-                "GPT-OSS MXFP4 streamed expert range {start}..{end} exceeds tensor {name}"
-            );
+        let info = self.archive.tensor_info(name)?;
+        let data_len = info.byte_len().ok_or_else(|| {
+            candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no exact byte range"))
+        })?;
+        let expert_len = data_len
+            .checked_div(self.num_experts)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert count is invalid".into()))?;
+        if expert_len == 0 || expert_len.saturating_mul(self.num_experts) != data_len {
+            candle_core::bail!("GPT-OSS MXFP4 tensor {name} has an invalid expert byte layout");
         }
-        Ok(&data[start..end])
+        let base = info
+            .data_range()
+            .ok_or_else(|| candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no data range")))?
+            .start;
+        let offset = u64::try_from(
+            base.checked_add(
+                expert_idx.checked_mul(expert_len).ok_or_else(|| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into())
+                })?
+            ).ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?
+        ).map_err(|_| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset exceeds u64".into()))?;
+        let file_len = self
+            .archive
+            .shards()
+            .get(info.shard_index())
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 shard index out of range".into()))?
+            .file_len();
+        Ok(MxFp4StreamRange {
+            shard: info.shard_index(),
+            offset,
+            len: expert_len,
+            file_len,
+        })
     }
 
     fn dot_row(
         x: &[f32],
         raw_expert: &[u8],
         row: usize,
-        out_row_offset: usize,
-        output: &mut [f32],
-        output_row: usize,
-        output_rows: usize,
+        out_row: &mut [f32],
+        out_col: usize,
     ) {
         let blocks_per_row = x.len() / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
@@ -201,15 +220,18 @@ impl MxFp4StreamingExpertLayer {
             let packed = &block[1..];
 
             let col_start = block_idx * MXFP4_BLOCK_SIZE;
+            // GGML MXFP4 uses split-half packing: low nibbles are elements 0..15,
+            // high nibbles are elements 16..31.
             for byte_idx in 0..MXFP4_BLOCK_SIZE / 2 {
                 let packed_byte = packed[byte_idx];
-                acc += x[col_start + byte_idx * 2] * dequant[(packed_byte & 0x0f) as usize];
-                acc += x[col_start + byte_idx * 2 + 1]
+                acc += x[col_start + byte_idx]
+                    * dequant[(packed_byte & 0x0f) as usize];
+                acc += x[col_start + MXFP4_BLOCK_SIZE / 2 + byte_idx]
                     * dequant[(packed_byte >> 4) as usize];
             }
         }
 
-        output[output_row * output_rows + out_row_offset + row] += acc;
+        out_row[out_col] += acc;
     }
 }
 
@@ -255,12 +277,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 (*tokens, index_dims[1], *cols, false)
             }
             [tokens, x_topk, cols] => {
-                if *tokens != index_dims[0] || *x_topk != index_dims[1] {
+                // The routed MoE contract allows either one shared input row per
+                // token ([tokens, 1, hidden]) or one input row per routed slot
+                // ([tokens, topk, hidden]).  GPT-OSS passes the former while
+                // topk_ids has one expert index for every route.
+                if *tokens != index_dims[0] {
                     candle_core::bail!(
-                        "GPT-OSS MXFP4 streaming input and index shapes do not agree"
+                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
                     );
                 }
-                (*tokens, *x_topk, *cols, true)
+                if *x_topk != 1 && *x_topk != index_dims[1] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input route dimension {} does not match top-k {}",
+                        x_topk,
+                        index_dims[1]
+                    );
+                }
+                (*tokens, index_dims[1], *cols, *x_topk != 1)
             }
             _ => candle_core::bail!(
                 "GPT-OSS MXFP4 streaming expects rank-2 or rank-3 input, got rank {}",
@@ -280,56 +313,159 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         let indices_cpu = indices.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
         let indices_data = indices_cpu.flatten_all()?.to_vec1::<u32>()?;
 
-        let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+        let mut routes_by_expert = HashMap::<usize, Vec<usize>>::new();
+        for (route, &expert) in indices_data.iter().enumerate() {
+            routes_by_expert
+                .entry(expert as usize)
+                .or_default()
+                .push(route);
+        }
+        let mut experts = routes_by_expert.keys().copied().collect::<Vec<_>>();
+        experts.sort_unstable();
 
-        for token_idx in 0..num_tokens {
-            for slot_idx in 0..topk {
-                let expert_idx = indices_data[token_idx * topk + slot_idx] as usize;
-                if expert_idx >= self.num_experts {
-                    candle_core::bail!(
-                        "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
-                        self.num_experts
-                    );
-                }
-
-                let route_row = token_idx * topk + slot_idx;
-                let x_offset = if x_has_topk {
-                    route_row * self.in_dim
-                } else {
-                    token_idx * self.in_dim
-                };
-                let x_row = &x_data[x_offset..x_offset + self.in_dim];
-
-                for component in 0..self.raw_weights.len() {
-                    let expert = self.raw_expert_bytes(component, expert_idx)?;
-                    for row in 0..self.component_out_dim {
-                        // Native GPT-OSS gate/up tensors are interleaved along the
-                        // output dimension: gate0, up0, gate1, up1, ...
-                        let out_index = if self.raw_weights.len() == 2 {
-                            row * 2 + component
-                        } else {
-                            row
-                        };
-                        Self::dot_row(
-                            x_row,
-                            expert,
-                            row,
-                            out_index,
-                            &mut output,
-                            route_row,
-                            self.out_dim,
-                        );
-                    }
-                }
+        let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
+        for weight_idx in 0..self.raw_weights.len() {
+            for &expert_idx in &experts {
+                let range = self.raw_expert_range(weight_idx, expert_idx)?;
+                requests.push((
+                    MxFp4StreamKey {
+                        source: self.raw_weights[weight_idx].clone(),
+                        expert_index: expert_idx,
+                    },
+                    range,
+                ));
             }
         }
 
-        let mut result =
-            Tensor::from_vec(output, (num_tokens, topk, self.out_dim), &Device::Cpu)?;
-        if let Some(bias) = &self.bias {
-            result = result.broadcast_add(bias)?;
+        let mut pending = if self.cache.overlap() {
+            Some(self.cache.prefetch(&requests)?)
+        } else {
+            None
+        };
+        let mut expert_data = HashMap::with_capacity(requests.len());
+        if pending.is_none() {
+            for (key, range) in requests {
+                expert_data.insert(key.clone(), self.cache.load(&key, range)?);
+            }
         }
-        result = result.to_device(x.device())?.to_dtype(x.dtype())?;
+
+        let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+
+        if self.raw_weights.len() > 1 {
+            // Gate and up are independent projections. While we compute one projection,
+            // the worker pool can continue reading the other projection's experts.
+            for component in 0..self.raw_weights.len() {
+                for &expert_idx in &experts {
+                    let key = MxFp4StreamKey {
+                        source: self.raw_weights[component].clone(),
+                        expert_index: expert_idx,
+                    };
+                    if let Some(pending_map) = pending.as_mut() {
+                        if !expert_data.contains_key(&key) {
+                            let handle = pending_map.remove(&key).ok_or_else(|| {
+                                candle_core::Error::Msg(
+                                    "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
+                                )
+                            })?;
+                            let data = self.cache.resolve(&key, handle)?;
+                            expert_data.insert(key.clone(), data);
+                        }
+                    }
+                    let expert = expert_data.get(&key).ok_or_else(|| {
+                        candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                    })?;
+
+                    output
+                        .par_chunks_mut(self.out_dim)
+                        .enumerate()
+                        .for_each(|(route_row, out_row)| {
+                            if indices_data[route_row] as usize != expert_idx {
+                                return;
+                            }
+                            let token_idx = route_row / topk;
+                            let x_offset = if x_has_topk {
+                                route_row * self.in_dim
+                            } else {
+                                token_idx * self.in_dim
+                            };
+                            let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                            for row in 0..self.component_out_dim {
+                                let out_index = row * 2 + component;
+                                Self::dot_row(x_row, expert, row, out_row, out_index);
+                            }
+                        });
+                }
+            }
+        } else {
+            // Down projection is a single component and fills the whole output.
+            let component = 0usize;
+            for &expert_idx in &experts {
+                let key = MxFp4StreamKey {
+                    source: self.raw_weights[component].clone(),
+                    expert_index: expert_idx,
+                };
+                if let Some(pending_map) = pending.as_mut() {
+                    if !expert_data.contains_key(&key) {
+                        let handle = pending_map.remove(&key).ok_or_else(|| {
+                            candle_core::Error::Msg(
+                                "GPT-OSS MXFP4 streamed expert request was not scheduled".to_string(),
+                            )
+                        })?;
+                        let data = self.cache.resolve(&key, handle)?;
+                        expert_data.insert(key.clone(), data);
+                    }
+                }
+                let expert = expert_data.get(&key).ok_or_else(|| {
+                    candle_core::Error::Msg("GPT-OSS MXFP4 streamed expert was not loaded".into())
+                })?;
+
+                output
+                    .par_chunks_mut(self.out_dim)
+                    .enumerate()
+                    .for_each(|(route_row, out_row)| {
+                        if indices_data[route_row] as usize != expert_idx {
+                            return;
+                        }
+                        let x_row =
+                            &x_data[route_row * self.in_dim..(route_row + 1) * self.in_dim];
+                        for row in 0..self.component_out_dim {
+                            Self::dot_row(x_row, expert, row, out_row, row);
+                        }
+                    });
+            }
+        }
+
+        if let Some(bias) = &self.bias {
+            let bias_data = bias
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let expected = self.num_experts * self.out_dim;
+            if bias_data.len() != expected {
+                candle_core::bail!(
+                    "GPT-OSS MXFP4 streaming bias has {} elements, expected {}",
+                    bias_data.len(),
+                    expected
+                );
+            }
+            output
+                .par_chunks_mut(self.out_dim)
+                .enumerate()
+                .for_each(|(route_row, out_row)| {
+                    let expert_idx = indices_data[route_row] as usize;
+                    let bias_offset = expert_idx * self.out_dim;
+                    for col in 0..self.out_dim {
+                        out_row[col] += bias_data[bias_offset + col];
+                    }
+                });
+        }
+
+        self.cache.log_stats();
+
+        let result =
+            Tensor::from_vec(output, (num_tokens, topk, self.out_dim), &Device::Cpu)?;
+        let result = result.to_device(x.device())?.to_dtype(x.dtype())?;
         Ok(result)
     }
 
@@ -680,8 +816,9 @@ impl MXFP4Layer {
     /// Construct one logical [rows, cols] MXFP4 matrix from canonical GGUF bytes.
     ///
     /// GGUF dtype 39 stores each 32-value block as one E8M0 scale byte followed by 16 packed
-    /// FP4 bytes. Candle uses the same low-nibble/high-nibble ordering, so the raw payload can
-    /// be copied into its packed [rows, cols/2] representation without a dequantize/requantize step.
+    /// FP4 bytes in GGML's split-half layout: byte j low nibble is element j and high nibble
+    /// is element j + 16. Candle's packed representation pairs adjacent elements in each byte,
+    /// so the raw payload must be losslessly repacked.
     pub fn from_gguf_bytes(
         data: &[u8],
         rows: usize,
@@ -719,9 +856,24 @@ impl MXFP4Layer {
             for block in 0..blocks_per_row {
                 let start = block * (1 + packed_bytes_per_block);
                 scales.push(row_data[start]);
-                blocks.extend_from_slice(
-                    &row_data[start + 1..start + 1 + packed_bytes_per_block],
-                );
+                let native = &row_data[start + 1..start + 1 + packed_bytes_per_block];
+
+                // GGML MXFP4 is split-half:
+                //   native[j].lo -> element j
+                //   native[j].hi -> element j + 16.
+                // Repack to Candle's adjacent-pair layout.
+                for pair in 0..packed_bytes_per_block {
+                    let elem0 = pair * 2;
+                    let elem1 = elem0 + 1;
+                    let nibble = |element: usize| -> u8 {
+                        if element < 16 {
+                            native[element] & 0x0f
+                        } else {
+                            native[element - 16] >> 4
+                        }
+                    };
+                    blocks.push(nibble(elem0) | (nibble(elem1) << 4));
+                }
             }
         }
 
@@ -997,7 +1149,13 @@ impl MXFP4Layer {
         ];
         let mut s = 0u32;
         while s < 256 {
-            let scale_factor = f32::from_bits(s << 23);
+            // GGML E8M0 uses the special encodings x=0,1 for the subnormal
+            // floor, then regular IEEE-754 exponents for x>=2.
+            let scale_factor = if s < 2 {
+                f32::from_bits(0x0020_0000u32 << s)
+            } else {
+                f32::from_bits((s - 1) << 23)
+            };
             let mut n = 0;
             while n < 16 {
                 lut[s as usize][n] = fp4[n] * scale_factor;
@@ -1443,6 +1601,28 @@ mod tests {
         assert!(MXFP4Layer::device_supported(&Device::Cpu));
     }
 
+    #[test]
+    fn streaming_dot_row_uses_output_column_once() -> Result<()> {
+        let x = vec![1.0f32; MXFP4_BLOCK_SIZE];
+        // Four output rows, one 32-value MXFP4 block per row: 1 scale byte + 16 packed bytes.
+        let raw_expert = vec![127u8; 4 * (MXFP4_BLOCK_SIZE / 2 + 1)];
+        let mut output = vec![0.0f32; 4];
+
+        // This targets the last output column. The helper now receives the
+        // route-local output row, so the column offset is applied exactly once.
+        MxFp4StreamingExpertLayer::dot_row(
+            &x,
+            &raw_expert,
+            3,
+            &mut output,
+            3,
+        );
+
+        assert!(output[3].is_finite());
+        Ok(())
+    }
+
+
     use super::*;
 
     const TEST_HIDDEN_SIZE: usize = 64;
@@ -1583,6 +1763,45 @@ mod tests {
             output.flatten_all()?.to_vec1::<half::bf16>()?,
             expected.flatten_all()?.to_vec1::<half::bf16>()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gguf_mxfp4_bytes_repack_split_half_layout() -> Result<()> {
+        let mut block = vec![127u8];
+        for j in 0..(MXFP4_BLOCK_SIZE / 2) {
+            // element j uses the low nibble; element j+16 uses the high nibble.
+            let lo = j as u8;
+            let hi = (15 - j) as u8;
+            block.push(lo | (hi << 4));
+        }
+
+        let layer = MXFP4Layer::from_gguf_bytes(
+            &block,
+            1,
+            MXFP4_BLOCK_SIZE,
+            None,
+            &Device::Cpu,
+        )?;
+        let actual = layer.dequantize_w()?.to_dtype(DType::F32)?;
+        let fp4 = [
+            0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let expected_values = (0..16)
+            .map(|j| fp4[j])
+            .chain((0..16).map(|j| fp4[15 - j]))
+            .collect::<Vec<_>>();
+        let expected = Tensor::from_vec(expected_values, (1, MXFP4_BLOCK_SIZE), &Device::Cpu)?;
+        assert_close(&actual, &expected)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mxfp4_e8m0_endpoints_match_ggml() -> Result<()> {
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[0][2], 2.0f32.powi(-126));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[1][2], 2.0f32.powi(-125));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[255][2], 2.0f32.powi(127));
         Ok(())
     }
 

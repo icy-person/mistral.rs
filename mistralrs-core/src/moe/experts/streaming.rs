@@ -930,7 +930,27 @@ impl StreamedProjection {
         input_is_routed: bool,
         device: &Device,
     ) -> Result<Tensor> {
-        let mut output = Tensor::zeros((x.dim(0)?, self.rows), x.dtype(), device)?;
+        // Every routed slot needs its own output row. For gate/up, the input is
+        // token-major and is selected repeatedly according to token_indices; for
+        // down, x is already route-major and routes identify those rows. In both
+        // cases the projected rows must be written to their global route position
+        // rather than accumulated into a token-sized output buffer.
+        let total_routes = plan
+            .entries
+            .iter()
+            .map(|entry| entry.routes.len())
+            .sum::<usize>();
+        if total_routes != x.dim(0)? {
+            if input_is_routed {
+                candle_core::bail!(
+                    "streamed MoE routed input has {} rows, but routing plan has {} routes",
+                    x.dim(0)?,
+                    total_routes
+                );
+            }
+        }
+
+        let mut output = Tensor::zeros((total_routes, self.rows), x.dtype(), device)?;
 
         for entry in plan.entries {
             let pending = match entry.pending {
@@ -950,14 +970,15 @@ impl StreamedProjection {
                 input.len(),
                 device,
             )?;
+
+            let selected = x.index_select(&input_indices, 0)?;
+            let projected = weight.forward(&selected)?;
+
             let output_indices = Tensor::from_vec(
                 entry.routes.iter().map(|v| *v as u32).collect::<Vec<_>>(),
                 entry.routes.len(),
                 device,
             )?;
-
-            let selected = x.index_select(&input_indices, 0)?;
-            let projected = weight.forward(&selected)?;
             output = output.index_add(&output_indices, &projected, 0)?;
         }
 

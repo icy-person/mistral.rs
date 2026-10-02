@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::{Arc, Mutex}};
 
 use candle_core::{quantized::GgmlDType, DType, Device, Error, Result, Shape, Tensor};
 use candle_nn::{var_builder::SimpleBackend, Linear};
@@ -7,6 +7,7 @@ use super::{
     archive::{qtensor_from_gguf_data, GgufArchive, GgufEndian},
     GgufMatMul,
 };
+use crate::mxfp4_stream::MxFp4StreamCache;
 use crate::{
     bias_shard, block_pack_factor, shard_range, slice_blocked_data, BiasShard, QuantMethod,
     QuantMethodConfig, QuantizedWeightSource, Shard, ShardedSafeTensors, ShardedVarBuilder,
@@ -272,6 +273,7 @@ pub struct GgufWeightSource {
     shapes: HashMap<String, Vec<usize>>,
     output_dtypes: HashMap<String, DType>,
     dtype: DType,
+    mxfp4_stream_cache: Mutex<Option<Arc<MxFp4StreamCache>>>,
 }
 
 struct PackedBinding {
@@ -332,6 +334,7 @@ impl GgufWeightSource {
             shapes,
             output_dtypes,
             dtype,
+            mxfp4_stream_cache: Mutex::new(None),
         })
     }
 
@@ -832,7 +835,35 @@ impl QuantizedWeightSource for GgufWeightSource {
             component_out_dim
         };
 
-        let bias = self.load_bias(key, &Device::Cpu, None, 3)?;
+        // GPT-OSS binds its native MXFP4 expert biases under projection-specific names
+        // (gate_up_proj_bias / down_proj_bias) because there is no native .bias tensor
+        // for the synthesized canonical projection.
+        let bias_key = match projection {
+            "gate_up_proj" => format!("model.layers.{layer}.mlp.experts.gate_up_proj_bias"),
+            "down_proj" => format!("model.layers.{layer}.mlp.experts.down_proj_bias"),
+            _ => unreachable!("projection was validated above"),
+        };
+        let bias = if self.bindings.contains_key(&bias_key) {
+            Some(self.materialize_tensor(&bias_key, &Device::Cpu)?)
+        } else {
+            None
+        };
+
+        let cache = {
+            let mut guard = self
+                .mxfp4_stream_cache
+                .lock()
+                .map_err(|_| Error::msg("GPT-OSS MXFP4 stream cache lock poisoned"))?;
+            if let Some(cache) = guard.as_ref() {
+                cache.clone()
+            } else {
+                let cache = MxFp4StreamCache::new(&self.archive)
+                    .map_err(Error::wrap)?;
+                *guard = Some(cache.clone());
+                cache
+            }
+        };
+
         let layer = MxFp4StreamingExpertLayer::from_gguf(
             self.archive.clone(),
             raw_names,
@@ -840,6 +871,7 @@ impl QuantizedWeightSource for GgufWeightSource {
             in_dim,
             out_dim,
             bias,
+            cache,
         )?;
 
         Ok(Some(Arc::new(layer)))

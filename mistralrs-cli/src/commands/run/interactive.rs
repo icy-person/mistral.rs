@@ -1004,7 +1004,10 @@ async fn text_interactive_mode(
             files: None,
             input_files: Vec::new(),
         }));
-        sender.send(req).await.unwrap();
+        if let Err(error) = sender.send(req).await {
+            error!("request channel closed before inference could start: {error}");
+            break 'outer;
+        }
         let start_ttft = Instant::now();
         let (assistant_output, first_token_duration, last_usage) =
             match stream_assistant_response(&mut rx, start_ttft).await {
