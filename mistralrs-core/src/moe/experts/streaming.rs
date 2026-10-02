@@ -11,7 +11,7 @@ use mistralrs_quant::{GgufArchive, GgufMatMul, MXFP4Layer, QuantMethod};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -679,7 +679,6 @@ impl PendingExpert {
         };
 
         let bias = bias
-            .bias
             .as_ref()
             .map(|bias| {
                 let bias = bias.narrow(0, key.expert, 1)?;
@@ -823,7 +822,7 @@ impl StreamedProjection {
             source: source.to_owned(),
             shard,
             tensor_offset,
-            file_len: shard_info.file_len(),
+            file_len: shard_file_len,
             expert_count,
             expert_bytes,
             rows,
@@ -868,11 +867,15 @@ impl StreamedProjection {
             });
         }
 
+        let expert_offset = expert.checked_mul(self.expert_bytes).ok_or_else(|| {
+            candle_core::Error::Msg("MoE expert offset overflow".to_string())
+        })?;
+        let expert_offset = u64::try_from(expert_offset).map_err(|_| {
+            candle_core::Error::Msg("MoE expert offset does not fit in u64".to_string())
+        })?;
         let offset = self
             .tensor_offset
-            .checked_add(expert.checked_mul(self.expert_bytes).ok_or_else(|| {
-                candle_core::Error::Msg("MoE expert offset overflow".to_string())
-            })?)
+            .checked_add(expert_offset)
             .ok_or_else(|| candle_core::Error::Msg("MoE expert offset overflow".to_string()))?;
 
         let len = self
@@ -1107,7 +1110,7 @@ impl StreamedExpertsWeights {
         Ok(Some(Self { gate, up, down }))
     }
 
-    fn forward_impl(
+    pub(super) fn forward_impl(
         &self,
         forward: &super::forward::MoEForward,
         config: super::forward::MoEForwardConfig,
