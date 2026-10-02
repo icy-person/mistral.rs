@@ -893,6 +893,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
                     let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
                     let route_count = routes.len();
+
+                    if route_count == 1 {
+                        let route_row = routes[0];
+                        let x_offset = route_x_offsets[0];
+                        let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                        let out_row =
+                            &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                        out_row
+                            .par_chunks_mut(2)
+                            .enumerate()
+                            .for_each(|(row, pair)| {
+                                pair[component] +=
+                                    Self::dot_streamed_row(x_row, expert, row, kernel);
+                            });
+                        continue;
+                    }
+
                     let mut partial = vec![0f32; self.component_out_dim * route_count];
 
                     partial
@@ -1002,6 +1019,22 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 let blocks_per_row = self.in_dim / MXFP4_BLOCK_SIZE;
                 let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
                 let route_count = routes.len();
+
+                if route_count == 1 {
+                    let route_row = routes[0];
+                    let x_offset = route_x_offsets[0];
+                    let x_row = &x_data[x_offset..x_offset + self.in_dim];
+                    let out_row =
+                        &mut output[route_row * self.out_dim..(route_row + 1) * self.out_dim];
+                    out_row
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(row, value)| {
+                            *value += Self::dot_streamed_row(x_row, expert, row, kernel);
+                        });
+                    continue;
+                }
+
                 let mut partial = vec![0f32; self.component_out_dim * route_count];
 
                 partial
