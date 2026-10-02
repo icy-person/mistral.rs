@@ -4,12 +4,13 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_castps256_ps128,
-    _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps,
-    _mm256_i32gather_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_epi32,
-    _mm256_setzero_ps, _mm_add_ss, _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64,
-    _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16,
-    _mm_unpacklo_epi8,
+    __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+    _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cvtepu8_epi32,
+    _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_hadd_ps, _mm256_loadu_ps,
+    _mm256_mul_ps, _mm256_permutevar8x32_ps, _mm256_set1_epi16, _mm256_set1_epi32,
+    _mm256_set1_ps, _mm256_setzero_ps, _mm256_slli_epi32, _mm256_xor_ps, _mm_add_ss,
+    _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_packus_epi16, _mm_setzero_si128,
+    _mm_srli_epi16, _mm_unpacklo_epi8,
 };
 
 use candle_core::{DType, Device, Result, Storage, Tensor};
@@ -249,8 +250,9 @@ impl MxFp4StreamingExpertLayer {
         raw_expert: &[u8],
         block_start: usize,
     ) -> [__m256; 4] {
-        let packed = raw_expert.as_ptr().add(block_start + 1);
-
+        // GPT-OSS MXFP4 uses E2M1 nibbles. Decode the 4-bit magnitudes with an
+        // in-register AVX2 permutation instead of a random-access 4096-entry
+        // gather table. The sign bit is carried by nibble bit 3.
         #[inline(always)]
         unsafe fn unpack8(ptr: *const u8) -> (__m256i, __m256i) {
             let bytes: __m128i = _mm_loadl_epi64(ptr.cast());
@@ -265,20 +267,37 @@ impl MxFp4StreamingExpertLayer {
             )
         }
 
+        #[inline(always)]
+        unsafe fn decode8(nibbles: __m256i, scale: __m256) -> __m256 {
+            // |nibble| 0..7 selects the E2M1 magnitude; bit 3 supplies sign.
+            let idx = _mm256_and_si256(nibbles, _mm256_set1_epi32(7));
+            let magnitude = _mm256_permutevar8x32_ps(
+                _mm256_setr_ps(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0),
+                idx,
+            );
+            let sign = _mm256_castsi256_ps(_mm256_slli_epi32(nibbles, 28));
+            _mm256_xor_ps(_mm256_mul_ps(magnitude, scale), sign)
+        }
+
+        let packed = raw_expert.as_ptr().add(block_start + 1);
         let (lo0, hi0) = unpack8(packed);
         let (lo1, hi1) = unpack8(packed.add(8));
-        let scale_base = _mm256_set1_epi32((raw_expert[block_start] as i32) << 4);
 
-        let i0 = _mm256_add_epi32(lo0, scale_base);
-        let i1 = _mm256_add_epi32(lo1, scale_base);
-        let i2 = _mm256_add_epi32(hi0, scale_base);
-        let i3 = _mm256_add_epi32(hi1, scale_base);
+        // E8M0: x=0,1 are the special subnormal floor encodings; x>=2 maps
+        // directly to an IEEE-754 exponent field.
+        let s = raw_expert[block_start] as u32;
+        let scale_bits = if s < 2 {
+            0x0020_0000u32 << s
+        } else {
+            (s - 1) << 23
+        };
+        let scale = _mm256_set1_ps(f32::from_bits(scale_bits));
 
         [
-            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i0, 4),
-            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i1, 4),
-            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i2, 4),
-            _mm256_i32gather_ps(MXFP4Layer::DEQUANT_LUT_FLAT.as_ptr(), i3, 4),
+            decode8(lo0, scale),
+            decode8(lo1, scale),
+            decode8(hi0, scale),
+            decode8(hi1, scale),
         ]
     }
 
@@ -293,30 +312,28 @@ impl MxFp4StreamingExpertLayer {
     ) -> f32 {
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let row_start = row * row_bytes;
+        let mut weight_ptr = raw_expert.as_ptr().add(row * row_bytes);
+        let mut x_ptr = x.as_ptr();
 
         let mut a0 = _mm256_setzero_ps();
         let mut a1 = _mm256_setzero_ps();
         let mut a2 = _mm256_setzero_ps();
         let mut a3 = _mm256_setzero_ps();
 
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+        for _ in 0..blocks_per_row {
+            let block_start = weight_ptr.offset(0) as *const u8;
+            let w = Self::load_fused_weight_vectors_avx2(
+                std::slice::from_raw_parts(raw_expert.as_ptr(), raw_expert.len()),
+                block_start.offset_from(raw_expert.as_ptr()) as usize,
+            );
 
-            a0 = _mm256_add_ps(a0, _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start)), w[0]
-            ));
-            a1 = _mm256_add_ps(a1, _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 8)), w[1]
-            ));
-            a2 = _mm256_add_ps(a2, _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 16)), w[2]
-            ));
-            a3 = _mm256_add_ps(a3, _mm256_mul_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 24)), w[3]
-            ));
+            a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(x_ptr), w[0]));
+            a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(8)), w[1]));
+            a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(16)), w[2]));
+            a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(24)), w[3]));
+
+            weight_ptr = weight_ptr.add(MXFP4_BLOCK_SIZE / 2 + 1);
+            x_ptr = x_ptr.add(MXFP4_BLOCK_SIZE);
         }
 
         Self::hsum4(a0, a1, a2, a3)
@@ -333,30 +350,25 @@ impl MxFp4StreamingExpertLayer {
     ) -> f32 {
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let row_start = row * row_bytes;
+        let mut weight_ptr = raw_expert.as_ptr().add(row * row_bytes);
+        let mut x_ptr = x.as_ptr();
 
         let mut a0 = _mm256_setzero_ps();
         let mut a1 = _mm256_setzero_ps();
         let mut a2 = _mm256_setzero_ps();
         let mut a3 = _mm256_setzero_ps();
 
-        for block_idx in 0..blocks_per_row {
-            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
-            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
-            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+        for _ in 0..blocks_per_row {
+            let offset = weight_ptr.offset_from(raw_expert.as_ptr()) as usize;
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, offset);
 
-            a0 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start)), w[0], a0
-            );
-            a1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 8)), w[1], a1
-            );
-            a2 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 16)), w[2], a2
-            );
-            a3 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(x.as_ptr().add(x_start + 24)), w[3], a3
-            );
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr), w[0], a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(8)), w[1], a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(16)), w[2], a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(24)), w[3], a3);
+
+            weight_ptr = weight_ptr.add(MXFP4_BLOCK_SIZE / 2 + 1);
+            x_ptr = x_ptr.add(MXFP4_BLOCK_SIZE);
         }
 
         Self::hsum4(a0, a1, a2, a3)
@@ -377,6 +389,44 @@ impl MxFp4StreamingExpertLayer {
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
         let row_start = row * row_bytes;
 
+        if x_offsets.len() <= 4 {
+            let mut v0 = [_mm256_setzero_ps(); 4];
+            let mut v1 = [_mm256_setzero_ps(); 4];
+            let n = x_offsets.len();
+
+            for block_idx in 0..blocks_per_row {
+                let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+                let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                for (route_idx, &x_offset) in x_offsets.iter().enumerate() {
+                    let x = x_data.as_ptr().add(x_offset + x_start);
+                    v0[route_idx] = _mm256_add_ps(
+                        v0[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x), w[0]),
+                    );
+                    v0[route_idx] = _mm256_add_ps(
+                        v0[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(8)), w[1]),
+                    );
+                    v1[route_idx] = _mm256_add_ps(
+                        v1[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(16)), w[2]),
+                    );
+                    v1[route_idx] = _mm256_add_ps(
+                        v1[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(24)), w[3]),
+                    );
+                }
+            }
+
+            for route_idx in 0..n {
+                accs[route_idx] += Self::hsum2(v0[route_idx], v1[route_idx]);
+            }
+            return;
+        }
+
+        // For larger route groups, keep one weight decode shared across all routes.
         for block_idx in 0..blocks_per_row {
             let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
             let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
@@ -407,6 +457,39 @@ impl MxFp4StreamingExpertLayer {
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
         let row_start = row * row_bytes;
+
+        if x_offsets.len() <= 4 {
+            let mut lo = [_mm256_setzero_ps(); 4];
+            let mut hi = [_mm256_setzero_ps(); 4];
+            let n = x_offsets.len();
+
+            for block_idx in 0..blocks_per_row {
+                let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+                let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                for (route_idx, &x_offset) in x_offsets.iter().enumerate() {
+                    let x = x_data.as_ptr().add(x_offset + x_start);
+                    lo[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x), w[0], lo[route_idx]
+                    );
+                    lo[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(8)), w[1], lo[route_idx]
+                    );
+                    hi[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(16)), w[2], hi[route_idx]
+                    );
+                    hi[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(24)), w[3], hi[route_idx]
+                    );
+                }
+            }
+
+            for route_idx in 0..n {
+                accs[route_idx] += Self::hsum2(lo[route_idx], hi[route_idx]);
+            }
+            return;
+        }
 
         for block_idx in 0..blocks_per_row {
             let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
@@ -442,6 +525,17 @@ impl MxFp4StreamingExpertLayer {
             acc += x[i] * w[i];
         }
         acc
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn hsum2(a0: __m256, a1: __m256) -> f32 {
+        let sum = _mm256_add_ps(a0, a1);
+        let h1 = _mm256_hadd_ps(sum, sum);
+        let h2 = _mm256_hadd_ps(h1, h1);
+        let lo = _mm256_castps256_ps128(h2);
+        let hi = _mm256_extractf128_ps(h2, 1);
+        _mm_cvtss_f32(_mm_add_ss(lo, hi))
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1873,33 +1967,6 @@ impl MXFP4Layer {
             bias,
         }))
     }
-
-    /// Combined FP4 × E8M0 dequant table: `DEQUANT_LUT[scale][nibble]`.
-    /// For each of the 256 possible E8M0 scale values, stores the 16 possible
-    /// dequantized values (FP4_LUT[nibble] * 2^(scale - 127)).
-    /// This turns dequantization into a single table lookup per element.
-    const DEQUANT_LUT_FLAT: [f32; 4096] = {
-        let mut lut = [0.0f32; 4096];
-        let fp4: [f32; 16] = [
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-        ];
-        let mut s = 0u32;
-        while s < 256 {
-            let scale_factor = if s < 2 {
-                f32::from_bits(0x0020_0000u32 << s)
-            } else {
-                f32::from_bits((s - 1) << 23)
-            };
-            let mut n = 0;
-            while n < 16 {
-                lut[s as usize * 16 + n] = fp4[n] * scale_factor;
-                n += 1;
-            }
-            s += 1;
-        }
-        lut
-    };
 
     const DEQUANT_LUT: [[f32; 16]; 256] = {
         let mut lut = [[0.0f32; 16]; 256];
