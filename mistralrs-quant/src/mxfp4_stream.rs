@@ -290,7 +290,7 @@ impl MxFp4StreamCache {
         }
     }
 
-    fn submit(&self, key: MxFp4StreamKey, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
+    fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
         let path = self
             .paths
             .get(range.shard)
@@ -319,7 +319,7 @@ impl MxFp4StreamCache {
         if let Some(data) = self.lookup(key) {
             return Ok(data);
         }
-        let rx = self.submit(key, range)?;
+        let rx = self.submit(range)?;
         let data = rx
             .recv()
             .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
@@ -342,7 +342,7 @@ impl MxFp4StreamCache {
             } else {
                 result.insert(
                     key,
-                    MxFp4StreamHandle::Pending(self.submit(key, range)?),
+                    MxFp4StreamHandle::Pending(self.submit(range)?),
                 );
             }
         }
