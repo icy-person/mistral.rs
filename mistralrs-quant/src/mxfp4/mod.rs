@@ -53,7 +53,6 @@ pub struct MXFP4Layer {
 /// into a temporary output buffer.
 #[derive(Debug)]
 pub struct MxFp4StreamingExpertLayer {
-    archive: Arc<crate::GgufArchive>,
     raw_weights: Vec<String>,
     num_experts: usize,
     component_out_dim: usize,
@@ -189,7 +188,6 @@ impl MxFp4StreamingExpertLayer {
         };
 
         Ok(Self {
-            archive,
             raw_weights,
             num_experts,
             component_out_dim,
