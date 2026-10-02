@@ -194,6 +194,8 @@ impl MxFp4StreamingExpertLayer {
             in_dim,
             out_dim,
             bias,
+            bias_cpu,
+            expert_ranges,
             cache,
         })
     }
