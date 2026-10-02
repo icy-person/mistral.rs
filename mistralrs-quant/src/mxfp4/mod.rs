@@ -368,7 +368,7 @@ impl MxFp4StreamingExpertLayer {
     ) -> f32 {
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let mut weight_ptr = raw_expert.as_ptr().add(row * row_bytes);
+        let mut weight_offset = row * row_bytes;
         let mut x_ptr = x.as_ptr();
 
         let mut a0 = _mm256_setzero_ps();
@@ -377,18 +377,14 @@ impl MxFp4StreamingExpertLayer {
         let mut a3 = _mm256_setzero_ps();
 
         for _ in 0..blocks_per_row {
-            let block_start = weight_ptr.offset(0) as *const u8;
-            let w = Self::load_fused_weight_vectors_avx2(
-                std::slice::from_raw_parts(raw_expert.as_ptr(), raw_expert.len()),
-                block_start.offset_from(raw_expert.as_ptr()) as usize,
-            );
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, weight_offset);
 
             a0 = _mm256_add_ps(a0, _mm256_mul_ps(_mm256_loadu_ps(x_ptr), w[0]));
             a1 = _mm256_add_ps(a1, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(8)), w[1]));
             a2 = _mm256_add_ps(a2, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(16)), w[2]));
             a3 = _mm256_add_ps(a3, _mm256_mul_ps(_mm256_loadu_ps(x_ptr.add(24)), w[3]));
 
-            weight_ptr = weight_ptr.add(MXFP4_BLOCK_SIZE / 2 + 1);
+            weight_offset += MXFP4_BLOCK_SIZE / 2 + 1;
             x_ptr = x_ptr.add(MXFP4_BLOCK_SIZE);
         }
 
@@ -406,7 +402,7 @@ impl MxFp4StreamingExpertLayer {
     ) -> f32 {
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
-        let mut weight_ptr = raw_expert.as_ptr().add(row * row_bytes);
+        let mut weight_offset = row * row_bytes;
         let mut x_ptr = x.as_ptr();
 
         let mut a0 = _mm256_setzero_ps();
@@ -415,15 +411,14 @@ impl MxFp4StreamingExpertLayer {
         let mut a3 = _mm256_setzero_ps();
 
         for _ in 0..blocks_per_row {
-            let offset = weight_ptr.offset_from(raw_expert.as_ptr()) as usize;
-            let w = Self::load_fused_weight_vectors_avx2(raw_expert, offset);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, weight_offset);
 
             a0 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr), w[0], a0);
             a1 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(8)), w[1], a1);
             a2 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(16)), w[2], a2);
             a3 = _mm256_fmadd_ps(_mm256_loadu_ps(x_ptr.add(24)), w[3], a3);
 
-            weight_ptr = weight_ptr.add(MXFP4_BLOCK_SIZE / 2 + 1);
+            weight_offset += MXFP4_BLOCK_SIZE / 2 + 1;
             x_ptr = x_ptr.add(MXFP4_BLOCK_SIZE);
         }
 
