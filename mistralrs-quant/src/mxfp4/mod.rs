@@ -612,16 +612,18 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         }
 
         let mut routes_flat = vec![0usize; indices_data.len()];
-        let mut cursors = expert_offsets[..self.num_experts].to_vec();
+        // Reuse expert_counts as the write cursor after the prefix offsets are built;
+        // this removes one temporary Vec allocation from every routed forward.
+        expert_counts[..self.num_experts].copy_from_slice(&expert_offsets[..self.num_experts]);
         for (route, &expert) in indices_data.iter().enumerate() {
             let expert = expert as usize;
-            let dst = cursors[expert];
+            let dst = expert_counts[expert];
             routes_flat[dst] = route;
-            cursors[expert] += 1;
+            expert_counts[expert] += 1;
         }
 
         let mut experts = (0..self.num_experts)
-            .filter(|&expert| expert_counts[expert] != 0)
+            .filter(|&expert| expert_offsets[expert] != expert_offsets[expert + 1])
             .collect::<Vec<_>>();
 
         if self.cache.zero_copy() {
@@ -630,7 +632,12 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         } else {
             // In heap-backed fallback mode, load cold experts first so the
             // per-source quota leaves hot experts resident.
-            experts.sort_unstable_by_key(|&expert| (expert_counts[expert], expert));
+            experts.sort_unstable_by_key(|&expert| {
+                (
+                    expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]),
+                    expert,
+                )
+            });
         }
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
@@ -653,6 +660,16 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         };
 
         let mut output = vec![0f32; num_tokens * topk * self.out_dim];
+        if let Some(bias_data) = &self.bias_cpu {
+            output
+                .par_chunks_mut(self.out_dim)
+                .enumerate()
+                .for_each(|(route_row, out_row)| {
+                    let expert_idx = indices_data[route_row] as usize;
+                    let bias_offset = expert_idx * self.out_dim;
+                    out_row.copy_from_slice(&bias_data[bias_offset..bias_offset + self.out_dim]);
+                });
+        }
         let kernel = Self::dot_kernel();
 
         // Reused across all experts/components in this forward.
@@ -1115,19 +1132,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     }
                 }
             }
-        }
-
-        if let Some(bias_data) = &self.bias_cpu {
-            output
-                .par_chunks_mut(self.out_dim)
-                .enumerate()
-                .for_each(|(route_row, out_row)| {
-                    let expert_idx = indices_data[route_row] as usize;
-                    let bias_offset = expert_idx * self.out_dim;
-                    for col in 0..self.out_dim {
-                        out_row[col] += bias_data[bias_offset + col];
-                    }
-                });
         }
 
         self.cache.log_stats();
