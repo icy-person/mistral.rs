@@ -370,6 +370,11 @@ impl MxFp4StreamCache {
         self.config.overlap
     }
 
+    #[inline(always)]
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.config.zero_copy && !self.config.o_direct
+    }
+
     #[inline]
     fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
         let mut guard = self.inner.lock().ok()?;
