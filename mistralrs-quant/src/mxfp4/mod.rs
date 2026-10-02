@@ -357,6 +357,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
         // prompt batches where the same expert can serve multiple tokens.
         //
         // The grouped path below parallelizes over output rows, decodes each MXFP4
+        // weight block once per row, and reuses it across all matching routes.
         // weight block once per row, and reuses that decoded block across every route
         // selecting the same expert.
         if self.raw_weights.len() > 1 {
