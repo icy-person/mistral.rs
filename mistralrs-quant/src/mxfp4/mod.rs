@@ -939,9 +939,15 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             .enumerate()
             .filter_map(|(expert, routes)| (!routes.is_empty()).then_some(expert))
             .collect::<Vec<_>>();
-        // Load low-frequency experts first so the per-source cache quota retains
-        // the most frequently routed experts at the end of the pass.
-        experts.sort_unstable_by_key(|&expert| (routes_by_expert[expert].len(), expert));
+        if self.cache.zero_copy() {
+            // Mapped expert ranges are retained without heap pressure. Keep them
+            // in file order so mmap/page-cache readahead sees increasing offsets.
+            experts.sort_unstable();
+        } else {
+            // Heap-backed fallback mode keeps low-frequency experts first so the
+            // per-source quota retains the hottest experts at the end of the pass.
+            experts.sort_unstable_by_key(|&expert| (routes_by_expert[expert].len(), expert));
+        }
 
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
         for weight_idx in 0..self.raw_weights.len() {
