@@ -255,12 +255,23 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                 (*tokens, index_dims[1], *cols, false)
             }
             [tokens, x_topk, cols] => {
-                if *tokens != index_dims[0] || *x_topk != index_dims[1] {
+                // The routed MoE contract allows either one shared input row per
+                // token ([tokens, 1, hidden]) or one input row per routed slot
+                // ([tokens, topk, hidden]).  GPT-OSS passes the former while
+                // topk_ids has one expert index for every route.
+                if *tokens != index_dims[0] {
                     candle_core::bail!(
-                        "GPT-OSS MXFP4 streaming input and index shapes do not agree"
+                        "GPT-OSS MXFP4 streaming input and index token counts do not agree"
                     );
                 }
-                (*tokens, *x_topk, *cols, true)
+                if *x_topk != 1 && *x_topk != index_dims[1] {
+                    candle_core::bail!(
+                        "GPT-OSS MXFP4 streaming input route dimension {} does not match top-k {}",
+                        x_topk,
+                        index_dims[1]
+                    );
+                }
+                (*tokens, index_dims[1], *cols, *x_topk != 1)
             }
             _ => candle_core::bail!(
                 "GPT-OSS MXFP4 streaming expects rank-2 or rank-3 input, got rank {}",
