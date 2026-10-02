@@ -607,6 +607,10 @@ fn read_file_range(
                 "MXFP4 mmap range exceeds mapped file",
             ));
         }
+        #[cfg(unix)]
+        {
+            let _ = map.advise_range(memmap2::Advice::WillNeed, start, len);
+        }
         return Ok(MxFp4StreamData::Mapped {
             map: map.clone(),
             start,
