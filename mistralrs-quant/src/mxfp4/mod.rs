@@ -185,55 +185,31 @@ impl MxFp4StreamingExpertLayer {
     }
 
 
+    #[inline(always)]
     fn raw_expert_range(
         &self,
         weight_idx: usize,
         expert_idx: usize,
     ) -> Result<MxFp4StreamRange> {
-        let name = self
-            .raw_weights
-            .get(weight_idx)
-            .ok_or_else(|| candle_core::Error::Msg("invalid streamed MXFP4 weight index".into()))?;
+        let base = *self.expert_ranges.get(weight_idx).ok_or_else(|| {
+            candle_core::Error::Msg("invalid streamed MXFP4 weight index".into())
+        })?;
         if expert_idx >= self.num_experts {
             candle_core::bail!(
                 "GPT-OSS MXFP4 expert index {expert_idx} out of range for {} experts",
                 self.num_experts
             );
         }
-
-        let info = self.archive.tensor_info(name)?;
-        let data_len = info.byte_len().ok_or_else(|| {
-            candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no exact byte range"))
-        })?;
-        let expert_len = data_len
-            .checked_div(self.num_experts)
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert count is invalid".into()))?;
-        if expert_len == 0 || expert_len.saturating_mul(self.num_experts) != data_len {
-            candle_core::bail!("GPT-OSS MXFP4 tensor {name} has an invalid expert byte layout");
-        }
-        let base = info
-            .data_range()
-            .ok_or_else(|| candle_core::Error::Msg(format!("GPT-OSS MXFP4 tensor {name} has no data range")))?
-            .start;
-        let offset = u64::try_from(
-            base.checked_add(
-                expert_idx.checked_mul(expert_len).ok_or_else(|| {
-                    candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into())
-                })?
-            ).ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?
-        ).map_err(|_| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset exceeds u64".into()))?;
-        let file_len = self
-            .archive
-            .shards()
-            .get(info.shard_index())
-            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 shard index out of range".into()))?
-            .file_len();
-        Ok(MxFp4StreamRange {
-            shard: info.shard_index(),
-            offset,
-            len: expert_len,
-            file_len,
-        })
+        let byte_offset = expert_idx
+            .checked_mul(base.len)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
+        let offset = base
+            .offset
+            .checked_add(u64::try_from(byte_offset).map_err(|_| {
+                candle_core::Error::Msg("GPT-OSS MXFP4 expert offset exceeds u64".into())
+            })?)
+            .ok_or_else(|| candle_core::Error::Msg("GPT-OSS MXFP4 expert offset overflow".into()))?;
+        Ok(MxFp4StreamRange { offset, ..base })
     }
 
     #[inline(always)]
