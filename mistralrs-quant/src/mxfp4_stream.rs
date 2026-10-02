@@ -153,13 +153,17 @@ struct CacheInner {
 }
 
 struct ReadJob {
-    key: MxFp4StreamKey,
     path: PathBuf,
     offset: u64,
     len: usize,
     file_len: usize,
     o_direct: bool,
     reply: SyncSender<io::Result<Vec<u8>>>,
+}
+
+pub(crate) enum MxFp4StreamHandle {
+    Ready(Arc<Vec<u8>>),
+    Pending(Receiver<io::Result<Vec<u8>>>),
 }
 
 #[derive(Default)]
@@ -296,7 +300,6 @@ impl MxFp4StreamCache {
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
         self.queue
             .send(ReadJob {
-                key,
                 path,
                 offset: range.offset,
                 len: range.len,
@@ -331,31 +334,40 @@ impl MxFp4StreamCache {
     pub(crate) fn prefetch(
         &self,
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
-    ) -> crate::Result<HashMap<MxFp4StreamKey, Arc<Vec<u8>>>> {
+    ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
         let mut result = HashMap::with_capacity(requests.len());
-        let mut pending = Vec::new();
-
         for &(key, range) in requests {
             if let Some(data) = self.lookup(key) {
-                result.insert(key, data);
+                result.insert(key, MxFp4StreamHandle::Ready(data));
             } else {
-                pending.push((key, self.submit(key, range)?));
+                result.insert(
+                    key,
+                    MxFp4StreamHandle::Pending(self.submit(key, range)?),
+                );
             }
         }
-
-        for (key, rx) in pending {
-            let data = rx
-                .recv()
-                .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
-                .map_err(candle_core::Error::wrap)?;
-            self.stats.reads.fetch_add(1, Ordering::Relaxed);
-            self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-            let data = Arc::new(data);
-            self.insert(key, data.clone());
-            result.insert(key, data);
-        }
-
         Ok(result)
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        key: MxFp4StreamKey,
+        handle: MxFp4StreamHandle,
+    ) -> crate::Result<Arc<Vec<u8>>> {
+        match handle {
+            MxFp4StreamHandle::Ready(data) => Ok(data),
+            MxFp4StreamHandle::Pending(rx) => {
+                let data = rx
+                    .recv()
+                    .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
+                    .map_err(candle_core::Error::wrap)?;
+                self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+                let data = Arc::new(data);
+                self.insert(key, data.clone());
+                Ok(data)
+            }
+        }
     }
 
     pub(crate) fn log_stats(&self) {
