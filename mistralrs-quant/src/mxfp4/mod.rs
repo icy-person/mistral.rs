@@ -564,12 +564,8 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                                 for (route_idx, &x_offset) in route_x_offsets.iter().enumerate() {
                                     let x_row = &x_data[x_offset..x_offset + self.in_dim];
                                     let x_block = &x_row[col_start..col_start + MXFP4_BLOCK_SIZE];
-                                    accs[route_idx] =
-                                        accs[route_idx].mul_add(1.0, Self::dot_block(
-                                            x_block,
-                                            &w_block,
-                                            kernel,
-                                        ));
+                                    accs[route_idx] +=
+                                        Self::dot_block(x_block, &w_block, kernel);
                                 }
                             }
                         });
@@ -1835,6 +1831,24 @@ mod tests {
     #[test]
     fn cpu_device_support_is_enabled() {
         assert!(MXFP4Layer::device_supported(&Device::Cpu));
+    }
+
+    #[test]
+    fn streaming_dot_block_kernel_matches_scalar() -> Result<()> {
+        let x = (0..MXFP4_BLOCK_SIZE)
+            .map(|i| (i as f32 * 0.03125) - 0.5)
+            .collect::<Vec<_>>();
+        let w = (0..MXFP4_BLOCK_SIZE)
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.125)
+            .collect::<Vec<_>>();
+        let scalar = MXFP4_BLOCK_SIZE
+            .checked_sub(0)
+            .map(|_| x.iter().zip(&w).map(|(a, b)| a * b).sum::<f32>())
+            .unwrap();
+        let kernel = MxFp4StreamingExpertLayer::dot_kernel();
+        let actual = MxFp4StreamingExpertLayer::dot_block(&x, &w, kernel);
+        assert!((actual - scalar).abs() < 1e-4, "actual={actual} scalar={scalar}");
+        Ok(())
     }
 
     #[test]
