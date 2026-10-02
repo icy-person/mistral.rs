@@ -249,7 +249,7 @@ pub use lora::{
     launch_routed_lora_direct, launch_routed_lora_grouped, RoutedLoraCudaMetadata,
     RoutedLoraCudaWeightTable, RoutedLoraDirectLaunch, RoutedLoraGroupedLaunch,
 };
-pub use mxfp4::MXFP4Layer;
+pub use mxfp4::{MxFp4StreamingExpertLayer, MXFP4Layer};
 pub use nvfp4::{Nvfp4InputCalibration, Nvfp4Layer, Nvfp4LayerParts};
 pub use pending_layer::{pending_isq_channel, PendingIsqLayer};
 pub use pertensor_fp8::{fp8_w8a16_linear, fp8_w8a8_linear, Fp8W8A8LinearArgs, PerTensorFP8Linear};
@@ -1821,6 +1821,14 @@ impl FusedRmsNormQuantized {
 
 /// Quantized method for a quantized matmul.
 pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
+    /// Expose the native file-backed MXFP4 expert layer for model-specific fused paths.
+    ///
+    /// Default implementations return None; optimized GPT-OSS CPU execution uses this
+    /// only when both gate/up and down projections are native streamed MXFP4 layers.
+    fn as_mxfp4_streaming(&self) -> Option<&MxFp4StreamingExpertLayer> {
+        None
+    }
+
     fn new(method: QuantMethodConfig) -> Result<Self>
     where
         Self: Sized;
