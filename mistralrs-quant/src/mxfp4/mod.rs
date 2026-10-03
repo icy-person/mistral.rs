@@ -373,7 +373,7 @@ impl MxFp4StreamingExpertLayer {
             let hi2 = _mm256_srli_epi32(mag, 1);
             let high_adj = _mm256_add_epi32(
                 hi,
-                _mm256_and_si256(hi, _mm256_and_si256(hi2, _mm256_set1_epi32(1))),
+                _mm256_and_si256(hi2, _mm256_set1_epi32(1)),
             );
             let one = _mm256_cmpeq_epi32(mag, _mm256_set1_epi32(1));
             let exponent_adjust = _mm256_sub_epi32(
