@@ -566,10 +566,38 @@ impl GptOssMoE {
             .transpose()?
             .flatten();
         let routed_input = xs_flat.unsqueeze(1)?;
+        let mut streamed_stats_done = false;
+        // Native streamed MXFP4 fast path: fuse gate/up -> SwiGLU -> down ->
+        // top-k weighted combine without materializing intermediate tensors.
+        if expert_lora.is_none() {
+            if let GptOssExpertProjections::Interleaved { gate_up, down } = &self.projections {
+                if let (Some(gate_up_stream), Some(down_stream)) =
+                    (gate_up.as_mxfp4_streaming(), down.as_mxfp4_streaming())
+                {
+                    gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
+                    down.process_routed_stats(&xs_flat, &topk_ids)?;
+                    streamed_stats_done = true;
+                    if let Some(fused) = mistralrs_quant::fused_gptoss_mlp(
+                        gate_up_stream,
+                        down_stream,
+                        &xs_flat,
+                        &topk_ids,
+                        &topk_weights,
+                        self.alpha,
+                        self.limit,
+                    )? {
+                        return Ok(fused.reshape((b_size, seq_len, hidden_dim))?);
+                    }
+                }
+            }
+        }
+
 
         let activated = match &self.projections {
             GptOssExpertProjections::Interleaved { gate_up, .. } => {
-                gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
+                if !streamed_stats_done {
+                    gate_up.process_routed_stats(&xs_flat, &topk_ids)?;
+                }
                 let gate_up = gate_up.gather_forward(&routed_input, &topk_ids)?;
                 let (num_tokens, topk_dim, _) = gate_up.dims3()?;
                 if let Some(lora) = &expert_lora {
@@ -614,7 +642,9 @@ impl GptOssMoE {
             GptOssExpertProjections::Interleaved { down, .. }
             | GptOssExpertProjections::Split { down, .. } => down,
         };
-        down.process_routed_stats(&activated, &topk_ids)?;
+        if !streamed_stats_done {
+            down.process_routed_stats(&activated, &topk_ids)?;
+        }
         let expert_out = down.gather_forward(&activated, &topk_ids)?;
         let expert_out = match &expert_lora {
             Some(lora) => lora.add_delta_owned(
