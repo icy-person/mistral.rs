@@ -1202,7 +1202,7 @@ impl MxFp4StreamingExpertLayer {
 
         // Preserve the existing streamed GEMM fast path for large expert groups.
         if experts.iter().any(|&expert| {
-            expert_offsets[expert + 1] - expert_offsets[expert] >= Self::GEMM_MIN_ROUTES
+            expert_offsets[expert + 1] - expert_offsets[expert] >= MxFp4StreamingExpertLayer::GEMM_MIN_ROUTES
         }) {
             return Ok(None);
         }
@@ -1240,7 +1240,7 @@ impl MxFp4StreamingExpertLayer {
         let mut route_x_offsets = Vec::with_capacity(topk.max(1));
         let mut activation_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
-        let kernel = Self::dot_kernel();
+        let kernel = MxFp4StreamingExpertLayer::dot_kernel();
         let moe_threads = MxFp4StreamingExpertLayer::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
@@ -1317,7 +1317,7 @@ impl MxFp4StreamingExpertLayer {
 
             // Full graph fusion: gate/up dot -> clamp -> SwiGLU directly into
             // activation scratch. No persistent gate_values/up_values tensors.
-            Self::moe_thread_pool().install(|| {
+            MxFp4StreamingExpertLayer::moe_thread_pool().install(|| {
                 activations[..activation_len]
                     .par_chunks_mut(8)
                     .enumerate()
@@ -1386,7 +1386,7 @@ impl MxFp4StreamingExpertLayer {
                             unsafe {
                                 let g = _mm256_loadu_ps(gates.as_ptr());
                                 let u = _mm256_loadu_ps(ups.as_ptr());
-                                let y = Self::swiglu8_avx2(g, u, alpha);
+                                let y = swiglu8_avx2(g, u, alpha);
                                 _mm256_storeu_ps(out_chunk.as_mut_ptr(), y);
                             }
                             #[cfg(not(target_arch = "x86_64"))]
@@ -1420,7 +1420,7 @@ impl MxFp4StreamingExpertLayer {
 
             const STACK_ROUTES: usize = 8;
             let parallel_down = route_count <= STACK_ROUTES
-                && Self::adaptive_parallel_with_threads(
+                && MxFp4StreamingExpertLayer::adaptive_parallel_with_threads(
                     moe_threads,
                     route_count,
                     down.out_dim,
@@ -1432,7 +1432,7 @@ impl MxFp4StreamingExpertLayer {
                 let route_rows_ptr = routes.as_ptr();
                 let activation_offsets_ref = &activation_offsets[..route_count];
                 let down_bias_ref = down_bias;
-                Self::moe_thread_pool().install(|| {
+                MxFp4StreamingExpertLayer::moe_thread_pool().install(|| {
                     (0..down.out_dim).into_par_iter().for_each(|row| {
                     let mut accs = [0.0f32; STACK_ROUTES];
                     let accs = &mut accs[..route_count];
@@ -1483,7 +1483,7 @@ impl MxFp4StreamingExpertLayer {
                     if down_kernel >= 2 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            Self::dot_streamed_routes_fused_avx2_fma(
+                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2_fma(
                                 &activations,
                                 &activation_offsets,
                                 down_raw,
@@ -1495,7 +1495,7 @@ impl MxFp4StreamingExpertLayer {
                     } else {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            Self::dot_streamed_routes_fused_avx2(
+                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2(
                                 &activations,
                                 &activation_offsets,
                                 down_raw,
