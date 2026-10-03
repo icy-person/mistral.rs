@@ -4,15 +4,15 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
-    _mm256_castps256_ps128, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cmpgt_epi32,
-    _mm256_cmpgt_ps, _mm256_cmpeq_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
+    _CMP_GT_OQ, __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+    _mm256_castps256_ps128, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cmp_ps,
+    _mm256_cmpgt_epi32, _mm256_cmpeq_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
     _mm256_cvttps_epi32, _mm256_div_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
     _mm256_hadd_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
-    _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set1_epi16, _mm256_set1_epi32,
+    _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set1_epi32,
     _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256,
     _mm256_slli_epi32, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps, _mm256_xor_ps,
-    _mm_add_ss,
+    _mm_add_ss, _mm_set1_epi16,
     _mm_and_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_packus_epi16, _mm_setzero_si128,
     _mm_srli_epi16, _mm_unpacklo_epi8,
 };
@@ -329,7 +329,7 @@ impl MxFp4StreamingExpertLayer {
 
     #[inline(always)]
     fn adaptive_parallel(route_count: usize, out_rows: usize, blocks_per_row: usize) -> bool {
-        Self::adaptive_parallel_with_threads(
+        MxFp4StreamingExpertLayer::adaptive_parallel_with_threads(
             rayon::current_num_threads(),
             route_count,
             out_rows,
@@ -958,7 +958,7 @@ impl MxFp4StreamingExpertLayer {
         in_dim: usize,
     ) -> Result<Vec<f32>> {
         let route_count = route_x_offsets.len();
-        if route_count < Self::GEMM_MIN_ROUTES {
+        if route_count < MxFp4StreamingExpertLayer::GEMM_MIN_ROUTES {
             return Err(candle_core::Error::Msg(
                 "route count below streamed GEMM threshold".into(),
             ));
@@ -1033,7 +1033,7 @@ impl MxFp4StreamingExpertLayer {
         );
         let mut emm0 = _mm256_cvttps_epi32(fx);
         let tmp = _mm256_cvtepi32_ps(emm0);
-        let mask = _mm256_cmpgt_ps(tmp, fx);
+        let mask = _mm256_cmp_ps(tmp, fx, _CMP_GT_OQ);
         emm0 = _mm256_sub_epi32(
             emm0,
             _mm256_and_si256(
@@ -1082,7 +1082,7 @@ impl MxFp4StreamingExpertLayer {
     unsafe fn swiglu8_avx2(gate: __m256, up: __m256, alpha: f32) -> __m256 {
         let scaled = _mm256_mul_ps(gate, _mm256_set1_ps(alpha));
         let neg = _mm256_sub_ps(_mm256_setzero_ps(), scaled);
-        let exp_neg = Self::exp_ps_avx2(neg);
+        let exp_neg = exp_ps_avx2(neg);
         let sigmoid = _mm256_div_ps(
             _mm256_set1_ps(1.0),
             _mm256_add_ps(_mm256_set1_ps(1.0), exp_neg),
@@ -1123,7 +1123,7 @@ impl MxFp4StreamingExpertLayer {
         alpha: f32,
         limit: f32,
     ) -> Result<Option<Tensor>> {
-        let [num_tokens, hidden_dim] = x.dims2()?;
+        let (num_tokens, hidden_dim) = x.dims2()?;
         let (idx_tokens, topk) = indices.dims2()?;
         if idx_tokens != num_tokens || topk == 0 || weights.dims2()? != (num_tokens, topk) {
             return Ok(None);
@@ -1150,7 +1150,7 @@ impl MxFp4StreamingExpertLayer {
             || down.out_dim != hidden_dim
             || !gate_up.in_dim.is_multiple_of(MXFP4_BLOCK_SIZE)
             || !down.in_dim.is_multiple_of(MXFP4_BLOCK_SIZE)
-            || Self::dot_kernel() == 0
+            || MxFp4StreamingExpertLayer::dot_kernel() == 0
         {
             return Ok(None);
         }
@@ -1238,7 +1238,7 @@ impl MxFp4StreamingExpertLayer {
         let mut activation_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
         let kernel = Self::dot_kernel();
-        let moe_threads = Self::moe_thread_pool().current_num_threads();
+        let moe_threads = MxFp4StreamingExpertLayer::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
                 let gate_key = MxFp4StreamKey {
@@ -1333,7 +1333,7 @@ impl MxFp4StreamingExpertLayer {
                             let (gate_value, up_value) = if kernel >= 2 {
                                 #[cfg(target_arch = "x86_64")]
                                 unsafe {
-                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
+                                    MxFp4StreamingExpertLayer::dot_streamed_row_interleaved_gate_up_fused_avx2_fma(
                                         x_row,
                                         gate_raw,
                                         row * 2,
@@ -1348,7 +1348,7 @@ impl MxFp4StreamingExpertLayer {
                             } else {
                                 #[cfg(target_arch = "x86_64")]
                                 unsafe {
-                                    Self::dot_streamed_row_interleaved_gate_up_fused_avx2(
+                                    MxFp4StreamingExpertLayer::dot_streamed_row_interleaved_gate_up_fused_avx2(
                                         x_row,
                                         gate_raw,
                                         row * 2,
@@ -1378,7 +1378,7 @@ impl MxFp4StreamingExpertLayer {
                                 .clamp(-limit, limit);
                         }
 
-                        if Self::approx_swiglu_enabled() && out_chunk.len() == 8 {
+                        if approx_swiglu_enabled() && out_chunk.len() == 8 {
                             #[cfg(target_arch = "x86_64")]
                             unsafe {
                                 let g = _mm256_loadu_ps(gates.as_ptr());
@@ -1427,7 +1427,7 @@ impl MxFp4StreamingExpertLayer {
             if parallel_down {
                 let output_ptr = output.as_mut_ptr();
                 let route_rows_ptr = routes.as_ptr();
-                let activation_offsets_ref = activation_offsets.as_slice();
+                let activation_offsets_ref = &activation_offsets[..route_count];
                 let down_bias_ref = down_bias;
                 Self::moe_thread_pool().install(|| {
                     (0..down.out_dim).into_par_iter().for_each(|row| {
@@ -1436,7 +1436,7 @@ impl MxFp4StreamingExpertLayer {
                     if down_kernel >= 2 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            Self::dot_streamed_routes_fused_avx2_fma(
+                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2_fma(
                                 &activations,
                                 activation_offsets_ref,
                                 down_raw,
@@ -1448,7 +1448,7 @@ impl MxFp4StreamingExpertLayer {
                     } else {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            Self::dot_streamed_routes_fused_avx2(
+                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2(
                                 &activations,
                                 activation_offsets_ref,
                                 down_raw,
