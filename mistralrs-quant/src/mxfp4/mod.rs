@@ -8,7 +8,7 @@ use std::arch::x86_64::{
     _mm256_castps256_ps128, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cmp_ps,
     _mm256_cmpgt_epi32, _mm256_cmpeq_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
     _mm256_cvttps_epi32, _mm256_div_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
-    _mm256_hadd_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
+    _mm256_hadd_ps, _mm256_rcp_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
     _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set1_epi32,
     _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256,
     _mm256_slli_epi32, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps, _mm256_xor_ps,
@@ -1222,9 +1222,14 @@ impl MxFp4StreamingExpertLayer {
         let scaled = _mm256_mul_ps(gate, _mm256_set1_ps(alpha));
         let neg = _mm256_sub_ps(_mm256_setzero_ps(), scaled);
         let exp_neg = exp_ps_avx2(neg);
-        let sigmoid = _mm256_div_ps(
-            _mm256_set1_ps(1.0),
-            _mm256_add_ps(_mm256_set1_ps(1.0), exp_neg),
+        let denom = _mm256_add_ps(_mm256_set1_ps(1.0), exp_neg);
+        // One Newton step after rcp_ps gives ~22 bits of reciprocal accuracy,
+        // avoiding the high-latency scalar-precision vector divide in the
+        // already-approximate SwiGLU path.
+        let mut sigmoid = _mm256_rcp_ps(denom);
+        sigmoid = _mm256_mul_ps(
+            sigmoid,
+            _mm256_sub_ps(_mm256_set1_ps(2.0), _mm256_mul_ps(denom, sigmoid)),
         );
         _mm256_mul_ps(
             _mm256_mul_ps(_mm256_add_ps(up, _mm256_set1_ps(1.0)), gate),
@@ -1540,6 +1545,76 @@ impl MxFp4StreamingExpertLayer {
             let down_kernel = kernel;
 
             const STACK_ROUTES: usize = 8;
+
+            // Decode normally has one route per active expert. Avoid the generic
+            // route-array kernel in that case: one direct row dot is cheaper and
+            // needs no per-row accumulator array.
+            if route_count == 1 {
+                let route_row = routes[0];
+                let token = route_row / topk;
+                let weight = route_weights[route_row];
+                let activation = &activations[..down.in_dim];
+                let output_ptr = output.as_mut_ptr();
+                let down_bias_ref = down_bias;
+
+                let compute_down_row = |row: usize| {
+                    let value = if down_kernel >= 2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            MxFp4StreamingExpertLayer::dot_streamed_row_fused_avx2_fma(
+                                activation,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                            )
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            unreachable!()
+                        }
+                    } else {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            MxFp4StreamingExpertLayer::dot_streamed_row_fused_avx2(
+                                activation,
+                                down_raw,
+                                row,
+                                down.in_dim,
+                            )
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            unreachable!()
+                        }
+                    };
+                    let bias = down_bias_ref
+                        .map(|b| b[expert_idx * down.out_dim + row])
+                        .unwrap_or(0.0);
+                    unsafe {
+                        *output_ptr.add(token * hidden_dim + row) +=
+                            (value + bias) * weight;
+                    }
+                };
+
+                if MxFp4StreamingExpertLayer::adaptive_parallel_with_threads(
+                    moe_threads,
+                    1,
+                    down.out_dim,
+                    blocks_per_row,
+                ) {
+                    MxFp4StreamingExpertLayer::moe_thread_pool().install(|| {
+                        (0..down.out_dim)
+                            .into_par_iter()
+                            .for_each(compute_down_row);
+                    });
+                } else {
+                    for row in 0..down.out_dim {
+                        compute_down_row(row);
+                    }
+                }
+                continue;
+            }
+
             let parallel_down = route_count <= STACK_ROUTES
                 && MxFp4StreamingExpertLayer::adaptive_parallel_with_threads(
                     moe_threads,
