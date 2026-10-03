@@ -286,14 +286,46 @@ impl MxFp4StreamingExpertLayer {
         Ok(self.remember_zero_copy_expert(weight_idx, expert_idx, data))
     }
 
+    #[cfg(target_os = "linux")]
+    fn physical_core_count() -> Option<usize> {
+        use std::{collections::HashSet, fs};
+
+        let mut cores = HashSet::new();
+        let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
+            return None;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let path = entry.path().join("topology/core_id");
+            if let Ok(core_id) = fs::read_to_string(path) {
+                cores.insert(core_id.trim().to_string());
+            }
+        }
+        (!cores.is_empty()).then_some(cores.len())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn physical_core_count() -> Option<usize> {
+        None
+    }
+
     fn moe_thread_pool() -> &'static rayon::ThreadPool {
         static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
         POOL.get_or_init(|| {
             let default_threads = candle_core::utils::get_num_threads().max(1);
             let threads = std::env::var("MISTRALRS_MOE_THREADS")
                 .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value > 0)
+                .and_then(|value| {
+                    if value.eq_ignore_ascii_case("physical") {
+                        physical_core_count().or(Some(default_threads))
+                    } else {
+                        value.parse::<usize>().ok().filter(|&value| value > 0)
+                    }
+                })
                 .unwrap_or(default_threads);
             let affinity = std::env::var("MISTRALRS_MOE_AFFINITY")
                 .map(|value| !matches!(value.as_str(), "0" | "false" | "no"))
