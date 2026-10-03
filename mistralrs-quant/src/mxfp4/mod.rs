@@ -79,6 +79,13 @@ pub struct MxFp4StreamingExpertLayer {
 }
 
 impl MxFp4StreamingExpertLayer {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn swiglu8_avx2(gate: __m256, up: __m256, alpha: f32) -> __m256 {
+        swiglu8_avx2(gate, up, alpha)
+    }
+
     pub(crate) fn from_gguf(
         archive: Arc<crate::GgufArchive>,
         raw_weights: Vec<String>,
