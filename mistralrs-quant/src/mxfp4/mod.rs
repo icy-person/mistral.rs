@@ -1531,11 +1531,8 @@ impl MxFp4StreamingExpertLayer {
                                 }
                             };
 
-                            gates[lane] = gate_bias_ref
-                                .map(|bias| {
-                                    gate_value
-                                        + bias[expert_idx * gate_up.out_dim + row * 2]
-                                })
+                            gates[lane] = gate_bias_expert
+                                .map(|bias| gate_value + bias[row * 2])
                                 .unwrap_or(gate_value)
                                 .min(limit);
                             ups[lane] = gate_bias_expert
