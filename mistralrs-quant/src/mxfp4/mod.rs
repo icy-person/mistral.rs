@@ -373,7 +373,10 @@ impl MxFp4StreamingExpertLayer {
             let hi2 = _mm256_srli_epi32(mag, 1);
             let high_adj = _mm256_add_epi32(
                 hi,
-                _mm256_and_si256(hi2, _mm256_set1_epi32(1)),
+                _mm256_and_si256(
+                    hi,
+                    _mm256_and_si256(hi2, _mm256_set1_epi32(1)),
+                ),
             );
             let one = _mm256_cmpeq_epi32(mag, _mm256_set1_epi32(1));
             let exponent_adjust = _mm256_sub_epi32(
@@ -423,7 +426,7 @@ impl MxFp4StreamingExpertLayer {
         let (lo1, hi1) = unpack8(packed.add(8));
 
         let s = raw_expert[block_start] as u32;
-        if (2..=253).contains(&s) {
+        if (3..=253).contains(&s) {
             let scale_offset = _mm256_set1_epi32((s as i32) - 1);
             [
                 decode8_normal_e8m0(lo0, scale_offset),
