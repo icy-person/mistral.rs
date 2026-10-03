@@ -1410,9 +1410,9 @@ impl MxFp4StreamingExpertLayer {
         let gate_bias = gate_up.bias_cpu.as_deref();
         let down_bias = down.bias_cpu.as_deref();
         let mut output = vec![0.0f32; num_tokens * hidden_dim];
-        let mut route_x_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
         let kernel = MxFp4StreamingExpertLayer::dot_kernel();
+        let approx_swiglu = approx_swiglu_enabled();
         let moe_threads = MxFp4StreamingExpertLayer::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
@@ -1473,17 +1473,12 @@ impl MxFp4StreamingExpertLayer {
             let routes = &routes_flat[start..end];
             let route_count = routes.len();
 
-            route_x_offsets.clear();
-            for (route_idx, &route_row) in routes.iter().enumerate() {
-                route_x_offsets.push((route_row / topk) * hidden_dim);
-            }
-
             let activation_len = route_count * down.in_dim;
             activations.resize(activation_len, 0.0);
 
             let gate_raw = gate_data.as_ref();
             let down_raw = down_data.as_ref();
-            let gate_bias_ref = gate_bias;
+            let gate_bias_expert = gate_bias.map(|bias| &bias[expert_idx * gate_up.out_dim..]);
 
             // Full graph fusion: gate/up dot -> clamp -> SwiGLU directly into
             // activation scratch. No persistent gate_values/up_values tensors.
@@ -1500,7 +1495,8 @@ impl MxFp4StreamingExpertLayer {
                             let flat_idx = base_flat + lane;
                             let route_idx = flat_idx / down.in_dim;
                             let row = flat_idx % down.in_dim;
-                            let x_offset = route_x_offsets[route_idx];
+                            let token = routes[route_idx] / topk;
+                            let x_offset = token * hidden_dim;
                             let x_row = &x_data[x_offset..x_offset + gate_up.in_dim];
 
                             let (gate_value, up_value) = if kernel >= 2 {
@@ -1542,16 +1538,13 @@ impl MxFp4StreamingExpertLayer {
                                 })
                                 .unwrap_or(gate_value)
                                 .min(limit);
-                            ups[lane] = gate_bias_ref
-                                .map(|bias| {
-                                    up_value
-                                        + bias[expert_idx * gate_up.out_dim + row * 2 + 1]
-                                })
+                            ups[lane] = gate_bias_expert
+                                .map(|bias| up_value + bias[row * 2 + 1])
                                 .unwrap_or(up_value)
                                 .clamp(-limit, limit);
                         }
 
-                        if approx_swiglu_enabled() && out_chunk.len() == 8 {
+                        if approx_swiglu && out_chunk.len() == 8 {
                             #[cfg(target_arch = "x86_64")]
                             unsafe {
                                 let g = _mm256_loadu_ps(gates.as_ptr());
