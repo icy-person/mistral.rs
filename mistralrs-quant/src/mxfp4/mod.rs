@@ -1558,9 +1558,9 @@ impl MxFp4StreamingExpertLayer {
                     if down_kernel >= 2 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2_fma(
+                            MxFp4StreamingExpertLayer::dot_streamed_contiguous_routes_fused_avx2_fma(
                                 &activations,
-                                activation_offsets_ref,
+                                route_count,
                                 down_raw,
                                 row,
                                 down.in_dim,
