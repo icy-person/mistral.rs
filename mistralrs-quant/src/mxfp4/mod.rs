@@ -726,6 +726,142 @@ impl MxFp4StreamingExpertLayer {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     #[inline]
+    unsafe fn dot_streamed_contiguous_routes_fused_avx2(
+        x_data: &[f32],
+        route_count: usize,
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+        accs: &mut [f32],
+    ) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        if route_count <= 4 {
+            let mut lo = [_mm256_setzero_ps(); 4];
+            let mut hi = [_mm256_setzero_ps(); 4];
+
+            for block_idx in 0..blocks_per_row {
+                let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+                let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                for route_idx in 0..route_count {
+                    let x = x_data.as_ptr().add(route_idx * in_dim + x_start);
+                    lo[route_idx] = _mm256_add_ps(
+                        lo[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x), w[0]),
+                    );
+                    lo[route_idx] = _mm256_add_ps(
+                        lo[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(8)), w[1]),
+                    );
+                    hi[route_idx] = _mm256_add_ps(
+                        hi[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(16)), w[2]),
+                    );
+                    hi[route_idx] = _mm256_add_ps(
+                        hi[route_idx],
+                        _mm256_mul_ps(_mm256_loadu_ps(x.add(24)), w[3]),
+                    );
+                }
+            }
+
+            for route_idx in 0..route_count {
+                accs[route_idx] += Self::hsum2(lo[route_idx], hi[route_idx]);
+            }
+            return;
+        }
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+            for route_idx in 0..route_count {
+                let x = x_data.as_ptr().add(route_idx * in_dim + x_start);
+                let a0 = _mm256_mul_ps(_mm256_loadu_ps(x), w[0]);
+                let a1 = _mm256_mul_ps(_mm256_loadu_ps(x.add(8)), w[1]);
+                let a2 = _mm256_mul_ps(_mm256_loadu_ps(x.add(16)), w[2]);
+                let a3 = _mm256_mul_ps(_mm256_loadu_ps(x.add(24)), w[3]);
+                accs[route_idx] += Self::hsum4(a0, a1, a2, a3);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    #[inline]
+    unsafe fn dot_streamed_contiguous_routes_fused_avx2_fma(
+        x_data: &[f32],
+        route_count: usize,
+        raw_expert: &[u8],
+        row: usize,
+        in_dim: usize,
+        accs: &mut [f32],
+    ) {
+        let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
+        let row_start = row * row_bytes;
+
+        if route_count <= 4 {
+            let mut lo = [_mm256_setzero_ps(); 4];
+            let mut hi = [_mm256_setzero_ps(); 4];
+
+            for block_idx in 0..blocks_per_row {
+                let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+                let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+                let x_start = block_idx * MXFP4_BLOCK_SIZE;
+
+                for route_idx in 0..route_count {
+                    let x = x_data.as_ptr().add(route_idx * in_dim + x_start);
+                    lo[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x), w[0], lo[route_idx]
+                    );
+                    lo[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(8)), w[1], lo[route_idx]
+                    );
+                    hi[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(16)), w[2], hi[route_idx]
+                    );
+                    hi[route_idx] = _mm256_fmadd_ps(
+                        _mm256_loadu_ps(x.add(24)), w[3], hi[route_idx]
+                    );
+                }
+            }
+
+            for route_idx in 0..route_count {
+                accs[route_idx] += Self::hsum2(lo[route_idx], hi[route_idx]);
+            }
+            return;
+        }
+
+        for block_idx in 0..blocks_per_row {
+            let block_start = row_start + block_idx * (MXFP4_BLOCK_SIZE / 2 + 1);
+            let w = Self::load_fused_weight_vectors_avx2(raw_expert, block_start);
+            let x_start = block_idx * MXFP4_BLOCK_SIZE;
+            for route_idx in 0..route_count {
+                let x = x_data.as_ptr().add(route_idx * in_dim + x_start);
+                let a0 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x), w[0], _mm256_setzero_ps()
+                );
+                let a1 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(8)), w[1], _mm256_setzero_ps()
+                );
+                let a2 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(16)), w[2], _mm256_setzero_ps()
+                );
+                let a3 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(x.add(24)), w[3], _mm256_setzero_ps()
+                );
+                accs[route_idx] += Self::hsum4(a0, a1, a2, a3);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn dot_streamed_routes_fused_avx2(
         x_data: &[f32],
         x_offsets: &[usize],
@@ -1238,7 +1374,6 @@ impl MxFp4StreamingExpertLayer {
         let down_bias = down.bias_cpu.as_deref();
         let mut output = vec![0.0f32; num_tokens * hidden_dim];
         let mut route_x_offsets = Vec::with_capacity(topk.max(1));
-        let mut activation_offsets = Vec::with_capacity(topk.max(1));
         let mut activations = Vec::new();
         let kernel = MxFp4StreamingExpertLayer::dot_kernel();
         let moe_threads = MxFp4StreamingExpertLayer::moe_thread_pool().current_num_threads();
@@ -1302,10 +1437,8 @@ impl MxFp4StreamingExpertLayer {
             let route_count = routes.len();
 
             route_x_offsets.clear();
-            activation_offsets.clear();
             for (route_idx, &route_row) in routes.iter().enumerate() {
                 route_x_offsets.push((route_row / topk) * hidden_dim);
-                activation_offsets.push(route_idx * down.in_dim);
             }
 
             let activation_len = route_count * down.in_dim;
@@ -1401,20 +1534,8 @@ impl MxFp4StreamingExpertLayer {
                     });
             });
 
-            // Fold top-k weights immediately into the activated route vectors.
-            // This removes a second full activation traversal before down projection.
-            activations[..activation_len]
-                .par_chunks_mut(down.in_dim)
-                .enumerate()
-                .for_each(|(route_idx, activation)| {
-                    let route_row = routes[route_idx];
-                    let weight = route_weights[route_row];
-                    for value in activation {
-                        *value *= weight;
-                    }
-                });
-
-            let activation_offsets = &activation_offsets[..route_count];
+            // Top-k weighting is folded into the final down-projection store.
+            // Do not traverse the full activation buffer just to scale it.
             let blocks_per_row = down.in_dim / MXFP4_BLOCK_SIZE;
             let down_kernel = kernel;
 
@@ -1429,8 +1550,6 @@ impl MxFp4StreamingExpertLayer {
 
             if parallel_down {
                 let output_ptr = output.as_mut_ptr();
-                let route_rows_ptr = routes.as_ptr();
-                let activation_offsets_ref = &activation_offsets[..route_count];
                 let down_bias_ref = down_bias;
                 MxFp4StreamingExpertLayer::moe_thread_pool().install(|| {
                     (0..down.out_dim).into_par_iter().for_each(|row| {
@@ -1451,9 +1570,9 @@ impl MxFp4StreamingExpertLayer {
                     } else {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2(
+                            MxFp4StreamingExpertLayer::dot_streamed_contiguous_routes_fused_avx2(
                                 &activations,
-                                activation_offsets_ref,
+                                route_count,
                                 down_raw,
                                 row,
                                 down.in_dim,
@@ -1463,7 +1582,7 @@ impl MxFp4StreamingExpertLayer {
                     }
 
                     for route_idx in 0..route_count {
-                        let route_row = unsafe { *route_rows_ptr.add(route_idx) };
+                        let route_row = routes[route_idx];
                         let token = route_row / topk;
                         let weight = route_weights[route_row];
                         let bias = down_bias_ref
@@ -1471,7 +1590,7 @@ impl MxFp4StreamingExpertLayer {
                             .unwrap_or(0.0);
                         unsafe {
                             *output_ptr.add(token * hidden_dim + row) +=
-                                accs[route_idx] + bias * weight;
+                                (accs[route_idx] + bias) * weight;
                         }
                     }
                     });
@@ -1483,9 +1602,9 @@ impl MxFp4StreamingExpertLayer {
                     if down_kernel >= 2 {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2_fma(
+                            MxFp4StreamingExpertLayer::dot_streamed_contiguous_routes_fused_avx2_fma(
                                 &activations,
-                                &activation_offsets,
+                                route_count,
                                 down_raw,
                                 row,
                                 down.in_dim,
@@ -1495,9 +1614,9 @@ impl MxFp4StreamingExpertLayer {
                     } else {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
-                            MxFp4StreamingExpertLayer::dot_streamed_routes_fused_avx2(
+                            MxFp4StreamingExpertLayer::dot_streamed_contiguous_routes_fused_avx2(
                                 &activations,
-                                &activation_offsets,
+                                route_count,
                                 down_raw,
                                 row,
                                 down.in_dim,
