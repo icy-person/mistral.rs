@@ -328,7 +328,7 @@ impl MxFp4StreamingExpertLayer {
                 .ok()
                 .and_then(|value| {
                     if value.eq_ignore_ascii_case("physical") {
-                        physical_core_count().or(Some(default_threads))
+                        Self::physical_core_count().or(Some(default_threads))
                     } else {
                         value.parse::<usize>().ok().filter(|&value| value > 0)
                     }
