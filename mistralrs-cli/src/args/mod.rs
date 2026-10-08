@@ -264,8 +264,8 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', default_value = "512")]
         prompt_len: Vec<usize>,
 
-        /// Output tokens per decode request. Values below 2 skip decode metrics.
-        #[arg(long, default_value = "128")]
+        /// Output tokens per decode request. MoE benchmarking defaults to 256 for steady-state measurements.
+        #[arg(long, default_value = "256")]
         gen_len: usize,
 
         /// Input context lengths used to measure decode TPOT. Accepts comma-separated values for sweeps.
