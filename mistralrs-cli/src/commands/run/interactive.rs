@@ -46,6 +46,26 @@ fn exit_handler() {
     std::process::exit(0);
 }
 
+fn append_final_text(acc: &mut String, text: &str) -> &str {
+    if text.is_empty() {
+        return "";
+    }
+    if acc.is_empty() {
+        acc.push_str(text);
+        return text;
+    }
+    if text.starts_with(acc.as_str()) {
+        let suffix = &text[acc.len()..];
+        acc.push_str(suffix);
+        suffix
+    } else if acc.ends_with(text) || acc.contains(text) {
+        ""
+    } else {
+        acc.push_str(text);
+        text
+    }
+}
+
 struct RealtimeStats {
     enabled: bool,
     last_render: Instant,
@@ -1555,8 +1575,10 @@ async fn stream_assistant_response(
                         if first_token_duration.is_none() {
                             first_token_duration = Some(Instant::now().duration_since(start_ttft));
                         }
-                        assistant_reasoning.push_str(reasoning);
-                        print!("{GRAY}{reasoning}{RESET}");
+                        let added = append_final_text(&mut assistant_reasoning, reasoning);
+                        if !added.is_empty() {
+                            print!("{GRAY}{added}{RESET}");
+                        }
                     }
                     if !content.is_empty() {
                         if first_token_duration.is_none() {
@@ -1566,8 +1588,10 @@ async fn stream_assistant_response(
                             println!();
                             was_reasoning = false;
                         }
-                        assistant_output.push_str(content);
-                        print!("{content}");
+                        let added = append_final_text(&mut assistant_output, content);
+                        if !added.is_empty() {
+                            print!("{added}");
+                        }
                     }
                     io::stdout().flush().unwrap();
                 }
