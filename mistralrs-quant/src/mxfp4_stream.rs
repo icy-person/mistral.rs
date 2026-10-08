@@ -638,6 +638,17 @@ impl MxFp4StreamCache {
         let Ok(guard) = self.inner.lock() else {
             return;
         };
+        let entry_count = guard.entries.len();
+        let used_bytes = guard.used_bytes;
+        let mapped_bytes = guard
+            .entries
+            .values()
+            .filter_map(|entry| match entry.data.as_ref() {
+                MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
+                MxFp4StreamData::Owned(_) => None,
+            })
+            .sum::<usize>();
+        drop(guard);
 
         let hits = self.stats.hits.load(Ordering::Relaxed);
         let misses = self.stats.misses.load(Ordering::Relaxed);
@@ -661,13 +672,10 @@ impl MxFp4StreamCache {
         tracing::info!(
             target: "mistralrs_moe_stream",
             "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
-            guard.entries.len(),
-            guard.used_bytes / MIB,
+            entry_count,
+            used_bytes / MIB,
             self.budget_bytes / MIB,
-            guard.entries.values().filter_map(|entry| match entry.data.as_ref() {
-                MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
-                MxFp4StreamData::Owned(_) => None,
-            }).sum::<usize>() / MIB,
+            mapped_bytes / MIB,
             mapped_resident_pages.saturating_mul(4096) / MIB,
             mapped_residency,
             self.config.cache_per_source,
