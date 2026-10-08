@@ -67,6 +67,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --thinking false \
+            --max-tokens 8 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
 
