@@ -600,9 +600,20 @@ impl GgufArchive {
         let aligned_addr = start_addr / page_size * page_size;
         let prefix = start_addr - aligned_addr;
         let span = prefix.checked_add(len).ok_or_else(|| Error::msg("GGUF residency span overflow"))?;
-        let pages = span.div_ceil(page_size);
+        let mapping_remaining = mapping
+            .len()
+            .checked_sub(aligned_addr.saturating_sub(base))
+            .ok_or_else(|| Error::msg("GGUF residency address is outside mapping"))?;
+        let probe_len = span.min(mapping_remaining);
+        let pages = probe_len.div_ceil(page_size);
         let mut vec = vec![0u8; pages];
-        let rc = unsafe { libc::mincore(aligned_addr as *mut libc::c_void, pages * page_size, vec.as_mut_ptr()) };
+        let rc = unsafe {
+            libc::mincore(
+                aligned_addr as *mut libc::c_void,
+                pages * page_size,
+                vec.as_mut_ptr(),
+            )
+        };
         if rc != 0 {
             return Err(Error::wrap(std::io::Error::last_os_error()));
         }
