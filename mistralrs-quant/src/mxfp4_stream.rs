@@ -217,6 +217,11 @@ struct ReadJob {
     reply: SyncSender<io::Result<Arc<MxFp4StreamData>>>,
 }
 
+struct PrefaultJob {
+    data: Arc<MxFp4StreamData>,
+    reply: SyncSender<io::Result<Arc<MxFp4StreamData>>>,
+}
+
 struct WorkerFiles {
     normal: Vec<File>,
     direct: Vec<Option<File>>,
@@ -275,6 +280,8 @@ struct Stats {
     io_nanos: AtomicU64,
     evictions: AtomicU64,
     released_bytes: AtomicU64,
+    prefault_jobs: AtomicU64,
+    prefault_nanos: AtomicU64,
     report_calls: AtomicU64,
 }
 
@@ -297,6 +304,8 @@ pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
     queues: Vec<SyncSender<ReadJob>>,
     next_queue: AtomicUsize,
+    prefault_queues: Vec<SyncSender<PrefaultJob>>,
+    next_prefault_queue: AtomicUsize,
     paths: Vec<PathBuf>,
     archive: Arc<crate::GgufArchive>,
     config: MxFp4StreamConfig,
@@ -315,7 +324,38 @@ impl MxFp4StreamCache {
 
         let queue_size = 8usize;
         let mut queues = Vec::new();
+        let mut prefault_queues = Vec::new();
         let stats = Arc::new(Stats::default());
+
+        if config.zero_copy && config.overlap && config.prefault {
+            let worker_count = config.io_threads.min(2).max(1);
+            prefault_queues.reserve(worker_count);
+            for worker_id in 0..worker_count {
+                let (queue_tx, queue_rx) = mpsc::sync_channel::<PrefaultJob>(queue_size);
+                prefault_queues.push(queue_tx);
+                let worker_stats = stats.clone();
+                thread::Builder::new()
+                    .name(format!("mxfp4-prefault-{worker_id}"))
+                    .spawn(move || {
+                        while let Ok(job) = queue_rx.recv() {
+                            let started = std::time::Instant::now();
+                            let result = prefault_mapped(&job.data).map(|_| job.data.clone());
+                            worker_stats.prefault_jobs.fetch_add(1, Ordering::Relaxed);
+                            worker_stats.prefault_nanos.fetch_add(
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                Ordering::Relaxed,
+                            );
+                            let _ = job.reply.send(result);
+                        }
+                    })
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to start MXFP4 prefault worker: {err}"),
+                        )
+                    })?;
+            }
+        }
 
         if !config.zero_copy || config.o_direct {
             queues.reserve(config.io_threads);
@@ -385,6 +425,8 @@ impl MxFp4StreamCache {
             }),
             queues,
             next_queue: AtomicUsize::new(0),
+            prefault_queues,
+            next_prefault_queue: AtomicUsize::new(0),
             paths,
             archive: archive.clone(),
             budget_bytes: config.cache_budget_bytes(),
