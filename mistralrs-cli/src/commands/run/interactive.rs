@@ -1428,7 +1428,9 @@ async fn stream_assistant_response(
             Response::Chunk(chunk) => {
                 denoising_progress.clear();
                 last_usage = chunk.usage.clone();
-                let choice = &chunk.choices[0];
+                let Some(choice) = chunk.choices.first() else {
+                    continue;
+                };
 
                 let has_any_content =
                     choice.delta.content.is_some() || choice.delta.reasoning_content.is_some();
@@ -1499,8 +1501,63 @@ async fn stream_assistant_response(
                 denoising_progress.clear();
                 return Err(format!("Got a validation error: {e:?}"));
             }
-            Response::Done(_) => unreachable!(),
-            Response::CompletionDone(_) => unreachable!(),
+            Response::Done(response) => {
+                denoising_progress.clear();
+                if last_usage.is_none() {
+                    last_usage = Some(response.usage.clone());
+                }
+
+                if let Some(choice) = response.choices.first() {
+                    let content = choice.message.content.as_deref().unwrap_or_default();
+                    let reasoning = choice
+                        .message
+                        .reasoning_content
+                        .as_deref()
+                        .unwrap_or_default();
+
+                    if !reasoning.is_empty() {
+                        if first_token_duration.is_none() {
+                            first_token_duration =
+                                Some(Instant::now().duration_since(start_ttft));
+                        }
+                        assistant_reasoning.push_str(reasoning);
+                        print!("{GRAY}{reasoning}{RESET}");
+                    }
+
+                    if !content.is_empty() {
+                        if first_token_duration.is_none() {
+                            first_token_duration =
+                                Some(Instant::now().duration_since(start_ttft));
+                        }
+                        if was_reasoning {
+                            println!();
+                            was_reasoning = false;
+                        }
+                        assistant_output.push_str(content);
+                        print!("{content}");
+                    }
+                    io::stdout().flush().unwrap();
+                }
+                break;
+            }
+            Response::CompletionDone(response) => {
+                denoising_progress.clear();
+                if last_usage.is_none() {
+                    last_usage = Some(response.usage.clone());
+                }
+                if let Some(choice) = response.choices.first() {
+                    if !choice.text.is_empty() {
+                        if first_token_duration.is_none() {
+                            first_token_duration =
+                                Some(Instant::now().duration_since(start_ttft));
+                        }
+                        assistant_output.push_str(&choice.text);
+                        print!("{}", choice.text);
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                break;
+            }
             Response::CompletionModelError(_, _) => unreachable!(),
             Response::CompletionChunk(_) => unreachable!(),
             Response::ImageGeneration(_) => unreachable!(),
