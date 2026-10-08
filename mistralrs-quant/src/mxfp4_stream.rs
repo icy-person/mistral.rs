@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
-    io::{self},
+    io,
+    ops::Deref,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
@@ -26,6 +27,8 @@ pub(crate) struct MxFp4StreamConfig {
     pub cache_mb: Option<usize>,
     pub cache_floor_mb: usize,
     pub cache_ceil_mb: Option<usize>,
+    pub cache_per_source: usize,
+    pub zero_copy: bool,
     pub io_threads: usize,
     pub overlap: bool,
     pub o_direct: bool,
@@ -38,8 +41,10 @@ impl Default for MxFp4StreamConfig {
             cache_mb: None,
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
+            cache_per_source: 5,
+            zero_copy: true,
             io_threads: 4,
-            overlap: false,
+            overlap: true,
             o_direct: false,
             stats: false,
         }
@@ -52,19 +57,24 @@ impl MxFp4StreamConfig {
         let cache_mb = std::env::var("MISTRALRS_MOE_CACHE_MB")
             .ok()
             .and_then(|v| parse_cache_mb(&v));
-        let cache_floor_mb = env_usize(
-            "MISTRALRS_MOE_CACHE_FLOOR_MB",
-            defaults.cache_floor_mb,
-        );
+        let cache_floor_mb =
+            env_usize("MISTRALRS_MOE_CACHE_FLOOR_MB", defaults.cache_floor_mb);
         let cache_ceil_mb = match std::env::var("MISTRALRS_MOE_CACHE_CEIL_MB") {
             Ok(v) if v.trim().eq_ignore_ascii_case("none") => None,
             Ok(v) => v.parse::<usize>().ok().or(defaults.cache_ceil_mb),
             Err(_) => defaults.cache_ceil_mb,
         };
+
         Self {
             cache_mb,
             cache_floor_mb,
             cache_ceil_mb,
+            cache_per_source: env_usize(
+                "MISTRALRS_MOE_CACHE_PER_SOURCE",
+                defaults.cache_per_source,
+            )
+            .clamp(1, 32),
+            zero_copy: env_bool("MISTRALRS_MOE_ZERO_COPY", defaults.zero_copy),
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
             o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
@@ -130,7 +140,7 @@ fn available_memory_bytes() -> usize {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MxFp4StreamKey {
-    pub source: String,
+    pub source: Arc<str>,
     pub expert_index: usize,
 }
 
@@ -143,32 +153,100 @@ pub(crate) struct MxFp4StreamRange {
 }
 
 #[derive(Debug)]
-struct CacheEntry {
-    data: Arc<Vec<u8>>,
-    bytes: usize,
-    last_used: u64,
+pub(crate) enum MxFp4StreamData {
+    Owned(Arc<[u8]>),
+    ArchiveMapped {
+        archive: Arc<crate::GgufArchive>,
+        shard: usize,
+        offset: usize,
+        len: usize,
+    },
 }
 
-#[derive(Debug)]
-struct CacheInner {
-    entries: HashMap<MxFp4StreamKey, CacheEntry>,
-    used_bytes: usize,
-    clock: u64,
+impl MxFp4StreamData {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(data) => data.len(),
+            Self::ArchiveMapped { .. } => 0,
+        }
+    }
+}
+
+impl Deref for MxFp4StreamData {
+    type Target = [u8];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(data) => data,
+            Self::ArchiveMapped {
+                archive,
+                shard,
+                offset,
+                len,
+            } => archive
+                .shard_data_slice(*shard, *offset, *len)
+                .expect("validated zero-copy GGUF MXFP4 range"),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ReadJob {
-    path: PathBuf,
+    shard: usize,
     offset: u64,
     len: usize,
     file_len: usize,
-    o_direct: bool,
-    reply: SyncSender<io::Result<Vec<u8>>>,
+    reply: SyncSender<io::Result<Arc<MxFp4StreamData>>>,
+}
+
+struct WorkerFiles {
+    normal: Vec<File>,
+    direct: Vec<Option<File>>,
+}
+
+impl WorkerFiles {
+    fn new(paths: &[PathBuf], want_direct: bool) -> io::Result<Self> {
+        let mut normal = Vec::with_capacity(paths.len());
+        let mut direct = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            normal.push(File::open(path)?);
+
+            #[cfg(target_os = "linux")]
+            let direct_file = if want_direct {
+                match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(path)
+                {
+                    Ok(file) => Some(file),
+                    Err(err) => {
+                        tracing::debug!(
+                            "O_DIRECT unavailable for {}: {err}",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let direct_file = None;
+
+            direct.push(direct_file);
+        }
+
+        Ok(Self { normal, direct })
+    }
 }
 
 pub(crate) enum MxFp4StreamHandle {
-    Ready(Arc<Vec<u8>>),
-    Pending(Receiver<io::Result<Vec<u8>>>),
+    Ready(Arc<MxFp4StreamData>),
+    Pending(Receiver<io::Result<Arc<MxFp4StreamData>>>),
 }
 
 #[derive(Debug, Default)]
@@ -182,10 +260,26 @@ struct Stats {
 }
 
 #[derive(Debug)]
+struct CacheEntry {
+    data: Arc<MxFp4StreamData>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug)]
+struct CacheInner {
+    entries: HashMap<MxFp4StreamKey, CacheEntry>,
+    used_bytes: usize,
+    clock: u64,
+}
+
+#[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
-    queue: SyncSender<ReadJob>,
+    queues: Vec<SyncSender<ReadJob>>,
+    next_queue: AtomicUsize,
     paths: Vec<PathBuf>,
+    archive: Arc<crate::GgufArchive>,
     config: MxFp4StreamConfig,
     budget_bytes: usize,
     stats: Stats,
@@ -199,93 +293,166 @@ impl MxFp4StreamCache {
             .iter()
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
-        let queue_size = config.io_threads.saturating_mul(8).max(8);
-        let (queue, receiver) = mpsc::sync_channel::<ReadJob>(queue_size);
-        let receiver = Arc::new(Mutex::new(receiver));
 
-        let cache = Arc::new(Self {
+        let queue_size = 8usize;
+        let mut queues = Vec::new();
+
+        if !config.zero_copy || config.o_direct {
+            queues.reserve(config.io_threads);
+            for worker_id in 0..config.io_threads {
+                let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
+                queues.push(queue_tx);
+
+                let worker_paths = paths.clone();
+                let want_direct = config.o_direct;
+                thread::Builder::new()
+                    .name(format!("mxfp4-io-{worker_id}"))
+                    .spawn(move || {
+                        let files = match WorkerFiles::new(&worker_paths, want_direct) {
+                            Ok(files) => files,
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to open GPT-OSS MXFP4 shard files for worker {worker_id}: {err}"
+                                );
+                                return;
+                            }
+                        };
+
+                        while let Ok(job) = queue_rx.recv() {
+                            let Some(file) = files.normal.get(job.shard) else {
+                                let _ = job.reply.send(Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    "MXFP4 shard index out of range",
+                                )));
+                                continue;
+                            };
+
+                            let direct_file =
+                                files.direct.get(job.shard).and_then(Option::as_ref);
+                            let result = read_file_range(
+                                file,
+                                direct_file,
+                                job.offset,
+                                job.len,
+                                job.file_len,
+                            )
+                            .map(Arc::new);
+                            let _ = job.reply.send(result);
+                        }
+                    })
+                    .map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("failed to start MXFP4 I/O worker: {err}"),
+                        )
+                    })?;
+            }
+        }
+
+        Ok(Arc::new(Self {
             inner: Mutex::new(CacheInner {
                 entries: HashMap::new(),
                 used_bytes: 0,
                 clock: 0,
             }),
-            queue,
-            paths: paths.clone(),
+            queues,
+            next_queue: AtomicUsize::new(0),
+            paths,
+            archive: archive.clone(),
             budget_bytes: config.cache_budget_bytes(),
             config,
             stats: Stats::default(),
-        });
-
-        for worker_id in 0..config.io_threads {
-            let receiver = receiver.clone();
-            thread::Builder::new()
-                .name(format!("mxfp4-io-{worker_id}"))
-                .spawn(move || loop {
-                    let job = match receiver.lock() {
-                        Ok(lock) => lock.recv(),
-                        Err(_) => return,
-                    };
-                    let Ok(job) = job else {
-                        return;
-                    };
-                    let result = read_file_range(
-                        &job.path,
-                        job.offset,
-                        job.len,
-                        job.file_len,
-                        job.o_direct,
-                    );
-                    let _ = job.reply.send(result);
-                })
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("failed to start MXFP4 I/O worker: {err}")))?;
-        }
-
-        Ok(cache)
+        }))
     }
 
+    #[inline(always)]
     pub(crate) fn overlap(&self) -> bool {
         self.config.overlap
     }
 
-    fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<Vec<u8>>> {
+    #[inline(always)]
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.config.zero_copy && !self.config.o_direct
+    }
+
+    #[inline]
+    fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
         let mut guard = self.inner.lock().ok()?;
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
-        let entry = guard.entries.get_mut(&key)?;
+        let entry = guard.entries.get_mut(key)?;
         entry.last_used = now;
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
         Some(entry.data.clone())
     }
 
-    fn insert(&self, key: MxFp4StreamKey, data: Arc<Vec<u8>>) {
+    fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
         let len = data.len();
-        let capacity = self.budget_bytes;
-        if len == 0 || len > capacity {
+        if len > self.budget_bytes {
             return;
         }
+
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
+
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
+
         if let Some(old) = guard.entries.remove(&key) {
             guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
         }
-        while guard.used_bytes.saturating_add(len) > capacity {
-            let Some(victim) = guard
+
+        // ArchiveMapped entries are just tiny descriptors pointing at the
+        // existing GGUF mmap, so they consume no heap-cache budget. Do not
+        // evict them by the per-source quota: keeping the full routed-expert
+        // working set avoids repeated cache misses and repeated page advice.
+        let heap_backed = len != 0;
+
+        if heap_backed {
+            let source = key.source.clone();
+            while guard
                 .entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(old) = guard.entries.remove(&victim) {
-                guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                .filter(|(entry_key, _)| entry_key.source == source)
+                .count()
+                >= self.config.cache_per_source
+            {
+                let Some(victim) = guard
+                    .entries
+                    .iter()
+                    .filter(|(entry_key, _)| entry_key.source == source)
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(entry_key, _)| entry_key.clone())
+                else {
+                    break;
+                };
+
+                if let Some(old) = guard.entries.remove(&victim) {
+                    guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            while guard.used_bytes.saturating_add(len) > self.budget_bytes {
+                let Some(victim) = guard
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(entry_key, _)| entry_key.clone())
+                else {
+                    break;
+                };
+
+                if let Some(old) = guard.entries.remove(&victim) {
+                    guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-        if guard.used_bytes.saturating_add(len) <= capacity {
+
+        // Zero-copy mappings are not constrained by the heap byte budget.
+        if !heap_backed || guard.used_bytes.saturating_add(len) <= self.budget_bytes {
             guard.used_bytes = guard.used_bytes.saturating_add(len);
             guard.entries.insert(
                 key,
@@ -298,24 +465,63 @@ impl MxFp4StreamCache {
         }
     }
 
-    fn submit(&self, range: MxFp4StreamRange) -> io::Result<Receiver<io::Result<Vec<u8>>>> {
-        let path = self
-            .paths
-            .get(range.shard)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 shard index out of range"))?
-            .clone();
+    #[inline]
+    fn mapped_range(&self, range: MxFp4StreamRange) -> Option<Arc<MxFp4StreamData>> {
+        if !self.config.zero_copy || self.config.o_direct {
+            return None;
+        }
+
+        let offset = usize::try_from(range.offset).ok()?;
+        self.archive
+            .shard_data_slice(range.shard, offset, range.len)
+            .ok()?;
+        let _ = self
+            .archive
+            .shard_data_will_need(range.shard, offset, range.len);
+
+        Some(Arc::new(MxFp4StreamData::ArchiveMapped {
+            archive: self.archive.clone(),
+            shard: range.shard,
+            offset,
+            len: range.len,
+        }))
+    }
+
+    fn submit(
+        &self,
+        range: MxFp4StreamRange,
+    ) -> io::Result<Receiver<io::Result<Arc<MxFp4StreamData>>>> {
+        if self.queues.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "MXFP4 zero-copy mapping unavailable and no I/O workers are configured",
+            ));
+        }
+        if range.shard >= self.paths.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MXFP4 shard index out of range",
+            ));
+        }
+
         let (tx, rx) = mpsc::sync_channel(1);
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
-        self.queue
+        let worker = self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len();
+
+        self.queues[worker]
             .send(ReadJob {
-                path,
+                shard: range.shard,
                 offset: range.offset,
                 len: range.len,
                 file_len: range.file_len,
-                o_direct: self.config.o_direct,
                 reply: tx,
             })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "MXFP4 I/O workers stopped"))?;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "MXFP4 I/O worker stopped",
+                )
+            })?;
+
         Ok(rx)
     }
 
@@ -323,18 +529,27 @@ impl MxFp4StreamCache {
         &self,
         key: &MxFp4StreamKey,
         range: MxFp4StreamRange,
-    ) -> crate::Result<Arc<Vec<u8>>> {
+    ) -> crate::Result<Arc<MxFp4StreamData>> {
         if let Some(data) = self.lookup(key) {
             return Ok(data);
         }
+
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(data) = self.mapped_range(range) {
+            self.insert(key.clone(), data.clone());
+            return Ok(data);
+        }
+
         let rx = self.submit(range)?;
         let data = rx
             .recv()
             .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
             .map_err(candle_core::Error::wrap)?;
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-        let data = Arc::new(data);
+        self.stats
+            .bytes_read
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.insert(key.clone(), data.clone());
         Ok(data)
     }
@@ -342,18 +557,26 @@ impl MxFp4StreamCache {
     pub(crate) fn prefetch(
         &self,
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
-    ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
-        let mut result = HashMap::with_capacity(requests.len());
-        for (key, range) in requests.iter().cloned() {
-            if let Some(data) = self.lookup(&key) {
-                result.insert(key, MxFp4StreamHandle::Ready(data));
-            } else {
-                result.insert(
-                    key,
-                    MxFp4StreamHandle::Pending(self.submit(range)?),
-                );
+    ) -> crate::Result<VecDeque<MxFp4StreamHandle>> {
+        let mut result = VecDeque::with_capacity(requests.len());
+
+        for (key, range) in requests {
+            if let Some(data) = self.lookup(key) {
+                result.push_back(MxFp4StreamHandle::Ready(data));
+                continue;
             }
+
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(data) = self.mapped_range(*range) {
+                self.insert(key.clone(), data.clone());
+                result.push_back(MxFp4StreamHandle::Ready(data));
+                continue;
+            }
+
+            result.push_back(MxFp4StreamHandle::Pending(self.submit(*range)?));
         }
+
         Ok(result)
     }
 
@@ -361,7 +584,7 @@ impl MxFp4StreamCache {
         &self,
         key: &MxFp4StreamKey,
         handle: MxFp4StreamHandle,
-    ) -> crate::Result<Arc<Vec<u8>>> {
+    ) -> crate::Result<Arc<MxFp4StreamData>> {
         match handle {
             MxFp4StreamHandle::Ready(data) => Ok(data),
             MxFp4StreamHandle::Pending(rx) => {
@@ -370,8 +593,9 @@ impl MxFp4StreamCache {
                     .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
                     .map_err(candle_core::Error::wrap)?;
                 self.stats.reads.fetch_add(1, Ordering::Relaxed);
-                self.stats.bytes_read.fetch_add(data.len() as u64, Ordering::Relaxed);
-                let data = Arc::new(data);
+                self.stats
+                    .bytes_read
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
                 self.insert(key.clone(), data.clone());
                 Ok(data)
             }
@@ -382,53 +606,66 @@ impl MxFp4StreamCache {
         if !self.config.stats {
             return;
         }
+
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
         if report != 0 && !report.is_multiple_of(32) {
             return;
         }
+
         let Ok(guard) = self.inner.lock() else {
             return;
         };
+
         let hits = self.stats.hits.load(Ordering::Relaxed);
         let misses = self.stats.misses.load(Ordering::Relaxed);
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+
         let requests = hits.saturating_add(misses);
         let hit_rate = if requests == 0 {
             0.0
         } else {
             hits as f64 / requests as f64
         };
+
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
             self.budget_bytes / MIB,
+            self.config.cache_per_source,
             hits,
             misses,
             hit_rate * 100.0,
             reads,
-            bytes / MIB as u64,
+            bytes / (MIB as u64),
             evictions,
             self.config.io_threads,
             self.config.overlap,
+            self.config.zero_copy,
             self.config.o_direct,
         );
     }
 }
 
 fn read_file_range(
-    path: &PathBuf,
+    file: &File,
+    direct_file: Option<&File>,
     offset: u64,
     len: usize,
     file_len: usize,
-    want_direct: bool,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<MxFp4StreamData> {
     let end = offset
         .checked_add(len as u64)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "MXFP4 read range overflow"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MXFP4 read range overflow",
+            )
+        })?;
+
     if end > file_len as u64 {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -437,38 +674,43 @@ fn read_file_range(
     }
 
     #[cfg(target_os = "linux")]
-    if want_direct {
+    if let Some(direct) = direct_file {
         let aligned_start = offset / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT;
-        let aligned_end = end.div_ceil(DIRECT_ALIGNMENT as u64) * DIRECT_ALIGNMENT;
+        let aligned_end = end.div_ceil(DIRECT_ALIGNMENT) * DIRECT_ALIGNMENT;
+
         if aligned_start < aligned_end && aligned_end <= file_len as u64 {
-            let aligned_len = usize::try_from(aligned_end - aligned_start)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "aligned MXFP4 read too large"))?;
-            match read_direct(path, aligned_start, aligned_len) {
+            let aligned_len = usize::try_from(aligned_end - aligned_start).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "aligned MXFP4 read too large",
+                )
+            })?;
+
+            match read_direct(direct, aligned_start, aligned_len) {
                 Ok(buf) => {
                     let begin = usize::try_from(offset - aligned_start).unwrap_or(0);
-                    return Ok(buf[begin..begin + len].to_vec());
+                    return Ok(MxFp4StreamData::Owned(Arc::<[u8]>::from(
+                        buf[begin..begin + len].to_vec(),
+                    )));
                 }
                 Err(err) => {
-                    tracing::debug!("O_DIRECT MXFP4 read fallback for {}: {err}", path.display());
+                    tracing::debug!(
+                        "O_DIRECT MXFP4 read fallback for range {offset}..{end}: {err}"
+                    );
                 }
             }
         }
     }
 
-    let file = File::open(path)?;
     let mut buf = vec![0u8; len];
-    read_exact_at(&file, offset, &mut buf)?;
-    Ok(buf)
+    read_exact_at(file, offset, &mut buf)?;
+    Ok(MxFp4StreamData::Owned(Arc::<[u8]>::from(buf)))
 }
 
 #[cfg(target_os = "linux")]
-fn read_direct(path: &PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)?;
+fn read_direct(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut aligned = AlignedBuffer::new(len)?;
-    read_exact_at(&file, offset, aligned.as_mut_slice())?;
+    read_exact_at(file, offset, aligned.as_mut_slice())?;
     Ok(aligned.to_vec())
 }
 
@@ -485,9 +727,14 @@ impl AlignedBuffer {
         let layout = std::alloc::Layout::from_size_align(len, DIRECT_ALIGNMENT as usize)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+
         if ptr.is_null() {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "MXFP4 aligned allocation failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "MXFP4 aligned allocation failed",
+            ));
         }
+
         Ok(Self { ptr, len, layout })
     }
 
@@ -509,21 +756,29 @@ impl Drop for AlignedBuffer {
 
 fn read_exact_at(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0usize;
+
     while done < buf.len() {
         #[cfg(unix)]
         let n = FileExt::read_at(file, &mut buf[done..], offset)?;
+
         #[cfg(not(unix))]
         let n = {
             let mut clone = file.try_clone()?;
             clone.seek(SeekFrom::Start(offset))?;
             clone.read(&mut buf[done..])?
         };
+
         if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short MXFP4 expert read"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short MXFP4 expert read",
+            ));
         }
+
         done += n;
         offset += n as u64;
     }
+
     Ok(())
 }
 
@@ -541,11 +796,11 @@ mod tests {
     #[test]
     fn cache_keys_include_tensor_source() {
         let gate_l0 = MxFp4StreamKey {
-            source: "blk.0.ffn_gate_exps.weight".to_string(),
+            source: Arc::<str>::from("blk.0.ffn_gate_exps.weight"),
             expert_index: 0,
         };
         let gate_l1 = MxFp4StreamKey {
-            source: "blk.1.ffn_gate_exps.weight".to_string(),
+            source: Arc::<str>::from("blk.1.ffn_gate_exps.weight"),
             expert_index: 0,
         };
         assert_ne!(gate_l0, gate_l1);
@@ -557,6 +812,8 @@ mod tests {
             cache_mb: Some(4096),
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(2048),
+            cache_per_source: 5,
+            zero_copy: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,

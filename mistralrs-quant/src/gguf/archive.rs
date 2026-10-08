@@ -536,6 +536,53 @@ impl GgufArchive {
         self.tensors.contains_key(name)
     }
 
+    /// Returns a zero-copy byte slice into the archive's existing shard mmap.
+    #[inline]
+    pub(crate) fn shard_data_will_need(
+        &self,
+        shard_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let mapping = self.mappings.get(shard_index).ok_or_else(|| {
+            Error::msg(format!("GGUF shard index {shard_index} is out of range"))
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            Error::msg("GGUF zero-copy shard range overflow")
+        })?;
+        if end > mapping.len() {
+            return Err(Error::msg(format!(
+                "GGUF zero-copy shard range {offset}..{end} exceeds mapping length {}",
+                mapping.len()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            let _ = mapping.advise_range(memmap2::Advice::WillNeed, offset, len);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shard_data_slice(
+        &self,
+        shard_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<&[u8]> {
+        let mapping = self.mappings.get(shard_index).ok_or_else(|| {
+            Error::msg(format!("GGUF shard index {shard_index} is out of range"))
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            Error::msg("GGUF zero-copy shard range overflow")
+        })?;
+        mapping.get(offset..end).ok_or_else(|| {
+            Error::msg(format!(
+                "GGUF zero-copy shard range {offset}..{end} exceeds mapping length {}",
+                mapping.len()
+            ))
+        })
+    }
+
     pub fn tensor_data(&self, name: &str) -> Result<GgufTensorData<'_>> {
         let info = self.tensor_info(name)?;
         let range = info.data_range.as_ref().ok_or_else(|| {
