@@ -571,6 +571,32 @@ impl MxFp4StreamCache {
         }))
     }
 
+    fn submit_prefault(
+        &self,
+        data: Arc<MxFp4StreamData>,
+    ) -> io::Result<Option<Receiver<io::Result<Arc<MxFp4StreamData>>>>> {
+        if self.prefault_queues.is_empty() {
+            return Ok(None);
+        }
+
+        let (reply, rx) = mpsc::sync_channel(1);
+        let worker = self
+            .next_prefault_queue
+            .fetch_add(1, Ordering::Relaxed)
+            % self.prefault_queues.len();
+
+        self.prefault_queues[worker]
+            .send(PrefaultJob { data, reply })
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "MXFP4 prefault worker stopped",
+                )
+            })?;
+
+        Ok(Some(rx))
+    }
+
     fn submit(
         &self,
         range: MxFp4StreamRange,
@@ -654,7 +680,11 @@ impl MxFp4StreamCache {
 
             if let Some(data) = self.mapped_range(*range) {
                 self.insert(key.clone(), data.clone());
-                result.insert(key.clone(), MxFp4StreamHandle::Ready(data));
+                if let Some(rx) = self.submit_prefault(data.clone())? {
+                    result.insert(key.clone(), MxFp4StreamHandle::Pending(rx));
+                } else {
+                    result.insert(key.clone(), MxFp4StreamHandle::Ready(data));
+                }
                 continue;
             }
 
@@ -835,6 +865,40 @@ impl MxFp4StreamCache {
             self.config.release_idle,
         );
     }
+}
+
+fn prefault_mapped(data: &MxFp4StreamData) -> io::Result<()> {
+    let bytes = data.deref();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    let page_size = {
+        let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if value <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "unable to determine system page size for MXFP4 prefault",
+            ));
+        }
+        value as usize
+    };
+
+    #[cfg(not(unix))]
+    let page_size = 4096usize;
+
+    let mut checksum = 0u8;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        // SAFETY: offset is inside the validated mapping or owned buffer.
+        // This deliberately faults one byte per page without retaining another copy.
+        checksum ^= unsafe { std::ptr::read_volatile(bytes.as_ptr().add(offset)) };
+        offset = offset.saturating_add(page_size);
+    }
+    checksum ^= bytes[bytes.len() - 1];
+    std::hint::black_box(checksum);
+    Ok(())
 }
 
 fn read_file_range(
