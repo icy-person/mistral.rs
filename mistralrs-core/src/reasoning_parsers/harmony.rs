@@ -570,6 +570,26 @@ mod tests {
     }
 
     #[test]
+    fn test_harmony_stream_parser_extracts_final_channel() {
+        prewarm_harmony_encoding();
+        let mut ctx = HarmonyContext::new().expect("Harmony parser should initialize");
+
+        // Canonical GPT-OSS Harmony example from OpenAI's format documentation.
+        let tokens = [
+            200005, 35644, 200008, 1844, 31064, 25, 392, 4827, 382, 220, 17, 659, 220, 17,
+            16842, 12295, 81645, 13, 51441, 6052, 13, 200007, 200006, 173781, 200005, 17196,
+            200008, 17, 659, 220, 17, 314, 220, 19, 13, 200002,
+        ];
+
+        for token in tokens {
+            ctx.process_token(token);
+        }
+        ctx.process_eos();
+
+        assert_eq!(ctx.final_content().as_deref(), Some("2 + 2 = 4."));
+    }
+
+    #[test]
     fn test_harmony_delta_reasoning_content() {
         let both = HarmonyDelta {
             analysis_delta: Some("thinking ".to_string()),
