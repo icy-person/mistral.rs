@@ -618,7 +618,9 @@ impl GgufArchive {
             return Err(Error::wrap(std::io::Error::last_os_error()));
         }
         let resident = vec.iter().filter(|&&v| v & 1 != 0).count();
-        Ok((resident, pages))
+        let resident_bytes = resident.saturating_mul(page_size).min(len);
+        let total_bytes = pages.saturating_mul(page_size).min(len.saturating_add(prefix));
+        Ok((resident_bytes, total_bytes))
     }
 
     #[cfg(target_os = "linux")]
