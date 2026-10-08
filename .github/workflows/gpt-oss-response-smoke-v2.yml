@@ -72,8 +72,8 @@ jobs:
             --cache-floor-mb 1024 \
             --cache-ceil-mb 1024 \
             --io-threads 4 \
-            --thinking false \
-            --max-tokens 256 \
+            --reasoning-effort low \
+            --max-tokens 512 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>fallback.stderr | tee fallback.stdout
 
@@ -93,8 +93,8 @@ jobs:
             --cache-floor-mb 1024 \
             --cache-ceil-mb 1024 \
             --io-threads 4 \
-            --thinking false \
-            --max-tokens 256 \
+            --reasoning-effort low \
+            --max-tokens 512 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>fused.stderr | tee fused.stdout
 
