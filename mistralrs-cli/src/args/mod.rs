@@ -753,6 +753,11 @@ pub struct RuntimeOptions {
     #[serde(default = "default_moe_io_threads")]
     pub moe_io_threads: usize,
 
+    /// CPU worker count for the fused GPT-OSS MXFP4 kernel. Use an integer or 'physical'.
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", default_value = "physical")]
+    #[serde(default = "default_moe_threads")]
+    pub moe_threads: String,
+
     /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
     #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
     #[serde(default = "default_moe_overlap")]
@@ -980,6 +985,10 @@ pub struct BenchRuntimeOptions {
     #[arg(long = "io-threads", env = "MISTRALRS_MOE_IO_THREADS", default_value_t = 4)]
     pub moe_io_threads: usize,
 
+    /// CPU worker count for the fused GPT-OSS MXFP4 kernel. Use an integer or 'physical'.
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", default_value = "physical")]
+    pub moe_threads: String,
+
     /// Overlap expert reads with CPU compute.
     #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
     pub moe_overlap: bool,
@@ -1041,12 +1050,28 @@ impl BenchRuntimeOptions {
     pub fn apply_moe_stream_env(&self) {
         std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
+        std::env::set_var(
+            "MISTRALRS_MOE_THREADS",
+            if self.moe_threads.trim().is_empty() {
+                "physical"
+            } else {
+                self.moe_threads.trim()
+            },
+        );
         std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
         match self.moe_cache_ceil_mb {
             Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
             None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
         }
         std::env::set_var("MISTRALRS_MOE_IO_THREADS", self.moe_io_threads.clamp(1, 32).to_string());
+        std::env::set_var(
+            "MISTRALRS_MOE_THREADS",
+            if self.moe_threads.trim().is_empty() {
+                "physical"
+            } else {
+                self.moe_threads.trim()
+            },
+        );
         std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_ZERO_COPY", if self.moe_zero_copy { "1" } else { "0" });
@@ -1253,6 +1278,7 @@ impl Default for RuntimeOptions {
             moe_cache_floor_mb: 1536,
             moe_cache_ceil_mb: Some(4096),
             moe_io_threads: 4,
+            moe_threads: "physical".to_string(),
             moe_overlap: false,
             moe_o_direct: false,
             moe_zero_copy: true,
@@ -1307,6 +1333,10 @@ fn default_moe_overlap() -> bool {
 
 fn default_moe_release_idle() -> u64 {
     4096
+}
+
+fn default_moe_threads() -> String {
+    "physical".to_string()
 }
 
 fn default_true() -> bool {
