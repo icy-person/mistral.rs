@@ -74,7 +74,7 @@ pub struct MxFp4StreamingExpertLayer {
     expert_ranges: Vec<MxFp4StreamRange>,
     // Zero-copy entries are immutable mmap descriptors. Keep a tiny per-layer
     // OnceLock table so hot decode hits bypass the shared cache mutex/hash lookup.
-    zero_copy_experts: Vec<Vec<OnceLock<Arc<MxFp4StreamData>>>,
+    zero_copy_experts: Vec<Vec<OnceLock<Arc<MxFp4StreamData>>>>,
     cache: Arc<MxFp4StreamCache>,
 }
 
