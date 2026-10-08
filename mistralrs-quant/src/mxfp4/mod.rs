@@ -2558,6 +2558,26 @@ impl QuantizedSerde for MxFp4StreamingExpertLayer {
     }
 }
 
+/**
+ * Public module-level entry point for the fused GPT-OSS MXFP4 path.
+ *
+ * Keeps the associated implementation intact for existing callers while also
+ * providing the crate-level API exported by mistralrs-quant.
+ */
+pub fn fused_gptoss_mlp(
+    gate_up: &MxFp4StreamingExpertLayer,
+    down: &MxFp4StreamingExpertLayer,
+    x: &Tensor,
+    indices: &Tensor,
+    weights: &Tensor,
+    alpha: f32,
+    limit: f32,
+) -> Result<Option<Tensor>> {
+    MxFp4StreamingExpertLayer::fused_gptoss_mlp(
+        gate_up, down, x, indices, weights, alpha, limit,
+    )
+}
+
 impl MXFP4Layer {
     pub(crate) fn inspect_uqff_header(layer: &UqffLayerHeaderView<'_>) -> Option<UqffHeaderMatch> {
         const WEIGHT_SUFFIXES: &[&str] = &["weight", "weight.format", "weight.scales"];
