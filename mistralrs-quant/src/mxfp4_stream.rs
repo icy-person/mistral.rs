@@ -583,12 +583,12 @@ impl MxFp4StreamCache {
     pub(crate) fn prefetch(
         &self,
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
-    ) -> crate::Result<VecDeque<MxFp4StreamHandle>> {
-        let mut result = VecDeque::with_capacity(requests.len());
+    ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
+        let mut result = HashMap::with_capacity(requests.len());
 
         for (key, range) in requests {
             if let Some(data) = self.lookup(key) {
-                result.push_back(MxFp4StreamHandle::Ready(data));
+                result.insert(key.clone(), MxFp4StreamHandle::Ready(data));
                 continue;
             }
 
@@ -596,11 +596,11 @@ impl MxFp4StreamCache {
 
             if let Some(data) = self.mapped_range(*range) {
                 self.insert(key.clone(), data.clone());
-                result.push_back(MxFp4StreamHandle::Ready(data));
+                result.insert(key.clone(), MxFp4StreamHandle::Ready(data));
                 continue;
             }
 
-            result.push_back(MxFp4StreamHandle::Pending(self.submit(*range)?));
+            result.insert(key.clone(), MxFp4StreamHandle::Pending(self.submit(*range)?));
         }
 
         Ok(result)
