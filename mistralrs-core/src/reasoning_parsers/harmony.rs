@@ -127,6 +127,9 @@ impl HarmonyAccumulated {
 /// delta extraction for streaming responses.
 pub struct HarmonyContext {
     parser: StreamableParser,
+    // Keep the exact generated token stream so a malformed Harmony boundary can
+    // be reparsed losslessly at the end of generation.
+    tokens: Vec<u32>,
     // Track lengths for delta extraction (for parser content)
     last_analysis_len: usize,
     last_commentary_len: usize,
@@ -164,6 +167,7 @@ impl HarmonyContext {
         .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
         Ok(Self {
             parser,
+            tokens: Vec::new(),
             last_analysis_len: 0,
             last_commentary_len: 0,
             last_final_len: 0,
@@ -180,8 +184,12 @@ impl HarmonyContext {
 
     /// Process a token and return any new delta content
     pub fn process_token(&mut self, token_id: u32) -> HarmonyDelta {
-        // process() returns Result, ignore errors for robustness
-        let _ = self.parser.process(token_id);
+        self.tokens.push(token_id);
+        if let Err(error) = self.parser.process(token_id) {
+            // Keep malformed model output recoverable. The complete token stream is
+            // retained and replayed with permissive parsing at finalization.
+            tracing::debug!(?error, "Harmony parser rejected a token; deferring to replay recovery");
+        }
         self.extract_delta()
     }
 
@@ -417,6 +425,39 @@ impl crate::reasoning_parsers::ReasoningParser for HarmonyContext {
 
     fn finalize(&mut self) {
         self.process_eos();
+
+        // If the incremental parser never produced a final channel, replay the exact
+        // token stream through a fresh permissive parser. This handles malformed
+        // Harmony boundaries without exposing raw control tokens to callers.
+        if self.accumulated.final_content.is_empty() && !self.tokens.is_empty() {
+            if let Ok(mut recovered) = StreamableParser::new_with_options(
+                get_harmony_encoding().clone(),
+                Some(Role::Assistant),
+                ParseOptions { strict: false },
+            ) {
+                let mut ok = true;
+                for &token in &self.tokens {
+                    if recovered.process(token).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    let _ = recovered.process_eos();
+                    self.parser = recovered;
+                    self.last_analysis_len = 0;
+                    self.last_commentary_len = 0;
+                    self.last_final_len = 0;
+                    self.sent_reasoning_len = 0;
+                    self.sent_final_len = 0;
+                    self.channel = None;
+                    self.accumulated = HarmonyAccumulated::default();
+                    self.current_tool_call = None;
+                    self.tool_calls.clear();
+                    self.extract_delta();
+                }
+            }
+        }
     }
 
     fn get_content_delta(&mut self) -> Option<String> {
