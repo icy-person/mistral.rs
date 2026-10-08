@@ -621,6 +621,39 @@ impl GgufArchive {
         Ok((resident, pages))
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shard_data_dont_need(
+        &self,
+        shard_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let mapping = self.mappings.get(shard_index).ok_or_else(|| {
+            Error::msg(format!("GGUF shard index {shard_index} is out of range"))
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| Error::msg("GGUF DONTNEED range overflow"))?;
+        if end > mapping.len() {
+            return Err(Error::msg(format!(
+                "GGUF DONTNEED range {offset}..{end} exceeds mapping length {}",
+                mapping.len()
+            )));
+        }
+        if len != 0 {
+            let _ = mapping.advise_range(memmap2::Advice::DontNeed, offset, len);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn shard_data_dont_need(
+        &self,
+        _shard_index: usize,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn shard_data_residency(
         &self,
