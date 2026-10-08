@@ -22,7 +22,7 @@ pub trait ReasoningParser: Send + Sync {
 
     /// Process one model token. Token-native parsers such as OpenAI Harmony can
     /// use the original token id instead of re-tokenizing decoded bytes.
-    fn process_token(&mut self, token_id: u32, bytes: &[u8]) {
+    fn process_token(&mut self, _token_id: u32, bytes: &[u8]) {
         self.process_bytes(bytes);
     }
     /// Finalize at end of stream (flush buffers, handle unclosed blocks).
