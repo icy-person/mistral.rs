@@ -763,6 +763,11 @@ pub struct RuntimeOptions {
     #[serde(default)]
     pub moe_o_direct: bool,
 
+    /// Use zero-copy mmap for routed MXFP4 experts. Disable for an apples-to-apples heap-cache benchmark.
+    #[arg(long = "moe-zero-copy", env = "MISTRALRS_MOE_ZERO_COPY", default_value_t = true)]
+    #[serde(default = "default_true")]
+    pub moe_zero_copy: bool,
+
     /// Maximum cached experts per source. Zero means no per-source quota; the global byte budget remains authoritative.
     #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
     #[serde(default)]
@@ -978,6 +983,10 @@ pub struct BenchRuntimeOptions {
     #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
     pub moe_o_direct: bool,
 
+    /// Use zero-copy mmap for routed MXFP4 experts.
+    #[arg(long = "moe-zero-copy", env = "MISTRALRS_MOE_ZERO_COPY", default_value_t = true)]
+    pub moe_zero_copy: bool,
+
     /// Emit streaming telemetry during the benchmark.
     #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
     pub moe_stats: bool,
@@ -1031,6 +1040,7 @@ impl BenchRuntimeOptions {
         std::env::set_var("MISTRALRS_MOE_IO_THREADS", self.moe_io_threads.clamp(1, 32).to_string());
         std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_ZERO_COPY", if self.moe_zero_copy { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", self.moe_cache_per_source.min(128).to_string());
         std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
@@ -1124,6 +1134,7 @@ impl RuntimeOptions {
         );
         std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_ZERO_COPY", if self.moe_zero_copy { "1" } else { "0" });
         std::env::set_var(
             "MISTRALRS_MOE_CACHE_PER_SOURCE",
             self.moe_cache_per_source.min(128).to_string(),
@@ -1233,6 +1244,7 @@ impl Default for RuntimeOptions {
             moe_io_threads: 4,
             moe_overlap: false,
             moe_o_direct: false,
+            moe_zero_copy: true,
             moe_cache_per_source: 0,
             moe_release_cold: false,
             moe_release_idle: 4096,
@@ -1283,6 +1295,10 @@ fn default_moe_overlap() -> bool {
 
 fn default_moe_release_idle() -> u64 {
     4096
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
