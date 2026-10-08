@@ -769,7 +769,14 @@ pub struct RuntimeOptions {
     pub moe_o_direct: bool,
 
     /// Use zero-copy mmap for routed MXFP4 experts. Disable for an apples-to-apples heap-cache benchmark.
-    #[arg(long = "moe-zero-copy", env = "MISTRALRS_MOE_ZERO_COPY", default_value_t = true)]
+    #[arg(
+        long = "moe-zero-copy",
+        env = "MISTRALRS_MOE_ZERO_COPY",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
     #[serde(default = "default_true")]
     pub moe_zero_copy: bool,
 
@@ -789,7 +796,14 @@ pub struct RuntimeOptions {
     pub moe_release_idle: u64,
 
     /// Prefault zero-copy expert mmap pages in background workers before compute.
-    #[arg(long = "moe-prefault", env = "MISTRALRS_MOE_PREFAULT", default_value_t = true)]
+    #[arg(
+        long = "moe-prefault",
+        env = "MISTRALRS_MOE_PREFAULT",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
     #[serde(default = "default_true")]
     pub moe_prefault: bool,
 
@@ -998,7 +1012,14 @@ pub struct BenchRuntimeOptions {
     pub moe_o_direct: bool,
 
     /// Use zero-copy mmap for routed MXFP4 experts.
-    #[arg(long = "moe-zero-copy", env = "MISTRALRS_MOE_ZERO_COPY", default_value_t = true)]
+    #[arg(
+        long = "moe-zero-copy",
+        env = "MISTRALRS_MOE_ZERO_COPY",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
     pub moe_zero_copy: bool,
 
     /// Emit streaming telemetry during the benchmark.
@@ -1018,7 +1039,14 @@ pub struct BenchRuntimeOptions {
     pub moe_release_idle: u64,
 
     /// Prefault zero-copy expert mmap pages in background workers before compute.
-    #[arg(long = "moe-prefault", env = "MISTRALRS_MOE_PREFAULT", default_value_t = true)]
+    #[arg(
+        long = "moe-prefault",
+        env = "MISTRALRS_MOE_PREFAULT",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
     pub moe_prefault: bool,
 
     /// Path to a MatFormer config (CSV/JSON describing available slices). See model card.
@@ -1050,14 +1078,6 @@ impl BenchRuntimeOptions {
     pub fn apply_moe_stream_env(&self) {
         std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
-        std::env::set_var(
-            "MISTRALRS_MOE_THREADS",
-            if self.moe_threads.trim().is_empty() {
-                "physical"
-            } else {
-                self.moe_threads.trim()
-            },
-        );
         std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
         match self.moe_cache_ceil_mb {
             Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
