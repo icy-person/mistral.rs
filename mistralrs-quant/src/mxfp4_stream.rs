@@ -865,6 +865,7 @@ impl MxFp4StreamCache {
             self.config.o_direct,
             self.config.release_cold,
             self.config.release_idle,
+            self.config.prefault,
         );
     }
 }
