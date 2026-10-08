@@ -270,7 +270,10 @@ impl Engine {
             .is_some_and(|choice| choice.forced_function_name().is_some());
         let needs_tool_call_state =
             has_tools || uses_channel_tool_call_strategy || validates_forced_tool_choice;
-        if preferred_tool_call_format == Some(ToolCallFormat::Harmony)
+        let template_uses_harmony = get_mut_arcmutex!(self.pipeline)
+            .get_chat_template()
+            .is_some_and(|template| template.is_harmony_format());
+        if (template_uses_harmony || preferred_tool_call_format == Some(ToolCallFormat::Harmony))
             && !crate::reasoning_parsers::harmony::is_harmony_encoding_ready()
         {
             if let Err(e) = tokio::task::block_in_place(|| {
