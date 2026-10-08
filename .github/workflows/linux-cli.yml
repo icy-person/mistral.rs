@@ -61,6 +61,30 @@ jobs:
           ./target/release/mistralrs stream --help >/dev/null
           test -x target/release/mistralrs
 
+      - name: Run GPT-OSS 20B response smoke test
+        env:
+          RUST_LOG: error
+          MISTRALRS_MOE_ZERO_COPY: "true"
+          MISTRALRS_MOE_OVERLAP: "false"
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
+        run: |
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output gpt-oss-20b-MXFP4.gguf \
+            "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf"
+          ./target/release/mistralrs run \
+            --cpu \
+            -f "$PWD/gpt-oss-20b-MXFP4.gguf" \
+            --moe-stream \
+            --cache-mb 1024 \
+            --cache-floor-mb 1024 \
+            --cache-ceil-mb 1024 \
+            --io-threads 4 \
+            --thinking false \
+            --max-tokens 8 \
+            -i "Reply with exactly this number and nothing else: 323" \
+            2>model.stderr | tee model.stdout
+          grep -q "323" model.stdout
+
       - name: Package CLI
         run: |
           mkdir -p dist
