@@ -420,6 +420,7 @@ impl MxFp4StreamCache {
         let now = guard.clock;
         if let Some(entry) = guard.entries.get_mut(key) {
             entry.last_used = now;
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -685,23 +686,33 @@ impl MxFp4StreamCache {
     }
 
     fn mapped_residency(&self) -> (usize, usize) {
-        let Ok(guard) = self.inner.lock() else {
-            return (0, 0);
+        let ranges = {
+            let Ok(guard) = self.inner.lock() else {
+                return (0, 0);
+            };
+            guard
+                .entries
+                .values()
+                .filter_map(|entry| match entry.data.as_ref() {
+                    MxFp4StreamData::ArchiveMapped {
+                        shard,
+                        offset,
+                        len,
+                        ..
+                    } => Some((*shard, *offset, *len)),
+                    MxFp4StreamData::Owned(_) => None,
+                })
+                .collect::<Vec<_>>()
         };
+
         let mut resident_bytes = 0usize;
         let mut total_bytes = 0usize;
-        for entry in guard.entries.values() {
-            if let MxFp4StreamData::ArchiveMapped {
-                shard,
-                offset,
-                len,
-                ..
-            } = entry.data.as_ref()
+        for (shard, offset, len) in ranges {
+            if let Ok((resident, total)) =
+                self.archive.shard_data_residency(shard, offset, len)
             {
-                if let Ok((resident, total)) = self.archive.shard_data_residency(*shard, *offset, *len) {
-                    resident_bytes = resident_bytes.saturating_add(resident);
-                    total_bytes = total_bytes.saturating_add(total);
-                }
+                resident_bytes = resident_bytes.saturating_add(resident);
+                total_bytes = total_bytes.saturating_add(total);
             }
         }
         (resident_bytes, total_bytes)
