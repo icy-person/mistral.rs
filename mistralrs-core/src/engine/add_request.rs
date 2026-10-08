@@ -798,7 +798,22 @@ impl Engine {
             {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
                 if let Some(chat_template) = pipeline.get_chat_template() {
-                    if chat_template.uses_channel_tags() && !chat_template.is_harmony_format() {
+                    if chat_template.is_harmony_format() {
+                        match crate::reasoning_parsers::HarmonyContext::new() {
+                            Ok(ctx) => seq.enable_reasoning(
+                                crate::reasoning_parsers::ReasoningMode::Harmony,
+                                Box::new(ctx),
+                            ),
+                            Err(error) => {
+                                request
+                                    .response
+                                    .send(Response::InternalError(error.into()))
+                                    .await
+                                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                                return;
+                            }
+                        }
+                    } else if chat_template.uses_channel_tags() {
                         // Gemma 4: <|channel>thought\n...<channel|>
                         let prompt_activates_thinking =
                             seq.get_initial_prompt().contains("<|think|>");
