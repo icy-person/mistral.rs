@@ -197,6 +197,7 @@ pub async fn run_interactive(
                 enable_thinking: thinking,
                 reasoning_effort,
                 adapter: request_adapter,
+                max_tokens,
             },
         )
         .await;
