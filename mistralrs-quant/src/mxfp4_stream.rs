@@ -41,7 +41,7 @@ impl Default for MxFp4StreamConfig {
             cache_mb: None,
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(4096),
-            cache_per_source: 5,
+            cache_per_source: 0,
             zero_copy: true,
             io_threads: 4,
             overlap: true,
@@ -73,7 +73,7 @@ impl MxFp4StreamConfig {
                 "MISTRALRS_MOE_CACHE_PER_SOURCE",
                 defaults.cache_per_source,
             )
-            .clamp(1, 32),
+            .min(128),
             zero_copy: env_bool("MISTRALRS_MOE_ZERO_COPY", defaults.zero_copy),
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
@@ -255,7 +255,10 @@ struct Stats {
     misses: AtomicU64,
     reads: AtomicU64,
     bytes_read: AtomicU64,
+    io_jobs: AtomicU64,
+    io_nanos: AtomicU64,
     evictions: AtomicU64,
+    released_pages: AtomicU64,
     report_calls: AtomicU64,
 }
 
@@ -411,12 +414,13 @@ impl MxFp4StreamCache {
 
         if heap_backed {
             let source = key.source.clone();
-            while guard
-                .entries
-                .iter()
-                .filter(|(entry_key, _)| entry_key.source == source)
-                .count()
-                >= self.config.cache_per_source
+            while self.config.cache_per_source > 0
+                && guard
+                    .entries
+                    .iter()
+                    .filter(|(entry_key, _)| entry_key.source == source)
+                    .count()
+                    >= self.config.cache_per_source
             {
                 let Some(victim) = guard
                     .entries
