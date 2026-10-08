@@ -285,6 +285,7 @@ impl MxFp4StreamingExpertLayer {
     ) -> Result<Arc<MxFp4StreamData>> {
         if self.cache.zero_copy() {
             if let Some(data) = self.zero_copy_experts[weight_idx][expert_idx].get() {
+                self.cache.touch(key);
                 return Ok(data.clone());
             }
         }
