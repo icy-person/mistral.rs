@@ -567,7 +567,7 @@ impl GgufArchive {
     ///
     /// This is Linux/Unix VM residency telemetry, not a cache-hit metric: a zero-copy mapping
     /// can remain cached as a descriptor while its physical pages have already been reclaimed.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn shard_data_residency(
         &self,
         shard_index: usize,
@@ -604,13 +604,13 @@ impl GgufArchive {
         let mut vec = vec![0u8; pages];
         let rc = unsafe { libc::mincore(aligned_addr as *mut libc::c_void, pages * page_size, vec.as_mut_ptr()) };
         if rc != 0 {
-            return Err(Error::last_os_error().into());
+            return Err(Error::wrap(std::io::Error::last_os_error()));
         }
         let resident = vec.iter().filter(|&&v| v & 1 != 0).count();
         Ok((resident, pages))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn shard_data_residency(
         &self,
         _shard_index: usize,
