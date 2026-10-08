@@ -1,4 +1,5 @@
 name: GPT-OSS 20B response smoke test
+# rerun on current HEAD
 
 on:
   pull_request:
