@@ -1644,7 +1644,6 @@ impl Sequence {
             None | Some(StopReason::Length(_)) | Some(StopReason::ModelLength(_))
         );
         let committed_start = self.completion_bytes.len();
-        let completion_len = completion_bytes.len();
         let harmony_token = (self.reasoning_mode == Some(ReasoningMode::Harmony))
             .then_some(tok.token);
 
@@ -1682,12 +1681,10 @@ impl Sequence {
 
         let committed_bytes = &self.completion_bytes[committed_start..];
         if let Some(token_id) = harmony_token {
-            // Harmony must consume the original token id so formatting tokens remain
-            // structurally visible to the parser.
-            if committed_bytes.len() == completion_len {
-                if let Some(parser) = self.reasoning_parser.as_mut() {
-                    parser.process_token(token_id, committed_bytes);
-                }
+            // Harmony consumes the original token id immediately; its parser is independent
+            // of decoded-byte buffering and must also observe structural control tokens.
+            if let Some(parser) = self.reasoning_parser.as_mut() {
+                parser.process_token(token_id, &completion_bytes);
             }
         }
         self.last_completion_bytes_len = committed_bytes.len();
