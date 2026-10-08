@@ -268,8 +268,8 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', default_value = "512")]
         prompt_len: Vec<usize>,
 
-        /// Output tokens per decode request. Values below 2 skip decode metrics.
-        #[arg(long, default_value = "128")]
+        /// Output tokens per decode request. MoE benchmarking defaults to 256 for steady-state measurements.
+        #[arg(long, default_value = "256")]
         gen_len: usize,
 
         /// Input context lengths used to measure decode TPOT. Accepts comma-separated values for sweeps.
@@ -757,6 +757,11 @@ pub struct RuntimeOptions {
     #[serde(default = "default_moe_io_threads")]
     pub moe_io_threads: usize,
 
+    /// CPU worker count for the fused GPT-OSS MXFP4 kernel. Use an integer or 'physical'.
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", default_value = "physical")]
+    #[serde(default = "default_moe_threads")]
+    pub moe_threads: String,
+
     /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
     #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
     #[serde(default = "default_moe_overlap")]
@@ -766,6 +771,50 @@ pub struct RuntimeOptions {
     #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
     #[serde(default)]
     pub moe_o_direct: bool,
+
+    /// Use zero-copy mmap for routed MXFP4 experts. Disable for an apples-to-apples heap-cache benchmark.
+    #[arg(
+        long = "moe-zero-copy",
+        env = "MISTRALRS_MOE_ZERO_COPY",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
+    #[serde(default = "default_true")]
+    pub moe_zero_copy: bool,
+
+    /// Maximum cached experts per source. Zero means no per-source quota; the global byte budget remains authoritative.
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    #[serde(default)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold zero-copy GGUF mmap pages with MADV_DONTNEED.
+    #[arg(long = "moe-release-cold", env = "MISTRALRS_MOE_RELEASE_COLD")]
+    #[serde(default)]
+    pub moe_release_cold: bool,
+
+    /// Cache-clock accesses after which an idle mmap expert becomes eligible for release.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    #[serde(default = "default_moe_release_idle")]
+    pub moe_release_idle: u64,
+
+    /// Prefault zero-copy expert mmap pages in background workers before compute.
+    #[arg(
+        long = "moe-prefault",
+        env = "MISTRALRS_MOE_PREFAULT",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
+    #[serde(default = "default_true")]
+    pub moe_prefault: bool,
+
+    /// Show live generation token/s statistics on stderr while the answer streams.
+    #[arg(long = "realtime-stats", env = "MISTRALRS_REALTIME_STATS")]
+    #[serde(default)]
+    pub realtime_stats: bool,
 
     /// Emit periodic MoE cache/I/O telemetry to the log.
     #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
@@ -934,6 +983,76 @@ pub struct BenchRuntimeOptions {
     #[arg(long)]
     pub no_kv_cache: bool,
 
+    /// Stream routed MoE expert weights from GGUF during the benchmark.
+    #[arg(long = "moe-stream", env = "MISTRALRS_MOE_STREAM")]
+    pub moe_stream: bool,
+
+    /// Expert-cache budget in MiB, or auto.
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
+    pub moe_cache_mb: String,
+
+    /// Memory to leave available for the rest of the process/system.
+    #[arg(long = "cache-floor-mb", env = "MISTRALRS_MOE_CACHE_FLOOR_MB", default_value_t = 1536)]
+    pub moe_cache_floor_mb: usize,
+
+    /// Hard cache ceiling; omit to disable.
+    #[arg(long = "cache-ceil-mb", env = "MISTRALRS_MOE_CACHE_CEIL_MB", default_value = "4096")]
+    pub moe_cache_ceil_mb: Option<usize>,
+
+    /// Parallel expert-read lanes.
+    #[arg(long = "io-threads", env = "MISTRALRS_MOE_IO_THREADS", default_value_t = 4)]
+    pub moe_io_threads: usize,
+
+    /// CPU worker count for the fused GPT-OSS MXFP4 kernel. Use an integer or 'physical'.
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", default_value = "physical")]
+    pub moe_threads: String,
+
+    /// Overlap expert reads with CPU compute.
+    #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
+    pub moe_overlap: bool,
+
+    /// Try Linux O_DIRECT for expert reads.
+    #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
+    pub moe_o_direct: bool,
+
+    /// Use zero-copy mmap for routed MXFP4 experts.
+    #[arg(
+        long = "moe-zero-copy",
+        env = "MISTRALRS_MOE_ZERO_COPY",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub moe_zero_copy: bool,
+
+    /// Emit streaming telemetry during the benchmark.
+    #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
+    pub moe_stats: bool,
+
+    /// Maximum cached experts per source; zero disables the per-source quota.
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold zero-copy mmap pages.
+    #[arg(long = "moe-release-cold", env = "MISTRALRS_MOE_RELEASE_COLD")]
+    pub moe_release_cold: bool,
+
+    /// Cache-clock accesses before idle mmap pages become release candidates.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    pub moe_release_idle: u64,
+
+    /// Prefault zero-copy expert mmap pages in background workers before compute.
+    #[arg(
+        long = "moe-prefault",
+        env = "MISTRALRS_MOE_PREFAULT",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub moe_prefault: bool,
+
     /// Path to a MatFormer config (CSV/JSON describing available slices). See model card.
     #[arg(long)]
     pub matformer_config_path: Option<PathBuf>,
@@ -960,6 +1079,33 @@ pub struct BenchRuntimeOptions {
 }
 
 impl BenchRuntimeOptions {
+    pub fn apply_moe_stream_env(&self) {
+        std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
+        std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
+        match self.moe_cache_ceil_mb {
+            Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
+            None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
+        }
+        std::env::set_var("MISTRALRS_MOE_IO_THREADS", self.moe_io_threads.clamp(1, 32).to_string());
+        std::env::set_var(
+            "MISTRALRS_MOE_THREADS",
+            if self.moe_threads.trim().is_empty() {
+                "physical"
+            } else {
+                self.moe_threads.trim()
+            },
+        );
+        std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_ZERO_COPY", if self.moe_zero_copy { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", self.moe_cache_per_source.min(128).to_string());
+        std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_RELEASE_IDLE", self.moe_release_idle.max(256).to_string());
+        std::env::set_var("MISTRALRS_MOE_PREFAULT", if self.moe_prefault { "1" } else { "0" });
+    }
+
     pub fn matformer_selection(&self) -> MatformerSelection {
         MatformerSelection {
             config_path: self.matformer_config_path.clone(),
@@ -1047,6 +1193,18 @@ impl RuntimeOptions {
         );
         std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_ZERO_COPY", if self.moe_zero_copy { "1" } else { "0" });
+        std::env::set_var(
+            "MISTRALRS_MOE_CACHE_PER_SOURCE",
+            self.moe_cache_per_source.min(128).to_string(),
+        );
+        std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
+        std::env::set_var(
+            "MISTRALRS_MOE_RELEASE_IDLE",
+            self.moe_release_idle.max(256).to_string(),
+        );
+        std::env::set_var("MISTRALRS_MOE_PREFAULT", if self.moe_prefault { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_REALTIME_STATS", if self.realtime_stats { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
     }
 
@@ -1144,8 +1302,15 @@ impl Default for RuntimeOptions {
             moe_cache_floor_mb: 1536,
             moe_cache_ceil_mb: Some(4096),
             moe_io_threads: 4,
+            moe_threads: "physical".to_string(),
             moe_overlap: false,
             moe_o_direct: false,
+            moe_zero_copy: true,
+            moe_cache_per_source: 0,
+            moe_release_cold: false,
+            moe_release_idle: 4096,
+            moe_prefault: true,
+            realtime_stats: false,
             moe_stats: false,
             mcp_config: None,
             agent: false,
@@ -1187,7 +1352,19 @@ fn default_moe_io_threads() -> usize {
 }
 
 fn default_moe_overlap() -> bool {
-    false
+    true
+}
+
+fn default_moe_release_idle() -> u64 {
+    4096
+}
+
+fn default_moe_threads() -> String {
+    "physical".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {

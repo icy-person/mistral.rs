@@ -110,6 +110,7 @@ pub async fn run_bench(
         anyhow::bail!("--depth must be greater than 0 when decode metrics are enabled");
     }
     let request_adapter = normalize_requested_adapter(&model_type, request_adapter.as_deref())?;
+    runtime.apply_moe_stream_env();
 
     // Get model ID for display
     let model_id = get_model_id(&model_type);

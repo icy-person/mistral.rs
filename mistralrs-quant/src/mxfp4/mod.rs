@@ -285,6 +285,7 @@ impl MxFp4StreamingExpertLayer {
     ) -> Result<Arc<MxFp4StreamData>> {
         if self.cache.zero_copy() {
             if let Some(data) = self.zero_copy_experts[weight_idx][expert_idx].get() {
+                self.cache.touch(key);
                 return Ok(data.clone());
             }
         }
@@ -1978,7 +1979,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                     expert_index: expert_idx,
                 };
                 let expert_data = if let Some(pending_queue) = pending.as_mut() {
-                    let handle = pending_queue.pop_front().ok_or_else(|| {
+                    let handle = pending_queue.remove(&key).ok_or_else(|| {
                         candle_core::Error::Msg(
                             "GPT-OSS MXFP4 streamed expert request was not scheduled"
                                 .to_string(),
@@ -2003,7 +2004,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
                         expert_index: expert_idx,
                     };
                     let expert_up_data = if let Some(pending_queue) = pending.as_mut() {
-                        let handle = pending_queue.pop_front().ok_or_else(|| {
+                        let handle = pending_queue.remove(&key_up).ok_or_else(|| {
                             candle_core::Error::Msg(
                                 "GPT-OSS MXFP4 paired gate/up request was not scheduled"
                                     .to_string(),

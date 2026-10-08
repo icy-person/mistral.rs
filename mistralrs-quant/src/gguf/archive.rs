@@ -563,6 +563,113 @@ impl GgufArchive {
         Ok(())
     }
 
+    /// Returns the number of currently resident OS pages for a byte range in a GGUF mmap.
+    ///
+    /// This is Linux/Unix VM residency telemetry, not a cache-hit metric: a zero-copy mapping
+    /// can remain cached as a descriptor while its physical pages have already been reclaimed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shard_data_residency(
+        &self,
+        shard_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<(usize, usize)> {
+        let mapping = self.mappings.get(shard_index).ok_or_else(|| {
+            Error::msg(format!("GGUF shard index {shard_index} is out of range"))
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            Error::msg("GGUF residency range overflow")
+        })?;
+        if end > mapping.len() {
+            return Err(Error::msg(format!(
+                "GGUF residency range {offset}..{end} exceeds mapping length {}",
+                mapping.len()
+            )));
+        }
+        if len == 0 {
+            return Ok((0, 0));
+        }
+
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return Err(Error::msg("unable to determine system page size"));
+        }
+        let page_size = page_size as usize;
+        let base = mapping.as_ref().as_ptr() as usize;
+        let start_addr = base.checked_add(offset).ok_or_else(|| Error::msg("GGUF residency address overflow"))?;
+        let aligned_addr = start_addr / page_size * page_size;
+        let prefix = start_addr - aligned_addr;
+        let span = prefix.checked_add(len).ok_or_else(|| Error::msg("GGUF residency span overflow"))?;
+        let mapping_remaining = mapping
+            .len()
+            .checked_sub(aligned_addr.saturating_sub(base))
+            .ok_or_else(|| Error::msg("GGUF residency address is outside mapping"))?;
+        let probe_len = span.min(mapping_remaining);
+        let pages = probe_len.div_ceil(page_size);
+        let mut vec = vec![0u8; pages];
+        let rc = unsafe {
+            libc::mincore(
+                aligned_addr as *mut libc::c_void,
+                pages * page_size,
+                vec.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::wrap(std::io::Error::last_os_error()));
+        }
+        let resident = vec.iter().filter(|&&v| v & 1 != 0).count();
+        let resident_bytes = resident.saturating_mul(page_size).min(len);
+        Ok((resident_bytes, len))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn shard_data_dont_need(
+        &self,
+        shard_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let mapping = self.mappings.get(shard_index).ok_or_else(|| {
+            Error::msg(format!("GGUF shard index {shard_index} is out of range"))
+        })?;
+        let end = offset.checked_add(len).ok_or_else(|| Error::msg("GGUF DONTNEED range overflow"))?;
+        if end > mapping.len() {
+            return Err(Error::msg(format!(
+                "GGUF DONTNEED range {offset}..{end} exceeds mapping length {}",
+                mapping.len()
+            )));
+        }
+        if len != 0 {
+            // SAFETY: the caller only releases immutable file-backed pages after it has finished
+            // using the expert range. The mapping remains valid; a later access simply refaults
+            // the bytes from the underlying GGUF file.
+            let _ = unsafe {
+                mapping.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len)
+            };
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn shard_data_dont_need(
+        &self,
+        _shard_index: usize,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn shard_data_residency(
+        &self,
+        _shard_index: usize,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<(usize, usize)> {
+        Ok((0, 0))
+    }
+
     pub(crate) fn shard_data_slice(
         &self,
         shard_index: usize,

@@ -9,7 +9,7 @@
 use candle_core::{quantized::GgmlDType, Device, DType, Result, Tensor};
 use mistralrs_quant::{GgufArchive, GgufMatMul, MXFP4Layer, QuantMethod};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{self},
     path::{Path, PathBuf},
@@ -166,14 +166,15 @@ struct CacheKey {
 struct CacheEntry {
     weight: Arc<dyn QuantMethod>,
     bytes: usize,
+    last_used: u64,
 }
 
 #[derive(Default)]
 struct CacheState {
     entries: HashMap<CacheKey, CacheEntry>,
-    lru: VecDeque<CacheKey>,
     seen: HashSet<CacheKey>,
     resident_bytes: usize,
+    clock: u64,
     lookups: u64,
     hits: u64,
     evictions: u64,
@@ -280,17 +281,24 @@ impl MoeStreamCache {
         let mut state = self.state.lock().expect("MoE stream cache poisoned");
         state.lookups = state.lookups.saturating_add(1);
 
-        let Some(entry) = state.entries.get(key) else {
+        if !state.entries.contains_key(key) {
             if state.seen.contains(key) {
                 state.rereads = state.rereads.saturating_add(1);
             }
             self.maybe_log(&state);
             return None;
-        };
+        }
 
-        let weight = entry.weight.clone();
-        state.lru.retain(|candidate| candidate != key);
-        state.lru.push_back(key.clone());
+        state.clock = state.clock.wrapping_add(1);
+        let now = state.clock;
+        let weight = {
+            let entry = state
+                .entries
+                .get_mut(key)
+                .expect("cache entry exists after contains_key");
+            entry.last_used = now;
+            entry.weight.clone()
+        };
         state.hits = state.hits.saturating_add(1);
         self.maybe_log(&state);
         Some(weight)
@@ -302,14 +310,20 @@ impl MoeStreamCache {
         }
 
         let mut state = self.state.lock().expect("MoE stream cache poisoned");
+        state.clock = state.clock.wrapping_add(1);
+        let now = state.clock;
 
         if let Some(old) = state.entries.remove(&key) {
             state.resident_bytes = state.resident_bytes.saturating_sub(old.bytes);
-            state.lru.retain(|candidate| candidate != &key);
         }
 
         while state.resident_bytes.saturating_add(bytes) > self.budget_bytes {
-            let Some(old_key) = state.lru.pop_front() else {
+            let Some(old_key) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
                 break;
             };
             if let Some(old) = state.entries.remove(&old_key) {
@@ -321,8 +335,11 @@ impl MoeStreamCache {
         if state.resident_bytes.saturating_add(bytes) <= self.budget_bytes {
             state.resident_bytes = state.resident_bytes.saturating_add(bytes);
             state.seen.insert(key.clone());
-            state.entries.insert(key.clone(), CacheEntry { weight, bytes });
-            state.lru.push_back(key);
+            state.entries.insert(key, CacheEntry {
+                weight,
+                bytes,
+                last_used: now,
+            });
         }
     }
 

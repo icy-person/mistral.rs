@@ -26,7 +26,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, Instant},
 };
 use tokio::sync::{
@@ -120,6 +120,20 @@ fn find_earliest_stop_string(bytes: &[u8], stop_strings: &[String]) -> Option<(u
             Some((idx, pos))
         })
         .min_by_key(|(idx, pos)| (*pos, *idx))
+}
+
+fn realtime_stream_usage_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MISTRALRS_REALTIME_STATS")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn longest_stop_prefix_suffix(bytes: &[u8], stop_strings: &[String]) -> usize {
@@ -2492,6 +2506,7 @@ impl SequenceGroup {
             self.streaming_active_choices = self.streaming_active_choices.saturating_sub(1);
         }
         let expected_choices = self.streaming_active_choices.min(self.n_choices).max(1);
+        let realtime_usage = realtime_stream_usage_enabled();
         if !self.chat_streaming_chunks.is_empty() {
             let has_duplicate_index =
                 self.chat_streaming_chunks
@@ -2522,9 +2537,13 @@ impl SequenceGroup {
                         model: model.clone(),
                         system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                         object: "chat.completion.chunk".to_string(),
-                        usage: (idx + 1 == response_count)
-                            .then(|| usage_opt.clone())
-                            .flatten(),
+                        usage: if realtime_usage {
+                            Some(self.get_usage())
+                        } else {
+                            (idx + 1 == response_count)
+                                .then(|| usage_opt.clone())
+                                .flatten()
+                        },
                         adapter_generation: seq
                             .adapter_generation()
                             .map(|generation| generation.to_string()),
