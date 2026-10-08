@@ -192,7 +192,14 @@ The CLI uses the same `run`, `serve`, and `bench` commands for model repositorie
 For MoE performance work, `mistralrs bench` defaults to 256 generated tokens so decode
 measurements are long enough to expose cache churn and storage stalls. Use the same
 `--moe-stream`, `--cache-mb`, `--io-threads`, `--moe-threads`, `--moe-overlap`,
-`--moe-zero-copy`, and `--moe-prefault` controls for repeatable comparisons.
+`--moe-zero-copy`, and `--moe-prefault` controls for repeatable comparisons. Boolean controls
+accept explicit values, so `--moe-zero-copy false` and `--moe-prefault false` provide clean
+baseline runs without changing the benchmark command structure.
+
+For GPT-OSS CPU comparisons, record at least generation length, compute threads, I/O threads,
+cache budget, logical hit rate, physical mmap residency, actual I/O milliseconds, and decode
+tok/s. A 40-token result is useful for smoke testing but should not be treated as a steady-state
+cache benchmark.
 
 - **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
 - **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)
