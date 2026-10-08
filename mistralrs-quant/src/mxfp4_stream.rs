@@ -314,6 +314,7 @@ pub(crate) struct MxFp4StreamCache {
     config: MxFp4StreamConfig,
     budget_bytes: usize,
     stats: Arc<Stats>,
+    warned_cache_cliff: std::sync::atomic::AtomicBool,
 }
 
 impl MxFp4StreamCache {
@@ -435,6 +436,7 @@ impl MxFp4StreamCache {
             budget_bytes: config.cache_budget_bytes(),
             config,
             stats,
+            warned_cache_cliff: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -671,6 +673,22 @@ impl MxFp4StreamCache {
         &self,
         requests: &[(MxFp4StreamKey, MxFp4StreamRange)],
     ) -> crate::Result<HashMap<MxFp4StreamKey, MxFp4StreamHandle>> {
+        if !self.zero_copy() && self.budget_bytes != 0 {
+            let routed_bytes = requests
+                .iter()
+                .fold(0usize, |sum, (_, range)| sum.saturating_add(range.len));
+            if routed_bytes > self.budget_bytes
+                && !self.warned_cache_cliff.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    target: "mistralrs_moe_stream",
+                    routed_working_set_mib = routed_bytes / MIB,
+                    cache_budget_mib = self.budget_bytes / MIB,
+                    "single-layer routed working set exceeds the heap cache budget; expect churn"
+                );
+            }
+        }
+
         let mut result = HashMap::with_capacity(requests.len());
 
         for (key, range) in requests {
