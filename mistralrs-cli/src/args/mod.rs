@@ -763,6 +763,26 @@ pub struct RuntimeOptions {
     #[serde(default)]
     pub moe_o_direct: bool,
 
+    /// Maximum cached experts per source. Zero means no per-source quota; the global byte budget remains authoritative.
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    #[serde(default)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold zero-copy GGUF mmap pages with MADV_DONTNEED.
+    #[arg(long = "moe-release-cold", env = "MISTRALRS_MOE_RELEASE_COLD")]
+    #[serde(default)]
+    pub moe_release_cold: bool,
+
+    /// Cache-clock accesses after which an idle mmap expert becomes eligible for release.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    #[serde(default = "default_moe_release_idle")]
+    pub moe_release_idle: u64,
+
+    /// Show live generation token/s statistics on stderr while the answer streams.
+    #[arg(long = "realtime-stats", env = "MISTRALRS_REALTIME_STATS")]
+    #[serde(default)]
+    pub realtime_stats: bool,
+
     /// Emit periodic MoE cache/I/O telemetry to the log.
     #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
     #[serde(default)]
@@ -1043,6 +1063,16 @@ impl RuntimeOptions {
         );
         std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var(
+            "MISTRALRS_MOE_CACHE_PER_SOURCE",
+            self.moe_cache_per_source.min(128).to_string(),
+        );
+        std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
+        std::env::set_var(
+            "MISTRALRS_MOE_RELEASE_IDLE",
+            self.moe_release_idle.max(256).to_string(),
+        );
+        std::env::set_var("MISTRALRS_REALTIME_STATS", if self.realtime_stats { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
     }
 
@@ -1142,6 +1172,10 @@ impl Default for RuntimeOptions {
             moe_io_threads: 4,
             moe_overlap: false,
             moe_o_direct: false,
+            moe_cache_per_source: 0,
+            moe_release_cold: false,
+            moe_release_idle: 4096,
+            realtime_stats: false,
             moe_stats: false,
             mcp_config: None,
             agent: false,
@@ -1184,6 +1218,10 @@ fn default_moe_io_threads() -> usize {
 
 fn default_moe_overlap() -> bool {
     false
+}
+
+fn default_moe_release_idle() -> u64 {
+    4096
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
