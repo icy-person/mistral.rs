@@ -619,8 +619,7 @@ impl GgufArchive {
         }
         let resident = vec.iter().filter(|&&v| v & 1 != 0).count();
         let resident_bytes = resident.saturating_mul(page_size).min(len);
-        let total_bytes = pages.saturating_mul(page_size).min(len.saturating_add(prefix));
-        Ok((resident_bytes, total_bytes))
+        Ok((resident_bytes, len))
     }
 
     #[cfg(target_os = "linux")]
