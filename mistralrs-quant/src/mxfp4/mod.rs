@@ -1447,10 +1447,11 @@ impl SharedOutPtr {
                     source: gate_up.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
-                let gate_handle = queue.pop_front().ok_or_else(|| {
-                    candle_core::Error::Msg("fused GPT-OSS gate request queue underflow".into())
-                })?;
-                let gate_data = gate_up
+                let gate_handle = queue.remove(&gate_key).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "fused GPT-OSS missing prefetched gate expert {expert_idx}"
+                    ))
+                })?;                let gate_data = gate_up
                     .remember_zero_copy_expert(
                         0,
                         expert_idx,
@@ -1461,10 +1462,11 @@ impl SharedOutPtr {
                     source: down.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
-                let down_handle = queue.pop_front().ok_or_else(|| {
-                    candle_core::Error::Msg("fused GPT-OSS down request queue underflow".into())
-                })?;
-                let down_data = down.remember_zero_copy_expert(
+                let down_handle = queue.remove(&down_key).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "fused GPT-OSS missing prefetched down expert {expert_idx}"
+                    ))
+                })?;                let down_data = down.remember_zero_copy_expert(
                     0,
                     expert_idx,
                     down.cache.resolve(&down_key, down_handle)?,
