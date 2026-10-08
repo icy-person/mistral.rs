@@ -29,10 +29,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Fetch dependencies
-        run: cargo fetch --locked
+        run: |
+          for i in 1 2 3 4 5; do
+            cargo fetch && break
+            if [ "$i" = 5 ]; then
+              exit 1
+            fi
+            sleep $((i * 20))
+          done
+
+      - name: Validate resolved lockfile
+        run: cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
 
       - name: Build mistralrs CLI
-        run: cargo build --release --locked -p mistralrs-cli
+        run: cargo build --release --locked --offline -p mistralrs-cli
 
       - name: Download official GPT-OSS 20B MXFP4 GGUF
         run: |
