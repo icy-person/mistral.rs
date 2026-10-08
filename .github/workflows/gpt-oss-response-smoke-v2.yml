@@ -54,6 +54,8 @@ jobs:
             --output gpt-oss-20b-MXFP4.gguf "$HF_URL"
           echo "$HF_SHA256  gpt-oss-20b-MXFP4.gguf" | sha256sum --check -
 
+      # 8 tokens can be consumed by GPT-OSS Harmony reasoning before the final channel.
+      # Use a bounded but realistic generation budget so the user-facing answer is observable.
       - name: Run fallback streamed response
         env:
           RUST_LOG: error
@@ -71,7 +73,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --thinking false \
-            --max-tokens 8 \
+            --max-tokens 256 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>fallback.stderr | tee fallback.stdout
 
@@ -92,7 +94,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --thinking false \
-            --max-tokens 8 \
+            --max-tokens 256 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>fused.stderr | tee fused.stdout
 
