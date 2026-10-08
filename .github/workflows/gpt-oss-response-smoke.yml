@@ -1,4 +1,5 @@
 name: GPT-OSS 20B response smoke test
+# Final validation: exact output path + bounded decode
 
 on:
   push:
