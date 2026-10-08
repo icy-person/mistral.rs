@@ -840,7 +840,7 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, prefault_jobs={}, prefault_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
             entry_count,
             used_bytes / MIB,
             self.budget_bytes / MIB,
@@ -855,6 +855,8 @@ impl MxFp4StreamCache {
             bytes / (MIB as u64),
             self.stats.io_jobs.load(Ordering::Relaxed),
             self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.stats.prefault_jobs.load(Ordering::Relaxed),
+            self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             evictions,
             released_bytes / MIB,
             self.config.io_threads,
@@ -1071,6 +1073,7 @@ mod tests {
             stats: true,
             release_cold: false,
             release_idle: 4096,
+            prefault: true,
         };
         assert_eq!(cfg.cache_budget_bytes(), 2048 * MIB);
     }
