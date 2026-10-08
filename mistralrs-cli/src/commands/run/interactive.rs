@@ -57,7 +57,7 @@ impl RealtimeStats {
             enabled: std::env::var("MISTRALRS_REALTIME_STATS")
                 .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
-            last_render: Instant::now(),
+            last_render: Instant::now() - std::time::Duration::from_secs(1),
         }
     }
 
