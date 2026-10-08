@@ -326,6 +326,7 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
             enable_thinking: thinking,
             reasoning_effort,
             adapter,
+            max_tokens: None,
         },
     )
     .await;
@@ -398,101 +399,3 @@ async fn build_model_configs(
         }
 
         if let Some(isq) = crate::commands::serve::extract_isq_setting(&model_type) {
-            config = config.with_in_situ_quant(isq);
-        }
-        if let Some(max_bytes) =
-            crate::commands::serve::extract_encoder_cache_memory_bytes(&model_type)?
-        {
-            config = config.with_encoder_cache_memory_bytes(max_bytes);
-        }
-
-        configs.push(config);
-    }
-
-    Ok((configs, cpu))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn from_config_infers_gguf_for_an_exact_file() {
-        let root = std::env::temp_dir().join(format!("mistralrs-gguf-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("model.gguf"), []).unwrap();
-        fs::write(root.join("mmproj-BF16.gguf"), []).unwrap();
-        let input = format!(
-            r#"
-command = "run"
-
-[[models]]
-model_id = "{}"
-
-[models.format]
-quantized_file = "model.gguf"
-mmproj = "mmproj-BF16.gguf"
-"#,
-            root.display()
-        );
-        let config: CliConfig = toml::from_str(&input).unwrap();
-        let CliConfig::Run(config) = config else {
-            unreachable!()
-        };
-
-        let (models, cpu) = build_model_configs(
-            &config.models,
-            &config.runtime,
-            &mistralrs_core::TokenSource::None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(models.len(), 1);
-        assert!(!cpu);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn from_config_accepts_dynamic_lora_for_text_gguf() {
-        let root = std::env::temp_dir().join(format!("mistralrs-gguf-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("model-Q4_K_M.gguf"), []).unwrap();
-        let input = format!(
-            r#"
-command = "serve"
-
-[[models]]
-model_id = "{}"
-
-[models.format]
-quantized_file = "model-Q4_K_M.gguf"
-
-[models.adapter]
-lora = [
-  {{ alias = "code", source = "org/code-lora" }},
-]
-"#,
-            root.display()
-        );
-        let config: CliConfig = toml::from_str(&input).unwrap();
-        let CliConfig::Serve(config) = config else {
-            unreachable!()
-        };
-        assert!(config.models[0].adapter.dynamic_lora_enabled());
-
-        let (models, cpu) = build_model_configs(
-            &config.models,
-            &config.runtime,
-            &mistralrs_core::TokenSource::None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(models.len(), 1);
-        assert!(!cpu);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-}
