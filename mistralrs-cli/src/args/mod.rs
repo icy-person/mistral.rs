@@ -1348,7 +1348,7 @@ fn default_moe_io_threads() -> usize {
 }
 
 fn default_moe_overlap() -> bool {
-    false
+    true
 }
 
 fn default_moe_release_idle() -> u64 {
