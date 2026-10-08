@@ -398,6 +398,36 @@ impl HarmonyContext {
     }
 }
 
+impl crate::reasoning_parsers::ReasoningParser for HarmonyContext {
+    // Harmony is token-native: feeding decoded bytes back through the parser can
+    // lose special-token boundaries. Sequence calls process_token instead.
+    fn process_bytes(&mut self, _bytes: &[u8]) {}
+
+    fn process_token(&mut self, token_id: u32, _bytes: &[u8]) {
+        HarmonyContext::process_token(self, token_id);
+    }
+
+    fn finalize(&mut self) {
+        self.process_eos();
+    }
+
+    fn get_content_delta(&mut self) -> Option<String> {
+        HarmonyContext::get_final_delta(self)
+    }
+
+    fn get_reasoning_delta(&mut self) -> Option<String> {
+        HarmonyContext::get_reasoning_delta(self)
+    }
+
+    fn content(&self) -> Option<String> {
+        self.final_content()
+    }
+
+    fn reasoning_content(&self) -> Option<String> {
+        self.reasoning_content()
+    }
+}
+
 /// Global harmony encoding (lazy loaded)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 
