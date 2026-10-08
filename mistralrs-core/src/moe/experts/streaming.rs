@@ -281,17 +281,24 @@ impl MoeStreamCache {
         let mut state = self.state.lock().expect("MoE stream cache poisoned");
         state.lookups = state.lookups.saturating_add(1);
 
-        let Some(entry) = state.entries.get(key) else {
+        if !state.entries.contains_key(key) {
             if state.seen.contains(key) {
                 state.rereads = state.rereads.saturating_add(1);
             }
             self.maybe_log(&state);
             return None;
-        };
+        }
 
         state.clock = state.clock.wrapping_add(1);
-        entry.last_used = state.clock;
-        let weight = entry.weight.clone();
+        let now = state.clock;
+        let weight = {
+            let entry = state
+                .entries
+                .get_mut(key)
+                .expect("cache entry exists after contains_key");
+            entry.last_used = now;
+            entry.weight.clone()
+        };
         state.hits = state.hits.saturating_add(1);
         self.maybe_log(&state);
         Some(weight)
