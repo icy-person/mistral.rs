@@ -34,6 +34,7 @@ pub async fn run_interactive(
     thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
     input: Option<String>,
+    max_tokens: Option<usize>,
     images: Vec<String>,
     videos: Vec<String>,
     audios: Vec<String>,
@@ -171,6 +172,7 @@ pub async fn run_interactive(
                 enable_thinking: thinking,
                 reasoning_effort,
                 adapter: request_adapter,
+                max_tokens,
             },
         )
         .await;
