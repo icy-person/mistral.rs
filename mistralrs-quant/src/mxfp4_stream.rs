@@ -267,7 +267,8 @@ impl WorkerFiles {
 
 pub(crate) enum MxFp4StreamHandle {
     Ready(Arc<MxFp4StreamData>),
-    Pending(Receiver<io::Result<Arc<MxFp4StreamData>>>),
+    PendingRead(Receiver<io::Result<Arc<MxFp4StreamData>>>),
+    PendingPrefault(Receiver<io::Result<Arc<MxFp4StreamData>>>),
 }
 
 #[derive(Debug, Default)]
@@ -278,10 +279,12 @@ struct Stats {
     bytes_read: AtomicU64,
     io_jobs: AtomicU64,
     io_nanos: AtomicU64,
+    io_wait_nanos: AtomicU64,
     evictions: AtomicU64,
     released_bytes: AtomicU64,
     prefault_jobs: AtomicU64,
     prefault_nanos: AtomicU64,
+    prefault_wait_nanos: AtomicU64,
     report_calls: AtomicU64,
 }
 
@@ -681,14 +684,14 @@ impl MxFp4StreamCache {
             if let Some(data) = self.mapped_range(*range) {
                 self.insert(key.clone(), data.clone());
                 if let Some(rx) = self.submit_prefault(data.clone())? {
-                    result.insert(key.clone(), MxFp4StreamHandle::Pending(rx));
+                    result.insert(key.clone(), MxFp4StreamHandle::PendingPrefault(rx));
                 } else {
                     result.insert(key.clone(), MxFp4StreamHandle::Ready(data));
                 }
                 continue;
             }
 
-            result.insert(key.clone(), MxFp4StreamHandle::Pending(self.submit(*range)?));
+            result.insert(key.clone(), MxFp4StreamHandle::PendingRead(self.submit(*range)?));
         }
 
         Ok(result)
@@ -701,17 +704,33 @@ impl MxFp4StreamCache {
     ) -> crate::Result<Arc<MxFp4StreamData>> {
         match handle {
             MxFp4StreamHandle::Ready(data) => Ok(data),
-            MxFp4StreamHandle::Pending(rx) => {
+            MxFp4StreamHandle::PendingRead(rx) => {
+                let started = std::time::Instant::now();
                 let data = rx
                     .recv()
                     .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
                     .map_err(candle_core::Error::wrap)?;
-                if data.len() != 0 {
-                    self.stats.reads.fetch_add(1, Ordering::Relaxed);
-                    self.stats
-                        .bytes_read
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
-                }
+                self.stats.io_wait_nanos.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .bytes_read
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                self.insert(key.clone(), data.clone());
+                Ok(data)
+            }
+            MxFp4StreamHandle::PendingPrefault(rx) => {
+                let started = std::time::Instant::now();
+                let data = rx
+                    .recv()
+                    .map_err(|_| candle_core::Error::Msg("MXFP4 prefault worker stopped".into()))?
+                    .map_err(candle_core::Error::wrap)?;
+                self.stats.prefault_wait_nanos.fetch_add(
+                    started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
                 self.insert(key.clone(), data.clone());
                 Ok(data)
             }
@@ -842,7 +861,7 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, prefault_jobs={}, prefault_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
             entry_count,
             used_bytes / MIB,
             self.budget_bytes / MIB,
@@ -857,8 +876,10 @@ impl MxFp4StreamCache {
             bytes / (MIB as u64),
             self.stats.io_jobs.load(Ordering::Relaxed),
             self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.stats.io_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             evictions,
             released_bytes / MIB,
             self.config.io_threads,
