@@ -249,7 +249,7 @@ pub use lora::{
     launch_routed_lora_direct, launch_routed_lora_grouped, RoutedLoraCudaMetadata,
     RoutedLoraCudaWeightTable, RoutedLoraDirectLaunch, RoutedLoraGroupedLaunch,
 };
-pub use mxfp4::{MxFp4StreamingExpertLayer, MXFP4Layer};
+pub use mxfp4::{fused_gptoss_mlp, MxFp4StreamingExpertLayer, MXFP4Layer};
 pub use nvfp4::{Nvfp4InputCalibration, Nvfp4Layer, Nvfp4LayerParts};
 pub use pending_layer::{pending_isq_channel, PendingIsqLayer};
 pub use pertensor_fp8::{fp8_w8a16_linear, fp8_w8a8_linear, Fp8W8A8LinearArgs, PerTensorFP8Linear};

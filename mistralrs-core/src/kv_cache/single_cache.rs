@@ -10,7 +10,7 @@ fn cache_growth_size() -> usize {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value >= 64)
-            .unwrap_or(2048)
+            .unwrap_or(NormalCache::CACHE_GROW_SIZE)
     })
 }
 

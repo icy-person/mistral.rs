@@ -7,7 +7,7 @@ use std::arch::x86_64::{
     _CMP_GT_OQ, __m128i, __m256, __m256i, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
     _mm256_castps256_ps128, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cmp_ps,
     _mm256_cmpgt_epi32, _mm256_cmpeq_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
-    _mm256_cvttps_epi32, _mm256_div_ps, _mm256_extractf128_ps, _mm256_fmadd_ps,
+    _mm256_cvttps_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps,
     _mm256_hadd_ps, _mm256_rcp_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
     _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set1_epi32,
     _mm256_set1_ps, _mm256_setr_ps, _mm256_setzero_ps, _mm256_setzero_si256,
@@ -1293,11 +1293,30 @@ impl MxFp4StreamingExpertLayer {
         }
     }
 
+/// Raw output pointer that may be shared across the MoE rayon pool.
+///
+/// Every parallel closure that uses it writes only to the column `row` it was
+/// handed, so no two threads ever touch the same element. The accessor takes
+/// `self` (not a field) so edition-2021 closures capture the whole wrapper
+/// instead of the bare `*mut f32`, which is neither `Send` nor `Sync`.
+#[derive(Clone, Copy)]
+struct SharedOutPtr(*mut f32);
+
+unsafe impl Send for SharedOutPtr {}
+unsafe impl Sync for SharedOutPtr {}
+
+impl SharedOutPtr {
+    #[inline(always)]
+    unsafe fn add(self, offset: usize) -> *mut f32 {
+        self.0.add(offset)
+    }
+}
+
     /// Fused CPU GPT-OSS path for native streamed MXFP4 experts.
     ///
     /// Computes gate/up, GPT-OSS SwiGLU, down projection, and top-k weighted
     /// reduction without materializing Tensor intermediates.
-    pub(crate) fn fused_gptoss_mlp(
+    pub fn fused_gptoss_mlp(
         gate_up: &MxFp4StreamingExpertLayer,
         down: &MxFp4StreamingExpertLayer,
         x: &Tensor,
@@ -1417,14 +1436,14 @@ impl MxFp4StreamingExpertLayer {
         let gate_bias = gate_up.bias_cpu.as_deref();
         let down_bias = down.bias_cpu.as_deref();
         let mut output = vec![0.0f32; num_tokens * hidden_dim];
-        let mut activations = Vec::new();
+        let mut activations: Vec<f32> = Vec::new();
         let kernel = MxFp4StreamingExpertLayer::dot_kernel();
         let approx_swiglu = approx_swiglu_enabled();
         let moe_threads = MxFp4StreamingExpertLayer::moe_thread_pool().current_num_threads();
         for &expert_idx in &experts {
             let (gate_data, down_data) = if let Some(queue) = pending.as_mut() {
                 let gate_key = MxFp4StreamKey {
-                    source: gate_up.raw_weights[0].clone(),
+                    source: gate_up.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
                 let gate_handle = queue.pop_front().ok_or_else(|| {
@@ -1438,7 +1457,7 @@ impl MxFp4StreamingExpertLayer {
                     );
 
                 let down_key = MxFp4StreamKey {
-                    source: down.raw_weights[0].clone(),
+                    source: down.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
                 let down_handle = queue.pop_front().ok_or_else(|| {
@@ -1452,11 +1471,11 @@ impl MxFp4StreamingExpertLayer {
                 (gate_data, down_data)
             } else {
                 let gate_key = MxFp4StreamKey {
-                    source: gate_up.raw_weights[0].clone(),
+                    source: gate_up.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
                 let down_key = MxFp4StreamKey {
-                    source: down.raw_weights[0].clone(),
+                    source: down.cache_sources[0].clone(),
                     expert_index: expert_idx,
                 };
                 (
@@ -1583,7 +1602,7 @@ impl MxFp4StreamingExpertLayer {
                 let token = route_row / topk;
                 let weight = route_weights[route_row];
                 let activation = &activations[..down.in_dim];
-                let output_ptr = output.as_mut_ptr();
+                let output_ptr = SharedOutPtr(output.as_mut_ptr());
                 let down_bias_ref = down_bias;
 
                 let compute_down_row = |row: usize| {
@@ -1653,7 +1672,7 @@ impl MxFp4StreamingExpertLayer {
                 );
 
             if parallel_down {
-                let output_ptr = output.as_mut_ptr();
+                let output_ptr = SharedOutPtr(output.as_mut_ptr());
                 let down_bias_ref = down_bias;
                 MxFp4StreamingExpertLayer::moe_thread_pool().install(|| {
                     (0..down.out_dim).into_par_iter().for_each(|row| {
