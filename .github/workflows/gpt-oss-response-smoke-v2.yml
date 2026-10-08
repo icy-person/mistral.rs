@@ -49,7 +49,8 @@ jobs:
 
       - name: Download official GPT-OSS 20B MXFP4 GGUF
         run: |
-          curl --fail --location --retry 5 --retry-all-errors             --output gpt-oss-20b-MXFP4.gguf "$HF_URL"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output gpt-oss-20b-MXFP4.gguf "$HF_URL"
           echo "$HF_SHA256  gpt-oss-20b-MXFP4.gguf" | sha256sum --check -
 
       - name: Run fallback streamed response
@@ -60,7 +61,18 @@ jobs:
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "1"
         run: |
           set -o pipefail
-          ./target/release/mistralrs run             --cpu             -f "$PWD/gpt-oss-20b-MXFP4.gguf"             --moe-stream             --cache-mb 1024             --cache-floor-mb 1024             --cache-ceil-mb 1024             --io-threads 4             --thinking false             --max-tokens 8             -i "Reply with exactly this number and nothing else: 323"             2>fallback.stderr | tee fallback.stdout
+          ./target/release/mistralrs run \
+            --cpu \
+            -f "$PWD/gpt-oss-20b-MXFP4.gguf" \
+            --moe-stream \
+            --cache-mb 1024 \
+            --cache-floor-mb 1024 \
+            --cache-ceil-mb 1024 \
+            --io-threads 4 \
+            --thinking false \
+            --max-tokens 8 \
+            -i "Reply with exactly this number and nothing else: 323" \
+            2>fallback.stderr | tee fallback.stdout
 
       - name: Run fused streamed response
         env:
@@ -70,7 +82,18 @@ jobs:
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
         run: |
           set -o pipefail
-          ./target/release/mistralrs run             --cpu             -f "$PWD/gpt-oss-20b-MXFP4.gguf"             --moe-stream             --cache-mb 1024             --cache-floor-mb 1024             --cache-ceil-mb 1024             --io-threads 4             --thinking false             --max-tokens 8             -i "Reply with exactly this number and nothing else: 323"             2>fused.stderr | tee fused.stdout
+          ./target/release/mistralrs run \
+            --cpu \
+            -f "$PWD/gpt-oss-20b-MXFP4.gguf" \
+            --moe-stream \
+            --cache-mb 1024 \
+            --cache-floor-mb 1024 \
+            --cache-ceil-mb 1024 \
+            --io-threads 4 \
+            --thinking false \
+            --max-tokens 8 \
+            -i "Reply with exactly this number and nothing else: 323" \
+            2>fused.stderr | tee fused.stdout
 
       - name: Verify real model output
         run: |
