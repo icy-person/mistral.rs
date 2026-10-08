@@ -706,10 +706,12 @@ impl MxFp4StreamCache {
                     .recv()
                     .map_err(|_| candle_core::Error::Msg("MXFP4 I/O worker stopped".into()))?
                     .map_err(candle_core::Error::wrap)?;
-                self.stats.reads.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .bytes_read
-                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                if data.len() != 0 {
+                    self.stats.reads.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
                 self.insert(key.clone(), data.clone());
                 Ok(data)
             }
