@@ -1096,6 +1096,32 @@ mod tests {
     }
 
     #[test]
+    fn prefault_owned_buffer_is_safe() {
+        let data = MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![1u8; 8193]));
+        assert!(prefault_mapped(&data).is_ok());
+    }
+
+    #[test]
+    fn explicit_zero_source_quota_is_allowed() {
+        let cfg = MxFp4StreamConfig {
+            cache_mb: Some(1024),
+            cache_floor_mb: 1536,
+            cache_ceil_mb: Some(1024),
+            cache_per_source: 0,
+            zero_copy: false,
+            io_threads: 1,
+            overlap: false,
+            o_direct: false,
+            stats: false,
+            release_cold: false,
+            release_idle: 256,
+            prefault: false,
+        };
+        assert_eq!(cfg.cache_per_source, 0);
+        assert_eq!(cfg.cache_budget_bytes(), 1024 * MIB);
+    }
+
+    #[test]
     fn explicit_cache_budget_is_capped() {
         let cfg = MxFp4StreamConfig {
             cache_mb: Some(4096),
