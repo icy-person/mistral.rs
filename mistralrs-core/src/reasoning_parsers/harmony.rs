@@ -424,7 +424,7 @@ impl crate::reasoning_parsers::ReasoningParser for HarmonyContext {
     }
 
     fn reasoning_content(&self) -> Option<String> {
-        self.reasoning_content()
+        HarmonyContext::reasoning_content(self)
     }
 }
 
