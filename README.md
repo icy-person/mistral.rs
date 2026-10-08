@@ -138,7 +138,9 @@ mistralrs run -m unsloth/Qwen3.5-4B-GGUF --quant 4
 # Only routed expert slices are read from GGUF on demand; the rest stay off-RAM.
 mistralrs run --cpu -f /path/to/qwen-moe.gguf \
   --moe-stream --cache-mb auto --cache-floor-mb 1536 \
-  --cache-ceil-mb 4096 --io-threads 4 --moe-overlap --moe-stats
+  --cache-ceil-mb 4096 --io-threads 4 --moe-threads physical \
+  --moe-overlap --moe-zero-copy --moe-prefault --moe-stats \
+  --realtime-stats
 
 # Agentic REPL: search + code execution + shell from the terminal
 mistralrs run --agent -m Qwen/Qwen3-4B
@@ -171,9 +173,33 @@ memory for the rest of the process/system and `--cache-ceil-mb` caps the resulti
 streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
 resident expert layers, and dynamic LoRA, where resident backends remain authoritative.
 
+For RAM-constrained Linux systems, `--moe-zero-copy` keeps routed MXFP4 experts file-backed,
+while `--moe-prefault` uses background page-prefault workers to overlap mmap page faults with
+CPU compute. `--moe-threads physical` selects physical CPU cores for the fused GPT-OSS kernel.
+`--moe-cache-per-source 0` removes the old fixed per-tensor expert quota and leaves the global
+byte budget as the cache authority. With `--moe-stats`, GPT-OSS telemetry includes logical cache
+hit rate, mapped bytes, physically resident mapped bytes, actual read timing, prefault timing, and
+optional cold-page release counters.
+
+On Linux, `--moe-release-cold` can issue `MADV_DONTNEED` for sufficiently idle file-backed
+expert pages. It is opt-in because the kernel may reclaim those pages later and a subsequent
+expert access can fault the bytes back from GGUF storage.
+
 ### The `mistralrs` CLI
 
 The CLI uses the same `run`, `serve`, and `bench` commands for model repositories, local directories, and GGUF files.
+
+For MoE performance work, `mistralrs bench` defaults to 256 generated tokens so decode
+measurements are long enough to expose cache churn and storage stalls. Use the same
+`--moe-stream`, `--cache-mb`, `--io-threads`, `--moe-threads`, `--moe-overlap`,
+`--moe-zero-copy`, and `--moe-prefault` controls for repeatable comparisons. Boolean controls
+accept explicit values, so `--moe-zero-copy false` and `--moe-prefault false` provide clean
+baseline runs without changing the benchmark command structure.
+
+For GPT-OSS CPU comparisons, record at least generation length, compute threads, I/O threads,
+cache budget, logical hit rate, physical mmap residency, actual I/O milliseconds, and decode
+tok/s. A 40-token result is useful for smoke testing but should not be treated as a steady-state
+cache benchmark.
 
 - **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
 - **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)
