@@ -411,6 +411,18 @@ impl MxFp4StreamCache {
         Some(entry.data.clone())
     }
 
+    #[inline]
+    fn touch(&self, key: &MxFp4StreamKey) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        guard.clock = guard.clock.wrapping_add(1);
+        let now = guard.clock;
+        if let Some(entry) = guard.entries.get_mut(key) {
+            entry.last_used = now;
+        }
+    }
+
     fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
         let len = data.len();
         if len > self.budget_bytes {
@@ -676,8 +688,8 @@ impl MxFp4StreamCache {
         let Ok(guard) = self.inner.lock() else {
             return (0, 0);
         };
-        let mut resident_pages = 0usize;
-        let mut total_pages = 0usize;
+        let mut resident_bytes = 0usize;
+        let mut total_bytes = 0usize;
         for entry in guard.entries.values() {
             if let MxFp4StreamData::ArchiveMapped {
                 shard,
@@ -687,12 +699,12 @@ impl MxFp4StreamCache {
             } = entry.data.as_ref()
             {
                 if let Ok((resident, total)) = self.archive.shard_data_residency(*shard, *offset, *len) {
-                    resident_pages = resident_pages.saturating_add(resident);
-                    total_pages = total_pages.saturating_add(total);
+                    resident_bytes = resident_bytes.saturating_add(resident);
+                    total_bytes = total_bytes.saturating_add(total);
                 }
             }
         }
-        (resident_pages, total_pages)
+        (resident_bytes, total_bytes)
     }
 
     pub(crate) fn log_stats(&self) {
@@ -701,7 +713,7 @@ impl MxFp4StreamCache {
         }
 
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
-        if report != 0 && !report.is_multiple_of(32) {
+        if report != 0 && !report.is_multiple_of(256) {
             return;
         }
 
