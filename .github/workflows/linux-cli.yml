@@ -80,7 +80,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --reasoning-effort low \
-            --max-tokens 512 \
+            --max-tokens 2048 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
           echo "===== GPT-OSS MODEL RESPONSE ====="
