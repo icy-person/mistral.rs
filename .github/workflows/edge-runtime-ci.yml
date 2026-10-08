@@ -30,8 +30,18 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo fetch
-        run: cargo fetch --locked
+      - name: Resolve and fetch Rust dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            cargo fetch && break
+            if [ "$i" = 5 ]; then
+              exit 1
+            fi
+            sleep $((i * 10))
+          done
+
+      - name: Validate resolved lockfile
+        run: cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
 
       - name: Format check
         run: cargo fmt --all -- --check
