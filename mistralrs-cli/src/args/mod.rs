@@ -783,6 +783,11 @@ pub struct RuntimeOptions {
     #[serde(default = "default_moe_release_idle")]
     pub moe_release_idle: u64,
 
+    /// Prefault zero-copy expert mmap pages in background workers before compute.
+    #[arg(long = "moe-prefault", env = "MISTRALRS_MOE_PREFAULT", default_value_t = true)]
+    #[serde(default = "default_true")]
+    pub moe_prefault: bool,
+
     /// Show live generation token/s statistics on stderr while the answer streams.
     #[arg(long = "realtime-stats", env = "MISTRALRS_REALTIME_STATS")]
     #[serde(default)]
@@ -1003,6 +1008,10 @@ pub struct BenchRuntimeOptions {
     #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
     pub moe_release_idle: u64,
 
+    /// Prefault zero-copy expert mmap pages in background workers before compute.
+    #[arg(long = "moe-prefault", env = "MISTRALRS_MOE_PREFAULT", default_value_t = true)]
+    pub moe_prefault: bool,
+
     /// Path to a MatFormer config (CSV/JSON describing available slices). See model card.
     #[arg(long)]
     pub matformer_config_path: Option<PathBuf>,
@@ -1045,6 +1054,7 @@ impl BenchRuntimeOptions {
         std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", self.moe_cache_per_source.min(128).to_string());
         std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_RELEASE_IDLE", self.moe_release_idle.max(256).to_string());
+        std::env::set_var("MISTRALRS_MOE_PREFAULT", if self.moe_prefault { "1" } else { "0" });
     }
 
     pub fn matformer_selection(&self) -> MatformerSelection {
@@ -1144,6 +1154,7 @@ impl RuntimeOptions {
             "MISTRALRS_MOE_RELEASE_IDLE",
             self.moe_release_idle.max(256).to_string(),
         );
+        std::env::set_var("MISTRALRS_MOE_PREFAULT", if self.moe_prefault { "1" } else { "0" });
         std::env::set_var("MISTRALRS_REALTIME_STATS", if self.realtime_stats { "1" } else { "0" });
         std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
     }
@@ -1248,6 +1259,7 @@ impl Default for RuntimeOptions {
             moe_cache_per_source: 0,
             moe_release_cold: false,
             moe_release_idle: 4096,
+            moe_prefault: true,
             realtime_stats: false,
             moe_stats: false,
             mcp_config: None,
