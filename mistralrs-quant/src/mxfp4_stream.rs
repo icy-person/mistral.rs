@@ -35,6 +35,7 @@ pub(crate) struct MxFp4StreamConfig {
     pub stats: bool,
     pub release_cold: bool,
     pub release_idle: u64,
+    pub prefault: bool,
 }
 
 impl Default for MxFp4StreamConfig {
@@ -51,6 +52,7 @@ impl Default for MxFp4StreamConfig {
             stats: false,
             release_cold: false,
             release_idle: 4096,
+            prefault: true,
         }
     }
 }
@@ -85,6 +87,7 @@ impl MxFp4StreamConfig {
             stats: env_bool("MISTRALRS_MOE_STATS", defaults.stats),
             release_cold: env_bool("MISTRALRS_MOE_RELEASE_COLD", defaults.release_cold),
             release_idle: env_u64("MISTRALRS_MOE_RELEASE_IDLE", defaults.release_idle).max(256),
+            prefault: env_bool("MISTRALRS_MOE_PREFAULT", defaults.prefault),
         }
     }
 
