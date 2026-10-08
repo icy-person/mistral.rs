@@ -298,7 +298,7 @@ pub(crate) struct MxFp4StreamCache {
     archive: Arc<crate::GgufArchive>,
     config: MxFp4StreamConfig,
     budget_bytes: usize,
-    stats: Stats,
+    stats: Arc<Stats>,
 }
 
 impl MxFp4StreamCache {
@@ -312,6 +312,7 @@ impl MxFp4StreamCache {
 
         let queue_size = 8usize;
         let mut queues = Vec::new();
+        let stats = Arc::new(Stats::default());
 
         if !config.zero_copy || config.o_direct {
             queues.reserve(config.io_threads);
@@ -323,7 +324,9 @@ impl MxFp4StreamCache {
                 let want_direct = config.o_direct;
                 thread::Builder::new()
                     .name(format!("mxfp4-io-{worker_id}"))
-                    .spawn(move || {
+                    .spawn({
+                        let worker_stats = stats.clone();
+                        move || {
                         let files = match WorkerFiles::new(&worker_paths, want_direct) {
                             Ok(files) => files,
                             Err(err) => {
@@ -345,6 +348,7 @@ impl MxFp4StreamCache {
 
                             let direct_file =
                                 files.direct.get(job.shard).and_then(Option::as_ref);
+                            let started = std::time::Instant::now();
                             let result = read_file_range(
                                 file,
                                 direct_file,
@@ -353,9 +357,14 @@ impl MxFp4StreamCache {
                                 job.file_len,
                             )
                             .map(Arc::new);
+                            worker_stats.io_jobs.fetch_add(1, Ordering::Relaxed);
+                            worker_stats.io_nanos.fetch_add(
+                                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                                Ordering::Relaxed,
+                            );
                             let _ = job.reply.send(result);
                         }
-                    })
+                    }})
                     .map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::Other,
@@ -377,7 +386,7 @@ impl MxFp4StreamCache {
             archive: archive.clone(),
             budget_bytes: config.cache_budget_bytes(),
             config,
-            stats: Stats::default(),
+            stats,
         }))
     }
 
@@ -746,7 +755,6 @@ impl MxFp4StreamCache {
             hit_rate * 100.0,
             reads,
             bytes / (MIB as u64),
-            evictions,
             self.stats.io_jobs.load(Ordering::Relaxed),
             self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             evictions,
@@ -755,19 +763,6 @@ impl MxFp4StreamCache {
             self.config.overlap,
             self.config.zero_copy,
             self.config.o_direct,
-            self.budget_bytes / MIB,
-            self.config.cache_per_source,
-            hits,
-            misses,
-            hit_rate * 100.0,
-            reads,
-            bytes / (MIB as u64),
-            evictions,
-            self.config.io_threads,
-            self.config.overlap,
-            self.config.zero_copy,
-            self.config.o_direct,
-            released_bytes / MIB,
             self.config.release_cold,
             self.config.release_idle,
         );
