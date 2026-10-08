@@ -461,7 +461,7 @@ impl MxFp4StreamCache {
     }
 
     #[inline]
-    fn touch(&self, key: &MxFp4StreamKey) {
+    pub(crate) fn touch(&self, key: &MxFp4StreamKey) {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };

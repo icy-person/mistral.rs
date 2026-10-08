@@ -1,9 +1,13 @@
 name: GPT-OSS 20B response smoke test
+# Final validation: exact output path + bounded decode
 
 on:
   push:
     branches:
       - fix/gpt-oss-response-output
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read

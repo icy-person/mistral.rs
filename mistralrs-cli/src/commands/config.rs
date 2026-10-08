@@ -326,6 +326,7 @@ async fn run_run_config(cfg: crate::config::RunConfig) -> Result<()> {
             enable_thinking: thinking,
             reasoning_effort,
             adapter,
+            max_tokens: None,
         },
     )
     .await;
