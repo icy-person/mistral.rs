@@ -641,7 +641,12 @@ impl GgufArchive {
             )));
         }
         if len != 0 {
-            let _ = mapping.advise_range(memmap2::Advice::DontNeed, offset, len);
+            // SAFETY: the caller only releases immutable file-backed pages after it has finished
+            // using the expert range. The mapping remains valid; a later access simply refaults
+            // the bytes from the underlying GGUF file.
+            let _ = unsafe {
+                mapping.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, offset, len)
+            };
         }
         Ok(())
     }
