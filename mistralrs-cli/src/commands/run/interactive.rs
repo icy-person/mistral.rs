@@ -46,64 +46,6 @@ fn exit_handler() {
     std::process::exit(0);
 }
 
-fn append_final_text(acc: &mut String, text: &str) -> &str {
-    if text.is_empty() {
-        return "";
-    }
-    if acc.is_empty() {
-        acc.push_str(text);
-        return text;
-    }
-    if text.starts_with(acc.as_str()) {
-        let suffix = &text[acc.len()..];
-        acc.push_str(suffix);
-        suffix
-    } else if acc.ends_with(text) || acc.contains(text) {
-        ""
-    } else {
-        acc.push_str(text);
-        text
-    }
-}
-
-struct RealtimeStats {
-    enabled: bool,
-    last_render: Instant,
-}
-
-impl RealtimeStats {
-    fn new() -> Self {
-        Self {
-            enabled: std::env::var("MISTRALRS_REALTIME_STATS")
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                .unwrap_or(false),
-            last_render: Instant::now() - std::time::Duration::from_secs(1),
-        }
-    }
-
-    fn update(&mut self, usage: &Usage, start: Instant) {
-        if !self.enabled || self.last_render.elapsed() < std::time::Duration::from_millis(200) {
-            return;
-        }
-        self.last_render = Instant::now();
-        eprint!(
-            "
-\x1b[K[decode] {} tokens | {:.2} tok/s | elapsed {:.1}s",
-            usage.completion_tokens,
-            usage.avg_compl_tok_per_sec,
-            start.elapsed().as_secs_f32(),
-        );
-        let _ = io::stderr().flush();
-    }
-
-    fn clear(&self) {
-        if self.enabled {
-            eprint!("\r\x1b[K");
-            let _ = io::stderr().flush();
-        }
-    }
-}
-
 fn terminate_handler() {
     TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst);
 }
@@ -1495,7 +1437,6 @@ async fn stream_assistant_response(
     let mut last_usage = None;
     let mut pending_agentic_files = Vec::new();
     let mut denoising_progress = DenoisingProgress::new();
-    let mut realtime_stats = RealtimeStats::new();
 
     const GRAY: &str = "\x1b[90m";
     const RESET: &str = "\x1b[0m";
@@ -1506,9 +1447,6 @@ async fn stream_assistant_response(
             Response::Chunk(chunk) => {
                 denoising_progress.clear();
                 last_usage = chunk.usage.clone();
-                if let Some(usage) = last_usage.as_ref() {
-                    realtime_stats.update(usage, start_ttft);
-                }
                 let Some(choice) = chunk.choices.first() else {
                     continue;
                 };
@@ -1584,21 +1522,23 @@ async fn stream_assistant_response(
             }
             Response::Done(response) => {
                 denoising_progress.clear();
-                realtime_stats.clear();
                 if last_usage.is_none() {
                     last_usage = Some(response.usage.clone());
                 }
                 if let Some(choice) = response.choices.first() {
+                    let reasoning = choice
+                        .message
+                        .reasoning_content
+                        .as_deref()
+                        .unwrap_or_default();
                     let content = choice.message.content.as_deref().unwrap_or_default();
-                    let reasoning = choice.message.reasoning_content.as_deref().unwrap_or_default();
                     if !reasoning.is_empty() {
                         if first_token_duration.is_none() {
                             first_token_duration = Some(Instant::now().duration_since(start_ttft));
                         }
-                        let added = append_final_text(&mut assistant_reasoning, reasoning);
-                        if !added.is_empty() {
-                            print!("{GRAY}{added}{RESET}");
-                        }
+                        assistant_reasoning.push_str(reasoning);
+                        print!("{GRAY}{reasoning}{RESET}");
+                        was_reasoning = true;
                     }
                     if !content.is_empty() {
                         if first_token_duration.is_none() {
@@ -1608,26 +1548,22 @@ async fn stream_assistant_response(
                             println!();
                             was_reasoning = false;
                         }
-                        let added = append_final_text(&mut assistant_output, content);
-                        if !added.is_empty() {
-                            print!("{added}");
-                        }
+                        assistant_output.push_str(content);
+                        print!("{content}");
                     }
                     io::stdout().flush().unwrap();
                 }
                 break;
-            },
+            }
             Response::CompletionDone(response) => {
                 denoising_progress.clear();
-                realtime_stats.clear();
                 if last_usage.is_none() {
                     last_usage = Some(response.usage.clone());
                 }
                 if let Some(choice) = response.choices.first() {
                     if !choice.text.is_empty() {
                         if first_token_duration.is_none() {
-                            first_token_duration =
-                                Some(Instant::now().duration_since(start_ttft));
+                            first_token_duration = Some(Instant::now().duration_since(start_ttft));
                         }
                         assistant_output.push_str(&choice.text);
                         print!("{}", choice.text);
@@ -1645,7 +1581,6 @@ async fn stream_assistant_response(
         }
     }
     denoising_progress.clear();
-    realtime_stats.clear();
 
     Ok((
         AssistantTurn {
