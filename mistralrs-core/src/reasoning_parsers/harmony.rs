@@ -13,7 +13,8 @@
 //! This module provides incremental parsing of Harmony-formatted token streams.
 
 use openai_harmony::{
-    chat::Role, load_harmony_encoding, HarmonyEncoding, HarmonyEncodingName, StreamableParser,
+    chat::Role, load_harmony_encoding, HarmonyEncoding, HarmonyEncodingName, ParseOptions,
+    StreamableParser,
 };
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -152,8 +153,15 @@ impl HarmonyContext {
     /// Create a new Harmony parsing context
     pub fn new() -> Result<Self, anyhow::Error> {
         let encoding = get_harmony_encoding().clone();
-        let parser = StreamableParser::new(encoding, Some(Role::Assistant))
-            .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
+        // GPT-OSS can occasionally omit a Harmony structural marker even though its
+        // surrounding response is otherwise useful. Use permissive parsing so one
+        // malformed boundary does not discard the whole response stream.
+        let parser = StreamableParser::new_with_options(
+            encoding,
+            Some(Role::Assistant),
+            ParseOptions { strict: false },
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
         Ok(Self {
             parser,
             last_analysis_len: 0,
