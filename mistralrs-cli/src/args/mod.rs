@@ -950,6 +950,50 @@ pub struct BenchRuntimeOptions {
     #[arg(long)]
     pub no_kv_cache: bool,
 
+    /// Stream routed MoE expert weights from GGUF during the benchmark.
+    #[arg(long = "moe-stream", env = "MISTRALRS_MOE_STREAM")]
+    pub moe_stream: bool,
+
+    /// Expert-cache budget in MiB, or auto.
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
+    pub moe_cache_mb: String,
+
+    /// Memory to leave available for the rest of the process/system.
+    #[arg(long = "cache-floor-mb", env = "MISTRALRS_MOE_CACHE_FLOOR_MB", default_value_t = 1536)]
+    pub moe_cache_floor_mb: usize,
+
+    /// Hard cache ceiling; omit to disable.
+    #[arg(long = "cache-ceil-mb", env = "MISTRALRS_MOE_CACHE_CEIL_MB", default_value = "4096")]
+    pub moe_cache_ceil_mb: Option<usize>,
+
+    /// Parallel expert-read lanes.
+    #[arg(long = "io-threads", env = "MISTRALRS_MOE_IO_THREADS", default_value_t = 4)]
+    pub moe_io_threads: usize,
+
+    /// Overlap expert reads with CPU compute.
+    #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
+    pub moe_overlap: bool,
+
+    /// Try Linux O_DIRECT for expert reads.
+    #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
+    pub moe_o_direct: bool,
+
+    /// Emit streaming telemetry during the benchmark.
+    #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
+    pub moe_stats: bool,
+
+    /// Maximum cached experts per source; zero disables the per-source quota.
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold zero-copy mmap pages.
+    #[arg(long = "moe-release-cold", env = "MISTRALRS_MOE_RELEASE_COLD")]
+    pub moe_release_cold: bool,
+
+    /// Cache-clock accesses before idle mmap pages become release candidates.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    pub moe_release_idle: u64,
+
     /// Path to a MatFormer config (CSV/JSON describing available slices). See model card.
     #[arg(long)]
     pub matformer_config_path: Option<PathBuf>,
@@ -976,6 +1020,23 @@ pub struct BenchRuntimeOptions {
 }
 
 impl BenchRuntimeOptions {
+    pub fn apply_moe_stream_env(&self) {
+        std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
+        std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
+        match self.moe_cache_ceil_mb {
+            Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
+            None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
+        }
+        std::env::set_var("MISTRALRS_MOE_IO_THREADS", self.moe_io_threads.clamp(1, 32).to_string());
+        std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", self.moe_cache_per_source.min(128).to_string());
+        std::env::set_var("MISTRALRS_MOE_RELEASE_COLD", if self.moe_release_cold { "1" } else { "0" });
+        std::env::set_var("MISTRALRS_MOE_RELEASE_IDLE", self.moe_release_idle.max(256).to_string());
+    }
+
     pub fn matformer_selection(&self) -> MatformerSelection {
         MatformerSelection {
             config_path: self.matformer_config_path.clone(),
