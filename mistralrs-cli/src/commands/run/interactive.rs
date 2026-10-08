@@ -207,6 +207,7 @@ pub struct InteractiveConfig {
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub adapter: Option<String>,
+    pub max_tokens: Option<usize>,
 }
 
 struct OneshotCtx {
@@ -233,6 +234,7 @@ pub async fn oneshot_mode(
         enable_thinking,
         reasoning_effort,
         adapter,
+        max_tokens,
     } = config;
     let agent_approval_callback = cli_agent_approval_callback(agent_permission);
     let has_media =
@@ -267,7 +269,16 @@ async fn oneshot_text(mistralrs: Arc<MistralRs>, ctx: OneshotCtx, text: String) 
         adapter,
     } = ctx;
     let sender = mistralrs.get_sender(None).unwrap();
-    let sampling_params = interactive_sample_parameters(&mistralrs);
+    let mut sampling_params = interactive_sample_parameters(&mistralrs);
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
 
     let mut user_message: IndexMap<String, MessageContent> = IndexMap::new();
     user_message.insert("role".to_string(), Either::Left("user".to_string()));
@@ -574,6 +585,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking: _,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens,
             } = config;
             diffusion_interactive_mode(
                 mistralrs,
@@ -594,6 +606,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens: _,
             } = config;
             audio_interactive_mode(
                 mistralrs,
@@ -615,6 +628,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking: _,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens: _,
             } = config;
             speech_interactive_mode(
                 mistralrs,
