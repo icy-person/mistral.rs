@@ -602,6 +602,29 @@ impl MxFp4StreamCache {
         }
     }
 
+    fn mapped_residency(&self) -> (usize, usize) {
+        let Ok(guard) = self.inner.lock() else {
+            return (0, 0);
+        };
+        let mut resident_pages = 0usize;
+        let mut total_pages = 0usize;
+        for entry in guard.entries.values() {
+            if let MxFp4StreamData::ArchiveMapped {
+                shard,
+                offset,
+                len,
+                ..
+            } = entry.data.as_ref()
+            {
+                if let Ok((resident, total)) = self.archive.shard_data_residency(*shard, *offset, *len) {
+                    resident_pages = resident_pages.saturating_add(resident);
+                    total_pages = total_pages.saturating_add(total);
+                }
+            }
+        }
+        (resident_pages, total_pages)
+    }
+
     pub(crate) fn log_stats(&self) {
         if !self.config.stats {
             return;
@@ -621,6 +644,12 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        let (mapped_resident_pages, mapped_pages) = self.mapped_residency();
+        let mapped_residency = if mapped_pages == 0 {
+            0.0
+        } else {
+            mapped_resident_pages as f64 / mapped_pages as f64 * 100.0
+        };
 
         let requests = hits.saturating_add(misses);
         let hit_rate = if requests == 0 {
@@ -631,9 +660,27 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
             guard.entries.len(),
             guard.used_bytes / MIB,
+            self.budget_bytes / MIB,
+            guard.entries.values().filter_map(|entry| match entry.data.as_ref() {
+                MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
+                MxFp4StreamData::Owned(_) => None,
+            }).sum::<usize>() / MIB,
+            mapped_resident_pages.saturating_mul(4096) / MIB,
+            mapped_residency,
+            self.config.cache_per_source,
+            hits,
+            misses,
+            hit_rate * 100.0,
+            reads,
+            bytes / (MIB as u64),
+            evictions,
+            self.config.io_threads,
+            self.config.overlap,
+            self.config.zero_copy,
+            self.config.o_direct,
             self.budget_bytes / MIB,
             self.config.cache_per_source,
             hits,
