@@ -33,6 +33,8 @@ pub(crate) struct MxFp4StreamConfig {
     pub overlap: bool,
     pub o_direct: bool,
     pub stats: bool,
+    pub release_cold: bool,
+    pub release_idle: u64,
 }
 
 impl Default for MxFp4StreamConfig {
@@ -47,6 +49,8 @@ impl Default for MxFp4StreamConfig {
             overlap: true,
             o_direct: false,
             stats: false,
+            release_cold: false,
+            release_idle: 4096,
         }
     }
 }
@@ -79,6 +83,8 @@ impl MxFp4StreamConfig {
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
             o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
             stats: env_bool("MISTRALRS_MOE_STATS", defaults.stats),
+            release_cold: env_bool("MISTRALRS_MOE_RELEASE_COLD", defaults.release_cold),
+            release_idle: env_u64("MISTRALRS_MOE_RELEASE_IDLE", defaults.release_idle).max(256),
         }
     }
 
@@ -112,6 +118,13 @@ fn env_bool(name: &str, default: bool) -> bool {
         ),
         Err(_) => default,
     }
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -258,7 +271,7 @@ struct Stats {
     io_jobs: AtomicU64,
     io_nanos: AtomicU64,
     evictions: AtomicU64,
-    released_pages: AtomicU64,
+    released_bytes: AtomicU64,
     report_calls: AtomicU64,
 }
 
@@ -606,6 +619,50 @@ impl MxFp4StreamCache {
         }
     }
 
+    fn release_cold_pages(&self) -> usize {
+        if !self.config.release_cold || !self.zero_copy() {
+            return 0;
+        }
+
+        let Ok(guard) = self.inner.lock() else {
+            return 0;
+        };
+        let now = guard.clock;
+        let idle = self.config.release_idle;
+        let candidates = guard
+            .entries
+            .values()
+            .filter_map(|entry| {
+                if now.wrapping_sub(entry.last_used) < idle {
+                    return None;
+                }
+                match entry.data.as_ref() {
+                    MxFp4StreamData::ArchiveMapped {
+                        shard,
+                        offset,
+                        len,
+                        ..
+                    } if *len != 0 => Some((*shard, *offset, *len)),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(guard);
+
+        let mut released = 0usize;
+        for (shard, offset, len) in candidates {
+            if self.archive.shard_data_dont_need(shard, offset, len).is_ok() {
+                released = released.saturating_add(len);
+            }
+        }
+        if released != 0 {
+            self.stats
+                .released_bytes
+                .fetch_add(released as u64, Ordering::Relaxed);
+        }
+        released
+    }
+
     fn mapped_residency(&self) -> (usize, usize) {
         let Ok(guard) = self.inner.lock() else {
             return (0, 0);
@@ -659,11 +716,12 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
-        let (mapped_resident_pages, mapped_pages) = self.mapped_residency();
-        let mapped_residency = if mapped_pages == 0 {
+        let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
+        let released_bytes = self.release_cold_pages();
+        let mapped_residency = if mapped_bytes_total == 0 {
             0.0
         } else {
-            mapped_resident_pages as f64 / mapped_pages as f64 * 100.0
+            mapped_resident_bytes as f64 / mapped_bytes_total as f64 * 100.0
         };
 
         let requests = hits.saturating_add(misses);
@@ -675,12 +733,12 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, evictions={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}",
             entry_count,
             used_bytes / MIB,
             self.budget_bytes / MIB,
             mapped_bytes / MIB,
-            mapped_resident_pages.saturating_mul(4096) / MIB,
+            mapped_resident_bytes / MIB,
             mapped_residency,
             self.config.cache_per_source,
             hits,
@@ -689,6 +747,10 @@ impl MxFp4StreamCache {
             reads,
             bytes / (MIB as u64),
             evictions,
+            self.stats.io_jobs.load(Ordering::Relaxed),
+            self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            evictions,
+            released_bytes / MIB,
             self.config.io_threads,
             self.config.overlap,
             self.config.zero_copy,
@@ -705,6 +767,9 @@ impl MxFp4StreamCache {
             self.config.overlap,
             self.config.zero_copy,
             self.config.o_direct,
+            released_bytes / MIB,
+            self.config.release_cold,
+            self.config.release_idle,
         );
     }
 }
@@ -871,12 +936,14 @@ mod tests {
             cache_mb: Some(4096),
             cache_floor_mb: 1536,
             cache_ceil_mb: Some(2048),
-            cache_per_source: 5,
+            cache_per_source: 0,
             zero_copy: true,
             io_threads: 4,
             overlap: true,
             o_direct: false,
             stats: true,
+            release_cold: false,
+            release_idle: 4096,
         };
         assert_eq!(cfg.cache_budget_bytes(), 2048 * MIB);
     }
