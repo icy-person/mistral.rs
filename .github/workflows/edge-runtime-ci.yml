@@ -1,0 +1,46 @@
+name: Edge runtime CI
+
+on:
+  push:
+    branches:
+      - feat/complete-gpt-oss-edge-runtime
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  edge-runtime:
+    name: Edge runtime checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "5"
+      CARGO_HTTP_TIMEOUT: "120"
+      CARGO_HTTP_MULTIPLEXING: "false"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo fetch
+        run: cargo fetch --locked
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Check CLI
+        run: cargo check --locked -p mistralrs-cli
+
+      - name: Test quantization crate
+        run: cargo test --locked -p mistralrs-quant
+
+      - name: Test CLI crate
+        run: cargo test --locked -p mistralrs-cli
