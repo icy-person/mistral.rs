@@ -90,6 +90,10 @@ pub enum Command {
         #[arg(long)]
         reasoning_effort: Option<ReasoningEffort>,
 
+        /// Maximum number of newly generated tokens.
+        #[arg(long, value_parser = model::parse_positive_usize)]
+        max_tokens: Option<usize>,
+
         /// One-shot text prompt. When provided, sends a single request and exits
         /// instead of entering interactive mode.
         /// Combine with --image, --video, or --audio for multimodal requests.
