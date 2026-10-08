@@ -281,7 +281,6 @@ struct Stats {
     io_nanos: AtomicU64,
     io_wait_nanos: AtomicU64,
     evictions: AtomicU64,
-    released_bytes: AtomicU64,
     prefault_jobs: AtomicU64,
     prefault_nanos: AtomicU64,
     prefault_wait_nanos: AtomicU64,
@@ -791,11 +790,6 @@ impl MxFp4StreamCache {
                 released = released.saturating_add(len);
             }
         }
-        if released != 0 {
-            self.stats
-                .released_bytes
-                .fetch_add(released as u64, Ordering::Relaxed);
-        }
         released
     }
 
@@ -879,7 +873,7 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, released_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, released_now_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
             entry_count,
             used_bytes / MIB,
             self.budget_bytes / MIB,
