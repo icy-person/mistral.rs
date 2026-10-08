@@ -1617,7 +1617,25 @@ async fn stream_assistant_response(
                 }
                 break;
             },
-            Response::CompletionDone(_) => unreachable!(),
+            Response::CompletionDone(response) => {
+                denoising_progress.clear();
+                realtime_stats.clear();
+                if last_usage.is_none() {
+                    last_usage = Some(response.usage.clone());
+                }
+                if let Some(choice) = response.choices.first() {
+                    if !choice.text.is_empty() {
+                        if first_token_duration.is_none() {
+                            first_token_duration =
+                                Some(Instant::now().duration_since(start_ttft));
+                        }
+                        assistant_output.push_str(&choice.text);
+                        print!("{}", choice.text);
+                        io::stdout().flush().unwrap();
+                    }
+                }
+                break;
+            }
             Response::CompletionModelError(_, _) => unreachable!(),
             Response::CompletionChunk(_) => unreachable!(),
             Response::ImageGeneration(_) => unreachable!(),
