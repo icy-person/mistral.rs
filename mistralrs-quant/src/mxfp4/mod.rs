@@ -4014,7 +4014,7 @@ mod tests {
             .chain((0..16).map(|j| fp4[15 - j]))
             .collect::<Vec<_>>();
         let expected = Tensor::from_vec(expected_values, (1, MXFP4_BLOCK_SIZE), &Device::Cpu)?;
-        assert_close(&actual, &expected)?;
+        assert_close(&actual, &expected, 1e-4)?;
         Ok(())
     }
 
