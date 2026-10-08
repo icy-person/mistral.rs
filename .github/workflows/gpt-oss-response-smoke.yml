@@ -55,6 +55,7 @@ jobs:
           RUST_LOG: error
           MISTRALRS_MOE_ZERO_COPY: "true"
           MISTRALRS_MOE_OVERLAP: "false"
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "1"
         run: |
           set -o pipefail
           ./target/release/mistralrs run \
@@ -66,7 +67,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --thinking false \
-            -i "Answer this exact question in one sentence: What is 17 multiplied by 19?" \
+            -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
 
       - name: Print model answer only
