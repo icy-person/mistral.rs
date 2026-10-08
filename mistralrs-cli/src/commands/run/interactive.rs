@@ -46,24 +46,24 @@ fn exit_handler() {
     std::process::exit(0);
 }
 
-fn append_final_text(acc: &mut String, text: &str) -> &str {
+fn append_final_text(acc: &mut String, text: &str) -> usize {
     if text.is_empty() {
-        return "";
+        return 0;
     }
     if acc.is_empty() {
         acc.push_str(text);
-        return text;
+        return text.len();
     }
     if text.starts_with(acc.as_str()) {
-        let suffix = &text[acc.len()..];
-        acc.push_str(suffix);
-        suffix
-    } else if acc.ends_with(text) || acc.contains(text) {
-        ""
-    } else {
-        acc.push_str(text);
-        text
+        let prefix_len = acc.len();
+        acc.push_str(&text[prefix_len..]);
+        return text.len().saturating_sub(prefix_len);
     }
+    if acc.ends_with(text) || acc.contains(text) {
+        return 0;
+    }
+    acc.push_str(text);
+    text.len()
 }
 
 struct RealtimeStats {
@@ -1595,9 +1595,10 @@ async fn stream_assistant_response(
                         if first_token_duration.is_none() {
                             first_token_duration = Some(Instant::now().duration_since(start_ttft));
                         }
+                        let before = assistant_reasoning.len();
                         let added = append_final_text(&mut assistant_reasoning, reasoning);
-                        if !added.is_empty() {
-                            print!("{GRAY}{added}{RESET}");
+                        if added > 0 {
+                            print!("{GRAY}{}{RESET}", &assistant_reasoning[before..]);
                         }
                     }
                     if !content.is_empty() {
@@ -1608,9 +1609,10 @@ async fn stream_assistant_response(
                             println!();
                             was_reasoning = false;
                         }
+                        let before = assistant_output.len();
                         let added = append_final_text(&mut assistant_output, content);
-                        if !added.is_empty() {
-                            print!("{added}");
+                        if added > 0 {
+                            print!("{}", &assistant_output[before..]);
                         }
                     }
                     io::stdout().flush().unwrap();
