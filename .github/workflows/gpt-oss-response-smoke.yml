@@ -1,0 +1,78 @@
+name: GPT-OSS 20B response smoke test
+
+on:
+  push:
+    branches:
+      - fix/gpt-oss-response-output
+
+permissions:
+  contents: read
+
+jobs:
+  gpt-oss-response:
+    name: GPT-OSS 20B MXFP4 CPU response
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_TIMEOUT: "120"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      HF_URL: "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf"
+      HF_SHA256: "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            cargo fetch && break
+            if [ "$i" = 5 ]; then
+              exit 1
+            fi
+            sleep $((i * 20))
+          done
+
+      - name: Validate resolved lockfile
+        run: cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null
+
+      - name: Build mistralrs CLI
+        run: cargo build --release --locked --offline -p mistralrs-cli
+
+      - name: Download official GPT-OSS 20B MXFP4 GGUF
+        run: |
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output gpt-oss-20b-MXFP4.gguf "$HF_URL"
+          echo "$HF_SHA256  gpt-oss-20b-MXFP4.gguf" | sha256sum --check -
+
+      - name: Run real model response
+        env:
+          RUST_LOG: error
+          MISTRALRS_MOE_ZERO_COPY: "true"
+          MISTRALRS_MOE_OVERLAP: "false"
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "1"
+        run: |
+          set -o pipefail
+          ./target/release/mistralrs run \
+            --cpu \
+            -f "$PWD/gpt-oss-20b-MXFP4.gguf" \
+            --moe-stream \
+            --cache-mb 1024 \
+            --cache-floor-mb 1024 \
+            --cache-ceil-mb 1024 \
+            --io-threads 4 \
+            --thinking false \
+            --max-tokens 8 \
+            -i "Reply with exactly this number and nothing else: 323" \
+            2>model.stderr | tee model.stdout
+
+      - name: Print model answer only
+        run: |
+          echo "===== MODEL ANSWER ====="
+          sed '/^Stats:/,$d' model.stdout
+          echo "===== END MODEL ANSWER ====="

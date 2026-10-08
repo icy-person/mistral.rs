@@ -87,7 +87,8 @@ impl RealtimeStats {
         }
         self.last_render = Instant::now();
         eprint!(
-            "\x1b[K[decode] {} tokens | {:.2} tok/s | elapsed {:.1}s",
+            "
+\x1b[K[decode] {} tokens | {:.2} tok/s | elapsed {:.1}s",
             usage.completion_tokens,
             usage.avg_compl_tok_per_sec,
             start.elapsed().as_secs_f32(),
@@ -264,6 +265,7 @@ pub struct InteractiveConfig {
     pub enable_thinking: Option<bool>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub adapter: Option<String>,
+    pub max_tokens: Option<usize>,
 }
 
 struct OneshotCtx {
@@ -275,6 +277,7 @@ struct OneshotCtx {
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
     adapter: Option<String>,
+    max_tokens: Option<usize>,
 }
 
 pub async fn oneshot_mode(
@@ -290,6 +293,7 @@ pub async fn oneshot_mode(
         enable_thinking,
         reasoning_effort,
         adapter,
+        max_tokens,
     } = config;
     let agent_approval_callback = cli_agent_approval_callback(agent_permission);
     let has_media =
@@ -303,6 +307,7 @@ pub async fn oneshot_mode(
         enable_thinking,
         reasoning_effort,
         adapter,
+        max_tokens,
     };
 
     if has_media {
@@ -322,9 +327,13 @@ async fn oneshot_text(mistralrs: Arc<MistralRs>, ctx: OneshotCtx, text: String) 
         enable_thinking,
         reasoning_effort,
         adapter,
+        max_tokens,
     } = ctx;
     let sender = mistralrs.get_sender(None).unwrap();
-    let sampling_params = interactive_sample_parameters(&mistralrs);
+    let mut sampling_params = interactive_sample_parameters(&mistralrs);
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
 
     let mut user_message: IndexMap<String, MessageContent> = IndexMap::new();
     user_message.insert("role".to_string(), Either::Left("user".to_string()));
@@ -401,6 +410,7 @@ async fn oneshot_multimodal(mistralrs: Arc<MistralRs>, ctx: OneshotCtx, input: O
         enable_thinking,
         reasoning_effort,
         adapter: _,
+        max_tokens,
     } = ctx;
     let config = mistralrs.config(None).unwrap();
     let (prefixer, video_sampling) = match &config.category {
@@ -415,7 +425,10 @@ async fn oneshot_multimodal(mistralrs: Arc<MistralRs>, ctx: OneshotCtx, input: O
     };
 
     let sender = mistralrs.get_sender(None).unwrap();
-    let sampling_params = interactive_sample_parameters(&mistralrs);
+    let mut sampling_params = interactive_sample_parameters(&mistralrs);
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
 
     let mut images = Vec::new();
     let mut audios = Vec::new();
@@ -631,6 +644,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking: _,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens: _,
             } = config;
             diffusion_interactive_mode(
                 mistralrs,
@@ -651,6 +665,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens: _,
             } = config;
             audio_interactive_mode(
                 mistralrs,
@@ -672,6 +687,7 @@ pub async fn interactive_mode(mistralrs: Arc<MistralRs>, config: InteractiveConf
                 enable_thinking: _,
                 reasoning_effort: _,
                 adapter: _,
+                max_tokens: _,
             } = config;
             speech_interactive_mode(
                 mistralrs,
@@ -930,12 +946,16 @@ async fn text_interactive_mode(
         enable_thinking,
         reasoning_effort,
         mut adapter,
+        max_tokens,
     } = config;
     let sender = mistralrs.get_sender(None).unwrap();
     let mut messages: Vec<IndexMap<String, MessageContent>> = Vec::new();
     let tool_session_id = uuid::Uuid::new_v4().to_string();
 
     let mut sampling_params = interactive_sample_parameters(&mistralrs);
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
 
     info!("Starting interactive loop with sampling params: {sampling_params:?}");
     println!(
@@ -1632,6 +1652,7 @@ async fn multimodal_interactive_mode(
         enable_thinking,
         reasoning_effort,
         adapter: _,
+        max_tokens,
     } = config;
     let tool_session_id = uuid::Uuid::new_v4().to_string();
 
@@ -1658,6 +1679,9 @@ async fn multimodal_interactive_mode(
     };
 
     let mut sampling_params = interactive_sample_parameters(&mistralrs);
+    if let Some(max_tokens) = max_tokens {
+        sampling_params.max_len = Some(max_tokens);
+    }
     let mut prev_encoder_hits: usize = 0;
     let mut prev_encoder_misses: usize = 0;
 
