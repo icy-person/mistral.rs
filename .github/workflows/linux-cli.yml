@@ -80,9 +80,13 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --thinking false \
-            --max-tokens 8 \
+            --max-tokens 32 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
+          echo "===== GPT-OSS MODEL RESPONSE ====="
+          cat model.stdout
+          echo "===== END GPT-OSS MODEL RESPONSE ====="
+          test -s model.stdout
           grep -q "323" model.stdout
 
       - name: Package CLI
