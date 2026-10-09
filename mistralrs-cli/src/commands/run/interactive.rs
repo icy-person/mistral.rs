@@ -1496,6 +1496,7 @@ async fn stream_assistant_response(
     let mut pending_agentic_files = Vec::new();
     let mut denoising_progress = DenoisingProgress::new();
     let mut realtime_stats = RealtimeStats::new();
+    let mut reached_length_limit = false;
 
     const GRAY: &str = "\x1b[90m";
     const RESET: &str = "\x1b[0m";
@@ -1539,11 +1540,13 @@ async fn stream_assistant_response(
                 if let Some(ref finish_reason) = choice.finish_reason {
                     if was_reasoning {
                         println!();
+                        was_reasoning = false;
                     }
+                    // A terminal Response::Done can contain final text recovered during
+                    // parser finalization. Do not break before consuming that response.
                     if matches!(finish_reason.as_str(), "length") {
-                        print!("...");
+                        reached_length_limit = true;
                     }
-                    break;
                 }
             }
             Response::AgenticToolCallProgress {
@@ -1648,6 +1651,10 @@ async fn stream_assistant_response(
     }
     denoising_progress.clear();
     realtime_stats.clear();
+    if reached_length_limit {
+        print!("...");
+        let _ = io::stdout().flush();
+    }
 
     Ok((
         AssistantTurn {
