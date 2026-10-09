@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - fix/gpt-oss-response-output
+      - master
   pull_request:
     branches:
       - master
