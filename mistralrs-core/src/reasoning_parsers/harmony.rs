@@ -13,7 +13,8 @@
 //! This module provides incremental parsing of Harmony-formatted token streams.
 
 use openai_harmony::{
-    chat::Role, load_harmony_encoding, HarmonyEncoding, HarmonyEncodingName, StreamableParser,
+    chat::Role, load_harmony_encoding, HarmonyEncoding, HarmonyEncodingName, ParseOptions,
+    StreamableParser,
 };
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -126,6 +127,9 @@ impl HarmonyAccumulated {
 /// delta extraction for streaming responses.
 pub struct HarmonyContext {
     parser: StreamableParser,
+    // Keep the exact generated token stream so a malformed Harmony boundary can
+    // be reparsed losslessly at the end of generation.
+    tokens: Vec<u32>,
     // Track lengths for delta extraction (for parser content)
     last_analysis_len: usize,
     last_commentary_len: usize,
@@ -152,10 +156,18 @@ impl HarmonyContext {
     /// Create a new Harmony parsing context
     pub fn new() -> Result<Self, anyhow::Error> {
         let encoding = get_harmony_encoding().clone();
-        let parser = StreamableParser::new(encoding, Some(Role::Assistant))
-            .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
+        // GPT-OSS can occasionally omit a Harmony structural marker even though its
+        // surrounding response is otherwise useful. Use permissive parsing so one
+        // malformed boundary does not discard the whole response stream.
+        let parser = StreamableParser::new_with_options(
+            encoding,
+            Some(Role::Assistant),
+            ParseOptions { strict: false },
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create Harmony parser: {:?}", e))?;
         Ok(Self {
             parser,
+            tokens: Vec::new(),
             last_analysis_len: 0,
             last_commentary_len: 0,
             last_final_len: 0,
@@ -172,8 +184,12 @@ impl HarmonyContext {
 
     /// Process a token and return any new delta content
     pub fn process_token(&mut self, token_id: u32) -> HarmonyDelta {
-        // process() returns Result, ignore errors for robustness
-        let _ = self.parser.process(token_id);
+        self.tokens.push(token_id);
+        if let Err(error) = self.parser.process(token_id) {
+            // Keep malformed model output recoverable. The complete token stream is
+            // retained and replayed with permissive parsing at finalization.
+            tracing::debug!(?error, "Harmony parser rejected a token; deferring to replay recovery");
+        }
         self.extract_delta()
     }
 
@@ -398,6 +414,69 @@ impl HarmonyContext {
     }
 }
 
+impl crate::reasoning_parsers::ReasoningParser for HarmonyContext {
+    // Harmony is token-native: feeding decoded bytes back through the parser can
+    // lose special-token boundaries. Sequence calls process_token instead.
+    fn process_bytes(&mut self, _bytes: &[u8]) {}
+
+    fn process_token(&mut self, token_id: u32, _bytes: &[u8]) {
+        HarmonyContext::process_token(self, token_id);
+    }
+
+    fn finalize(&mut self) {
+        self.process_eos();
+
+        // If the incremental parser never produced a final channel, replay the exact
+        // token stream through a fresh permissive parser. This handles malformed
+        // Harmony boundaries without exposing raw control tokens to callers.
+        if self.accumulated.final_content.is_empty() && !self.tokens.is_empty() {
+            if let Ok(mut recovered) = StreamableParser::new_with_options(
+                get_harmony_encoding().clone(),
+                Some(Role::Assistant),
+                ParseOptions { strict: false },
+            ) {
+                let mut ok = true;
+                for &token in &self.tokens {
+                    if recovered.process(token).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    let _ = recovered.process_eos();
+                    self.parser = recovered;
+                    self.last_analysis_len = 0;
+                    self.last_commentary_len = 0;
+                    self.last_final_len = 0;
+                    self.sent_reasoning_len = 0;
+                    self.sent_final_len = 0;
+                    self.channel = None;
+                    self.accumulated = HarmonyAccumulated::default();
+                    self.current_tool_call = None;
+                    self.tool_calls.clear();
+                    self.extract_delta();
+                }
+            }
+        }
+    }
+
+    fn get_content_delta(&mut self) -> Option<String> {
+        HarmonyContext::get_final_delta(self)
+    }
+
+    fn get_reasoning_delta(&mut self) -> Option<String> {
+        HarmonyContext::get_reasoning_delta(self)
+    }
+
+    fn content(&self) -> Option<String> {
+        self.final_content()
+    }
+
+    fn reasoning_content(&self) -> Option<String> {
+        HarmonyContext::reasoning_content(self)
+    }
+}
+
 /// Global harmony encoding (lazy loaded)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 
@@ -488,6 +567,26 @@ mod tests {
             ..Default::default()
         };
         assert!(with_final.has_content());
+    }
+
+    #[test]
+    fn test_harmony_stream_parser_extracts_final_channel() {
+        prewarm_harmony_encoding();
+        let mut ctx = HarmonyContext::new().expect("Harmony parser should initialize");
+
+        // Canonical GPT-OSS Harmony example from OpenAI's format documentation.
+        let tokens = [
+            200005, 35644, 200008, 1844, 31064, 25, 392, 4827, 382, 220, 17, 659, 220, 17,
+            16842, 12295, 81645, 13, 51441, 6052, 13, 200007, 200006, 173781, 200005, 17196,
+            200008, 17, 659, 220, 17, 314, 220, 19, 13, 200002,
+        ];
+
+        for token in tokens {
+            ctx.process_token(token);
+        }
+        ctx.process_eos();
+
+        assert_eq!(ctx.final_content().as_deref(), Some("2 + 2 = 4."));
     }
 
     #[test]

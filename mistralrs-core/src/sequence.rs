@@ -1516,7 +1516,9 @@ impl Sequence {
         debug_assert!(len <= self.stop_pending_bytes.len());
         if len > 0 {
             if let Some(parser) = self.reasoning_parser.as_mut() {
-                parser.process_bytes(&self.stop_pending_bytes[..len]);
+                if self.reasoning_mode != Some(ReasoningMode::Harmony) {
+                    parser.process_bytes(&self.stop_pending_bytes[..len]);
+                }
             }
         }
         self.completion_bytes
@@ -1642,6 +1644,16 @@ impl Sequence {
             None | Some(StopReason::Length(_)) | Some(StopReason::ModelLength(_))
         );
         let committed_start = self.completion_bytes.len();
+        let harmony_token = (self.reasoning_mode == Some(ReasoningMode::Harmony))
+            .then_some(tok.token);
+
+        if let Some(token_id) = harmony_token {
+            // Harmony consumes the original token id immediately; its parser is independent
+            // of decoded-byte buffering and must also observe structural control tokens.
+            if let Some(parser) = self.reasoning_parser.as_mut() {
+                parser.process_token(token_id, &completion_bytes);
+            }
+        }
 
         if let Some(ref mut tool_call_state) = self.tool_call_state {
             tool_call_state.observe_token(tok.token, &completion_bytes);
