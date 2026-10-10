@@ -500,8 +500,18 @@ impl MxFp4StreamingExpertLayer {
 
             let gt_one = _mm256_cmpgt_epi32(mag, _mm256_set1_epi32(1));
             let odd = _mm256_and_si256(mag, _mm256_set1_epi32(1));
+            // A result whose exponent reaches 255 must be infinity, not NaN.
+            // Without this mask, e.g. scale=253 with FP4 magnitude 6 produces
+            // exponent=255 plus a nonzero mantissa (0x7fc00000).
+            let finite_exponent = _mm256_cmpgt_epi32(
+                _mm256_set1_epi32(255),
+                exponent,
+            );
             let mantissa_bits = _mm256_slli_epi32(
-                _mm256_and_si256(gt_one, odd),
+                _mm256_and_si256(
+                    _mm256_and_si256(gt_one, odd),
+                    finite_exponent,
+                ),
                 22,
             );
 
