@@ -1862,6 +1862,42 @@ impl SharedOutPtr {
         ))
     }
 
+/// Order read submissions exactly as the consumer resolves their handles.
+///
+/// The stream cache uses rendezvous reply channels to bound retained expert
+/// buffers. A worker cannot advance to its next read until the receiver for
+/// the current job is waiting, so submission order must match resolution
+/// order. Single-route split gate/up experts consume both components
+/// together; multi-route experts consume component 0 first and component 1
+/// in the second pass.
+fn stream_prefetch_component_order(
+    experts: &[usize],
+    expert_offsets: &[usize],
+    weight_count: usize,
+) -> Vec<(usize, usize)> {
+    debug_assert!((1..=2).contains(&weight_count));
+    let mut order = Vec::with_capacity(experts.len() * weight_count);
+
+    for &expert in experts {
+        order.push((0, expert));
+        if weight_count == 2
+            && expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) == 1
+        {
+            order.push((1, expert));
+        }
+    }
+
+    if weight_count == 2 {
+        for &expert in experts {
+            if expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) != 1 {
+                order.push((1, expert));
+            }
+        }
+    }
+
+    order
+}
+
 impl QuantMethod for MxFp4StreamingExpertLayer {
     fn as_mxfp4_streaming(&self) -> Option<&crate::MxFp4StreamingExpertLayer> {
         Some(self)
@@ -1886,42 +1922,6 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             "{} is a routed expert layer; use gather_forward",
             self.name()
         )
-    }
-
-    /// Order read submissions exactly as the consumer resolves their handles.
-    ///
-    /// The stream cache uses rendezvous reply channels to bound retained expert
-    /// buffers. A worker cannot advance to its next read until the receiver for
-    /// the current job is waiting, so submission order must match resolution
-    /// order. Single-route split gate/up experts consume both components
-    /// together; multi-route experts consume component 0 first and component 1
-    /// in the second pass.
-    fn stream_prefetch_component_order(
-        experts: &[usize],
-        expert_offsets: &[usize],
-        weight_count: usize,
-    ) -> Vec<(usize, usize)> {
-        debug_assert!((1..=2).contains(&weight_count));
-        let mut order = Vec::with_capacity(experts.len() * weight_count);
-
-        for &expert in experts {
-            order.push((0, expert));
-            if weight_count == 2
-                && expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) == 1
-            {
-                order.push((1, expert));
-            }
-        }
-
-        if weight_count == 2 {
-            for &expert in experts {
-                if expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) != 1 {
-                    order.push((1, expert));
-                }
-            }
-        }
-
-        order
     }
 
     fn gather_forward_raw(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
@@ -2034,7 +2034,7 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             });
         }
 
-        let prefetch_order = Self::stream_prefetch_component_order(
+        let prefetch_order = stream_prefetch_component_order(
             &experts,
             &expert_offsets,
             self.raw_weights.len(),
@@ -3796,11 +3796,7 @@ mod tests {
         let experts = [0, 1, 2, 3];
         let offsets = [0, 1, 4, 5, 7];
         assert_eq!(
-            MxFp4StreamingExpertLayer::stream_prefetch_component_order(
-                &experts,
-                &offsets,
-                2,
-            ),
+            stream_prefetch_component_order(&experts, &offsets, 2),
             vec![
                 (0, 0),
                 (1, 0),
