@@ -168,9 +168,15 @@ mistralrs run --cpu -f /path/to/model.gguf \
   --moe-stats
 ```
 
-The cache is sized once at model initialization for `--cache-mb auto`; `--cache-floor-mb` reserves
-memory for the rest of the process/system and `--cache-ceil-mb` caps the resulting budget. The
-streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
+The cache is sized once at model initialization for `--cache-mb auto`. On Linux, the
+available-memory estimate uses the lower of `/proc/meminfo`'s `MemAvailable` value and any
+discoverable cgroup v1/v2 memory remaining, so container and systemd memory limits are respected.
+`--cache-floor-mb` reserves memory for the rest of the process/system and `--cache-ceil-mb` caps
+the resulting budget. This is a startup snapshot, not a dynamic guarantee: non-expert weights,
+resident mapped expert pages, KV cache, and other processes can still consume RAM. On constrained
+systems, set an explicit cache ceiling and start with a modest context length.
+
+The streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
 resident expert layers, and dynamic LoRA, where resident backends remain authoritative.
 
 For RAM-constrained Linux systems, `--moe-zero-copy` keeps routed MXFP4 experts file-backed,
