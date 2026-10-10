@@ -467,7 +467,10 @@ impl MxFp4StreamingExpertLayer {
 
         let s = raw_expert[block_start] as u32;
         if (3..=253).contains(&s) {
-            let scale_offset = _mm256_set1_epi32((s as i32) - 1);
+            // The vector decoder adds the E2M1 exponent adjustment to this
+            // exponent field. Use the full E8M0 exponent, not exponent - 1:
+            // the canonical FP4 magnitudes below are not doubled.
+            let scale_offset = _mm256_set1_epi32(s as i32);
             [
                 decode8_normal_e8m0(lo0, scale_offset),
                 decode8_normal_e8m0(lo1, scale_offset),
@@ -475,11 +478,11 @@ impl MxFp4StreamingExpertLayer {
                 decode8_normal_e8m0(hi1, scale_offset),
             ]
         } else {
-            // E8M0 special values x=0,1 are the subnormal floor encodings.
-            let scale_bits = if s < 2 {
-                0x0020_0000u32 << s
+            // Match GGML_E8M0_TO_FP32 at the denormal floor and high endpoint.
+            let scale_bits = if s == 0 {
+                0x0040_0000u32
             } else {
-                (s - 1) << 23
+                s << 23
             };
             let scale = _mm256_set1_ps(f32::from_bits(scale_bits));
             [
@@ -3201,12 +3204,15 @@ impl MXFP4Layer {
         ];
         let mut s = 0u32;
         while s < 256 {
-            // GGML E8M0 uses the special encodings x=0,1 for the subnormal
-            // floor, then regular IEEE-754 exponents for x>=2.
-            let scale_factor = if s < 2 {
-                f32::from_bits(0x0020_0000u32 << s)
+            // Match GGML_E8M0_TO_FP32: byte 0 is the smallest denormal scale;
+            // other values encode their exponent directly. Do not use the
+            // half-scale helper here: fp4 already contains canonical E2M1
+            // values (0.5, 1, 1.5, ...), so halving the scale halves every
+            // decoded weight and changes model output.
+            let scale_factor = if s == 0 {
+                f32::from_bits(0x0040_0000)
             } else {
-                f32::from_bits((s - 1) << 23)
+                f32::from_bits(s << 23)
             };
             let mut n = 0;
             while n < 16 {
@@ -4020,9 +4026,12 @@ mod tests {
 
     #[test]
     fn mxfp4_e8m0_endpoints_match_ggml() -> Result<()> {
-        assert_eq!(MXFP4Layer::DEQUANT_LUT[0][2], 2.0f32.powi(-126));
-        assert_eq!(MXFP4Layer::DEQUANT_LUT[1][2], 2.0f32.powi(-125));
-        assert_eq!(MXFP4Layer::DEQUANT_LUT[255][2], 2.0f32.powi(127));
+        // Nibble 2 is the canonical E2M1 value 1.0, so this checks E8M0 scales.
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[0][2], 2.0f32.powi(-127));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[1][2], 2.0f32.powi(-126));
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[127][2], 1.0);
+        assert_eq!(MXFP4Layer::DEQUANT_LUT[128][2], 2.0);
+        assert!(MXFP4Layer::DEQUANT_LUT[255][2].is_infinite());
         Ok(())
     }
 
