@@ -22,6 +22,9 @@ use std::{os::unix::fs::OpenOptionsExt, path::Path};
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
 const HOT_PROMOTION_HITS: u16 = 3;
+// A fused gate/up source can have the LRU entry plus two persistent OnceLock descriptors.
+// More references indicate a live request should be allowed to finish before DONTNEED.
+const MAX_IDLE_MMAP_REFS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MxFp4StreamConfig {
@@ -970,6 +973,7 @@ impl MxFp4StreamCache {
                     now,
                     idle,
                     entry.dontneed_advised,
+                    Arc::strong_count(&entry.data),
                 ) {
                     continue;
                 }
@@ -1098,8 +1102,16 @@ impl MxFp4StreamCache {
     }
 }
 
-fn should_advise_cold_page(last_used: u64, now: u64, idle: u64, already_advised: bool) -> bool {
-    !already_advised && now.wrapping_sub(last_used) >= idle
+fn should_advise_cold_page(
+    last_used: u64,
+    now: u64,
+    idle: u64,
+    already_advised: bool,
+    strong_refs: usize,
+) -> bool {
+    !already_advised
+        && now.wrapping_sub(last_used) >= idle
+        && strong_refs <= MAX_IDLE_MMAP_REFS
 }
 
 fn should_promote_mapped(hits: u16, len: usize, budget_bytes: usize, promotion_claimed: bool) -> bool {
@@ -1471,11 +1483,13 @@ mod tests {
     }
 
     #[test]
-    fn cold_page_advice_is_once_per_idle_period() {
-        assert!(!should_advise_cold_page(100, 4095, 4096, false));
-        assert!(should_advise_cold_page(100, 4196, 4096, false));
-        assert!(!should_advise_cold_page(100, 4196, 4096, true));
+    fn cold_page_advice_is_once_per_idle_period_and_skips_live_users() {
+        assert!(!should_advise_cold_page(100, 4095, 4096, false, 1));
+        assert!(should_advise_cold_page(100, 4196, 4096, false, 3));
+        assert!(!should_advise_cold_page(100, 4196, 4096, true, 1));
+        // Cache entry + persistent descriptor(s) can be idle; another Arc means a live user.
+        assert!(!should_advise_cold_page(100, 4196, 4096, false, 4));
         // Wrapping subtraction keeps age arithmetic well-defined.
-        assert!(should_advise_cold_page(u64::MAX - 3, 3, 7, false));
+        assert!(should_advise_cold_page(u64::MAX - 3, 3, 7, false, 1));
     }
 }
