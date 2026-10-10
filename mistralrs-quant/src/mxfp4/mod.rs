@@ -3477,18 +3477,42 @@ impl MXFP4Layer {
         }
 
         let (num_tokens, topk, k, x_has_topk) = if x_dims.len() == 2 {
+            if x_dims[0] != indices_dims[0] {
+                candle_core::bail!(
+                    "MXFP4 CPU MoE input token count {} does not match indices token count {}",
+                    x_dims[0],
+                    indices_dims[0]
+                );
+            }
             (x_dims[0], indices_dims[1], x_dims[1], false)
         } else if x_dims.len() == 3 {
-            if x_dims[0] != indices_dims[0] || x_dims[1] != indices_dims[1] {
-                candle_core::bail!("MXFP4 CPU MoE input and indices shapes do not agree");
+            // MoE callers may provide either a separately gathered row for each
+            // selected expert ([tokens, topk, K]) or one shared row per token
+            // ([tokens, 1, K]). The latter must broadcast across all index slots.
+            if x_dims[0] != indices_dims[0]
+                || (x_dims[1] != 1 && x_dims[1] != indices_dims[1])
+            {
+                candle_core::bail!(
+                    "MXFP4 CPU MoE input shape {:?} is incompatible with indices shape {:?}",
+                    x_dims,
+                    indices_dims
+                );
             }
-            (x_dims[0], x_dims[1], x_dims[2], true)
+            (
+                x_dims[0],
+                indices_dims[1],
+                x_dims[2],
+                x_dims[1] != 1,
+            )
         } else {
             candle_core::bail!(
                 "MXFP4 CPU MoE fallback expects rank-2 or rank-3 input, got rank {}",
                 x_dims.len()
             );
         };
+        if topk == 0 {
+            candle_core::bail!("MXFP4 CPU MoE requires at least one selected expert");
+        }
 
         if !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
             candle_core::bail!(
@@ -4070,6 +4094,30 @@ mod tests {
         assert_eq!(MXFP4Layer::DEQUANT_LUT[128][2], 2.0);
         assert!(MXFP4Layer::DEQUANT_LUT[255][2].is_infinite());
         Ok(())
+    }
+
+    #[test]
+    fn stacked_mxfp4_gather_broadcasts_single_input_across_topk() -> Result<()> {
+        let layer = stacked_test_layer()?;
+        let input = Tensor::ones((2, 1, TEST_HIDDEN_SIZE), DType::F32, &Device::Cpu)?;
+        let indices = Tensor::from_vec(vec![0u32, 1, 1, 0], (2, 2), &Device::Cpu)?;
+
+        let actual = layer.gather_forward(&input, &indices)?;
+        assert_eq!(actual.dims(), &[2, 2, 4]);
+        assert_close(
+            &actual,
+            &Tensor::from_vec(
+                vec![
+                    64.0f32, 65.0, 66.0, 67.0, // token 0, expert 0
+                    68.0, 69.0, 70.0, 71.0, // token 0, expert 1
+                    68.0, 69.0, 70.0, 71.0, // token 1, expert 1
+                    64.0, 65.0, 66.0, 67.0, // token 1, expert 0
+                ],
+                (2, 2, 4),
+                &Device::Cpu,
+            )?,
+            1e-4,
+        )
     }
 
     #[test]
