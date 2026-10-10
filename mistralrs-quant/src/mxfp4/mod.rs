@@ -3756,7 +3756,7 @@ mod tests {
             -2.0, 6.0, -6.0, 7.0, -7.0, 0.0, 0.75, -0.75,
         ];
 
-        // The production kernel clamps gate/up values before calling SwiGLU.
+        // The production kernel clamps gate/up values before calling SwiGLU; test that contract exactly.
         let clamped_gates = gates.map(|gate| gate.min(7.0));
         let clamped_ups = ups.map(|up| up.clamp(-7.0, 7.0));
         let expected: Vec<f32> = clamped_gates
