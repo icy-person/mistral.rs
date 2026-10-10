@@ -84,11 +84,18 @@ jobs:
             --max-tokens 64 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
-          echo "===== GPT-OSS MODEL RESPONSE ====="
+          mkdir -p gpt-oss-moe-benchmark
+          cp model.stdout model.stderr gpt-oss-moe-benchmark/
+          echo "===== GPT-OSS MODEL STDOUT ====="
           cat model.stdout
-          echo "===== END GPT-OSS MODEL RESPONSE ====="
+          echo "===== GPT-OSS MODEL STDERR ====="
+          cat model.stderr
+          echo "===== END GPT-OSS MODEL LOGS ====="
+          # Some CLI output paths emit the generated text on stderr while
+          # stats are on stdout. Search both streams, and preserve both files
+          # in the always-uploaded diagnostic artifact if this smoke test fails.
           test -s model.stdout
-          grep -q "323" model.stdout
+          grep -q "323" model.stdout model.stderr
 
       - name: Compare GPT-OSS streaming configurations on the real model
         env:
