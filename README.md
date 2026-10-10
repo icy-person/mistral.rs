@@ -215,6 +215,32 @@ mistralrs bench --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \
   --prompt-len 128 --gen-len 256 --depth 128 --iterations 3 --warmup 1
 ```
 
+For repeatable local comparisons, the repository includes a three-profile script
+(`baseline-buffered`, `tuned-overlap`, and `low-residency`):
+
+```bash
+bash scripts/bench_moe_stream.sh /path/to/gpt-oss-20b-MXFP4.gguf
+```
+
+The script saves the hardware summary and each benchmark log into a timestamped directory. It
+does not assume the tuned profile wins: compare its measured decode tok/s, TTFT/TPOT, memory
+pressure, and MoE telemetry on your actual CPU and SSD before selecting defaults.
+
+For an 8 GiB system, start with a short context and a conservative cache, then raise settings only
+after a successful long-run test. Example interactive invocation:
+
+```bash
+mistralrs run --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \
+  --max-model-len 2048 --moe-stream --cache-mb 512 --cache-ceil-mb 512 \
+  --io-threads 2 --moe-threads physical --moe-overlap \
+  --moe-zero-copy --moe-prefault --moe-release-cold --moe-release-idle 1024 \
+  --moe-stats --realtime-stats
+```
+
+This is a conservative starting point, not a guarantee that GPT-OSS 20B fits or runs smoothly on
+every 8 GiB machine. File-backed mappings, non-expert weights, KV cache, context length, and
+other processes still affect peak resident memory.
+
 For GPT-OSS CPU comparisons, record the exact GGUF checksum, generation length, CPU thread
 count, I/O thread count, cache budget, logical hit rate, physical mmap residency, actual I/O
 milliseconds, peak RAM, and decode tok/s. Compare cold and warm runs separately. A short smoke
