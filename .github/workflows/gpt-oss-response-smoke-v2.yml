@@ -110,15 +110,15 @@ jobs:
               output = Path(path).read_text(errors="replace")
               # The CLI prints reasoning between ANSI gray/reset markers.
               # Exclude reasoning so the expected number must be in final answer text.
-              output = re.sub(r"\x1b\\[90m.*?\x1b\\[0m", "", output, flags=re.S)
-              output = re.sub(r"\x1b\\[[0-?]*[ -/]*[@-~]", "", output)
+              output = re.sub(r"\x1b\[90m.*?\x1b\[0m", "", output, flags=re.S)
+              output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
               return output.split("Stats:", 1)[0].strip()
 
           for path in ("fallback.stdout", "fused.stdout"):
               answer = final_text(path)
               print(f"===== {path} final answer =====")
               print(answer or "<EMPTY>")
-              if not re.search(r"(?<!\\d)323(?!\\d)", answer):
+              if not re.search(r"(?<!\d)323(?!\d)", answer):
                   print(f"ERROR: {path} did not contain the expected visible answer '323'", file=sys.stderr)
                   sys.exit(1)
           PY
