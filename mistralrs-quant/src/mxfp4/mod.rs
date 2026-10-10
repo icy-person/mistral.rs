@@ -298,6 +298,23 @@ impl MxFp4StreamingExpertLayer {
     fn physical_core_count() -> Option<usize> {
         use std::fs;
 
+        // Respect both cpuset/cgroup restrictions and task-level CPU affinity.
+        // Reading /proc/self/status first avoids sizing the pool from every CPU
+        // on the host when this process can only execute on a subset.
+        let allowed_cpu_ids = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                    .and_then(Self::parse_linux_cpu_list)
+            })
+            .or_else(|| {
+                fs::read_to_string("/sys/devices/system/cpu/online")
+                    .ok()
+                    .and_then(|online| Self::parse_linux_cpu_list(&online))
+            });
+
         let mut cores = Vec::new();
         let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
             return None;
@@ -308,6 +325,16 @@ impl MxFp4StreamingExpertLayer {
             if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
+            let Some(cpu_id) = name[3..].parse::<u32>().ok() else {
+                continue;
+            };
+            if allowed_cpu_ids
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&cpu_id))
+            {
+                continue;
+            }
+
             let topology = entry.path().join("topology");
             let Some(core_id) = fs::read_to_string(topology.join("core_id"))
                 .ok()
@@ -326,6 +353,33 @@ impl MxFp4StreamingExpertLayer {
         }
         let count = Self::unique_physical_core_count(cores);
         (count > 0).then_some(count)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn parse_linux_cpu_list(value: &str) -> Option<std::collections::HashSet<u32>> {
+        use std::collections::HashSet;
+
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let mut cpus = HashSet::new();
+        for range in value.split(',') {
+            let mut endpoints = range.trim().split('-');
+            let start = endpoints.next()?.parse::<u32>().ok()?;
+            let end = match endpoints.next() {
+                Some(value) => value.parse::<u32>().ok()?,
+                None => start,
+            };
+            // Reject malformed ranges and pathological input before expanding.
+            if endpoints.next().is_some() || end < start || end.saturating_sub(start) > 1_000_000 {
+                return None;
+            }
+            cpus.extend(start..=end);
+        }
+
+        (!cpus.is_empty()).then_some(cpus)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -3674,11 +3728,27 @@ impl QuantizedSerde for MXFP4Layer {
 mod tests {
     #[cfg(target_os = "linux")]
     #[test]
+    fn parses_cpu_affinity_lists() {
+        let cpus = MxFp4StreamingExpertLayer::parse_linux_cpu_list("0-3,8,10-11")
+            .expect("valid Linux CPU list");
+        assert_eq!(cpus.len(), 7);
+        for cpu in [0, 1, 2, 3, 8, 10, 11] {
+            assert!(cpus.contains(&cpu));
+        }
+
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("4-2").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("1-2-3").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("0-1000002").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn physical_core_count_keeps_package_identity() {
         // SMT siblings share both ids; the same core_id in another package
         // must count as a distinct physical core.
         assert_eq!(
-            MXFP4Layer::unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
+            MxFp4StreamingExpertLayer::unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
             3
         );
     }
