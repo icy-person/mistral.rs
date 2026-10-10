@@ -2075,6 +2075,54 @@ mod tests {
     }
 
     #[test]
+    fn bench_parses_advanced_moe_streaming_controls() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "bench",
+            "-m",
+            "org/model",
+            "--moe-stream",
+            "--cache-mb",
+            "768",
+            "--cache-floor-mb",
+            "1024",
+            "--cache-ceil-mb",
+            "768",
+            "--io-threads",
+            "3",
+            "--moe-overlap=false",
+            "--moe-zero-copy=false",
+            "--moe-prefault=false",
+            "--moe-release-cold",
+            "--moe-release-idle",
+            "1024",
+            "--moe-threads",
+            "physical",
+            "--moe-fused-route-limit",
+            "8",
+            "--moe-stats",
+        ])
+        .unwrap_or_else(|error| panic!("advanced MoE flags must parse in bench: {error}"));
+
+        let Command::Bench { runtime, .. } = cli.command else {
+            panic!("expected bench command");
+        };
+        assert!(runtime.moe_stream);
+        assert_eq!(runtime.moe_cache_mb, "768");
+        assert_eq!(runtime.moe_cache_floor_mb, 1024);
+        assert_eq!(runtime.moe_cache_ceil_mb, Some(768));
+        assert_eq!(runtime.moe_io_threads, 3);
+        assert!(!runtime.moe_overlap);
+        assert!(!runtime.moe_zero_copy);
+        assert!(!runtime.moe_prefault);
+        assert!(runtime.moe_release_cold);
+        assert_eq!(runtime.moe_release_idle, 1024);
+        assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
+        assert_eq!(runtime.moe_fused_route_limit, Some(8));
+        assert!(runtime.moe_stats);
+    }
+
+    #[test]
     fn moe_stream_flag_is_optional_when_omitted() {
         let cli = Cli::try_parse_from([
             "mistralrs",
