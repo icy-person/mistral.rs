@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Synthetic cold-page I/O benchmark for the MoE expert-cache policy.
+"""Synthetic MoE expert I/O benchmark.
 
-This is an SSD-pressure proxy, not a GPT-OSS end-to-end benchmark. It creates a
-small temporary file, simulates a skewed expert-routing stream, and compares
-repeated file reads with a bounded in-RAM LRU. POSIX_FADV_DONTNEED is advisory;
-the report includes logical file reads and Linux process storage-read bytes.
+This is an SSD-I/O proxy, not an end-to-end model benchmark. It compares an
+uncached reader with byte-bounded LRU caches across uniform and skewed routing,
+with OS page-cache retention or best-effort POSIX_FADV_DONTNEED after each miss.
+Linux read_bytes is process-wide; fadvise is advisory and may be ignored.
 """
 from __future__ import annotations
 
@@ -41,29 +41,46 @@ def advise_drop(fd: int, offset: int, length: int) -> bool:
         return False
 
 
-def make_requests(count: int, experts: int, hot_experts: int,
-                  hot_probability: float, seed: int) -> list[int]:
+def make_requests(
+    count: int,
+    experts: int,
+    hot_experts: int,
+    hot_probability: float,
+    seed: int,
+    profile: str = "custom",
+) -> list[int]:
     rng = random.Random(seed)
     result: list[int] = []
     for _ in range(count):
-        if rng.random() < hot_probability:
+        if profile == "uniform":
+            result.append(rng.randrange(experts))
+        elif rng.random() < hot_probability:
             result.append(rng.randrange(hot_experts))
         else:
             result.append(rng.randrange(hot_experts, experts))
     return result
 
 
-def run_case(path: Path, requests: list[int], expert_bytes: int,
-             cache_capacity: int, cache_enabled: bool) -> dict[str, Any]:
+def run_case(
+    path: Path,
+    requests: list[int],
+    expert_bytes: int,
+    cache_capacity: int,
+    drop_pages_after_miss: bool,
+) -> dict[str, Any]:
     fd = os.open(path, os.O_RDONLY)
     cache: OrderedDict[int, bytes] = OrderedDict()
-    hits = misses = file_read_bytes = read_calls = fadvise_calls = 0
-    advise_drop(fd, 0, path.stat().st_size)
+    hits = misses = file_read_bytes = read_calls = 0
+
+    # A fresh best-effort cold start for each scenario. Whether the kernel
+    # actually drops the pages is deliberately measured, not assumed.
+    initial_advice = advise_drop(fd, 0, path.stat().st_size)
+    after_read_advice_calls = 0
     before = process_storage_read_bytes()
     started = time.perf_counter()
     try:
         for expert in requests:
-            data = cache.get(expert) if cache_enabled else None
+            data = cache.get(expert) if cache_capacity > 0 else None
             if data is not None:
                 hits += 1
                 cache.move_to_end(expert)
@@ -77,37 +94,62 @@ def run_case(path: Path, requests: list[int], expert_bytes: int,
             read_calls += 1
             file_read_bytes += len(data)
 
-            # Data has been copied into an owned Python bytes object. Ask the OS
-            # to discard these clean file pages to approximate a cold-page read.
-            if advise_drop(fd, offset, expert_bytes):
-                fadvise_calls += 1
+            if drop_pages_after_miss and advise_drop(fd, offset, expert_bytes):
+                after_read_advice_calls += 1
 
-            if cache_enabled and cache_capacity > 0:
+            if cache_capacity > 0:
                 cache[expert] = data
                 cache.move_to_end(expert)
                 while len(cache) > cache_capacity:
                     cache.popitem(last=False)
     finally:
         os.close(fd)
+
     elapsed = time.perf_counter() - started
     after = process_storage_read_bytes()
     physical = None if before is None or after is None else max(0, after - before)
     return {
-        "mode": "bounded_lru" if cache_enabled else "uncached",
+        "cache_capacity_experts": cache_capacity,
+        "cache_capacity_mib": round(cache_capacity * expert_bytes / (1024 * 1024), 2),
+        "page_policy": "drop_after_miss" if drop_pages_after_miss else "retain_after_start",
         "requests": len(requests),
         "cache_hits": hits,
         "cache_misses": misses,
         "hit_rate_pct": round(100.0 * hits / max(1, len(requests)), 2),
         "file_read_calls": read_calls,
-        "file_read_bytes_requested": file_read_bytes,
-        "process_storage_read_bytes_delta": physical,
+        "file_read_mib_requested": round(file_read_bytes / (1024 * 1024), 2),
+        "process_storage_read_mib_delta": (
+            None if physical is None else round(physical / (1024 * 1024), 2)
+        ),
         "elapsed_seconds": round(elapsed, 4),
         "requests_per_second": round(len(requests) / max(elapsed, 1e-9), 1),
-        "fadvise_dontneed_calls": fadvise_calls,
+        "initial_dontneed_succeeded": initial_advice,
+        "dontneed_after_miss_calls": after_read_advice_calls,
         "fadvise_supported": hasattr(os, "posix_fadvise"),
-        "cache_capacity_experts": cache_capacity if cache_enabled else 0,
-        "cache_bytes": cache_capacity * expert_bytes if cache_enabled else 0,
     }
+
+
+def reduction_pct(baseline: float | int | None, value: float | int | None) -> float | None:
+    if baseline is None or value is None or baseline <= 0:
+        return None
+    return round(100.0 * (baseline - value) / baseline, 2)
+
+
+def print_table(results: list[dict[str, Any]]) -> None:
+    headers = ("PROFILE", "PAGE POLICY", "CACHE", "HIT%", "READ MiB", "STORAGE MiB", "SEC", "REQ/S", "READ↓%")
+    print("\n" + " | ".join(headers))
+    print("-" * 126)
+    for r in results:
+        storage = r["process_storage_read_mib_delta"]
+        storage_text = "n/a" if storage is None else f'{storage:.2f}'
+        reduction = r.get("logical_read_reduction_pct")
+        reduction_text = "—" if reduction is None else f"{reduction:.2f}"
+        print(
+            f'{r["profile"]:<8} | {r["page_policy"]:<17} | {r["cache_capacity_experts"]:>5} | '
+            f'{r["hit_rate_pct"]:>5.1f} | {r["file_read_mib_requested"]:>8.2f} | '
+            f'{storage_text:>11} | {r["elapsed_seconds"]:>6.3f} | '
+            f'{r["requests_per_second"]:>7.1f} | {reduction_text:>6}'
+        )
 
 
 def main() -> int:
@@ -119,6 +161,7 @@ def main() -> int:
     parser.add_argument("--hot-experts", type=int, default=16)
     parser.add_argument("--hot-probability", type=float, default=0.85)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--matrix", action="store_true", help="run routing/cache/page-policy comparison matrix")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -132,10 +175,26 @@ def main() -> int:
         parser.error("cache-experts must be >= 1")
 
     expert_bytes = args.expert_kib * 1024
+    cache_capacities = [0, args.cache_experts]
+    if args.matrix:
+        # Chosen to compare tiny, moderate, large, and full-working-set caches.
+        cache_capacities = sorted(set([0, 8, 16, 32, 64, args.experts]))
+        profiles = [
+            ("uniform", None),
+            ("skew50", 0.50),
+            ("skew85", 0.85),
+            ("skew95", 0.95),
+        ]
+        hot_experts = min(args.hot_experts, args.experts - 1)
+        policies = [False, True]
+    else:
+        profiles = [("custom", args.hot_probability)]
+        hot_experts = args.hot_experts
+        policies = [False, True]
+
     temp_root = os.environ.get("RUNNER_TEMP")
     kwargs = {"dir": temp_root} if temp_root and Path(temp_root).is_dir() else {}
-    requests = make_requests(args.requests, args.experts, args.hot_experts,
-                             args.hot_probability, args.seed)
+    matrix_results: list[dict[str, Any]] = []
 
     with tempfile.TemporaryDirectory(prefix="moe-ssd-bench-", **kwargs) as temp:
         path = Path(temp) / "synthetic-experts.bin"
@@ -148,44 +207,70 @@ def main() -> int:
             out.flush()
             os.fsync(out.fileno())
 
-        uncached = run_case(path, requests, expert_bytes, 0, False)
-        cached = run_case(path, requests, expert_bytes, args.cache_experts, True)
+        for profile_index, (profile, probability) in enumerate(profiles):
+            requests = make_requests(
+                args.requests,
+                args.experts,
+                hot_experts,
+                args.hot_probability if probability is None else probability,
+                args.seed + profile_index,
+                profile="uniform" if profile == "uniform" else "custom",
+            )
+            for drop_after_miss in policies:
+                case_results: list[dict[str, Any]] = []
+                for capacity in cache_capacities:
+                    result = run_case(path, requests, expert_bytes, capacity, drop_after_miss)
+                    result["profile"] = profile
+                    case_results.append(result)
 
-    logical_saved = uncached["file_read_bytes_requested"] - cached["file_read_bytes_requested"]
-    logical_reduction_pct = 100.0 * logical_saved / max(1, uncached["file_read_bytes_requested"])
-    uncached_physical = uncached["process_storage_read_bytes_delta"]
-    cached_physical = cached["process_storage_read_bytes_delta"]
-    physical_reduction_pct = None
-    if uncached_physical is not None and uncached_physical > 0 and cached_physical is not None:
-        physical_reduction_pct = round(
-            100.0 * (uncached_physical - cached_physical) / uncached_physical, 2
-        )
+                baseline = next(r for r in case_results if r["cache_capacity_experts"] == 0)
+                for result in case_results:
+                    result["logical_read_reduction_pct"] = reduction_pct(
+                        baseline["file_read_mib_requested"], result["file_read_mib_requested"]
+                    )
+                    result["storage_read_reduction_pct"] = reduction_pct(
+                        baseline["process_storage_read_mib_delta"],
+                        result["process_storage_read_mib_delta"],
+                    )
+                # LRU stack property: increasing capacity should not reduce hit rate.
+                hits_by_capacity = [
+                    (r["cache_capacity_experts"], r["cache_hits"]) for r in case_results
+                ]
+                if any(hits_by_capacity[i][1] > hits_by_capacity[i + 1][1]
+                       for i in range(len(hits_by_capacity) - 1)):
+                    raise RuntimeError(f"hit rate regressed as cache capacity increased for {profile}")
+                if baseline["cache_hits"] != 0:
+                    raise RuntimeError("uncached baseline unexpectedly reported cache hits")
+                matrix_results.extend(case_results)
 
-    result = {
-        "benchmark": "synthetic_moe_expert_io_pressure",
-        "note": "Not a GPT-OSS end-to-end benchmark. process_storage_read_bytes_delta is process-wide and POSIX_FADV_DONTNEED is advisory.",
+    payload = {
+        "benchmark": "synthetic_moe_expert_io_comparison",
+        "note": (
+            "Proxy benchmark only; not a GPT-OSS end-to-end test. Storage read bytes are "
+            "process-wide. POSIX_FADV_DONTNEED is advisory and the runner's virtualized "
+            "storage/cache behavior may differ from a user's SSD."
+        ),
         "workload": {
             "experts": args.experts,
             "expert_kib": args.expert_kib,
-            "requests": args.requests,
-            "hot_experts": args.hot_experts,
-            "hot_probability": args.hot_probability,
+            "file_mib": round(args.experts * expert_bytes / (1024 * 1024), 2),
+            "requests_per_profile": args.requests,
+            "hot_experts": hot_experts,
+            "cache_capacities_experts": cache_capacities,
+            "profiles": [p[0] for p in profiles],
+            "page_policies": ["retain_after_start", "drop_after_miss"],
             "seed": args.seed,
         },
-        "uncached": uncached,
-        "bounded_lru": cached,
-        "logical_file_read_reduction_pct": round(logical_reduction_pct, 2),
-        "process_storage_read_reduction_pct": physical_reduction_pct,
+        "results": matrix_results,
     }
-    output = json.dumps(result, indent=2, sort_keys=True)
+
+    print_table(matrix_results)
+    output = json.dumps(payload, indent=2, sort_keys=True)
+    print("\nFull comparison JSON:")
     print(output)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(output + "\n")
-    if cached["file_read_bytes_requested"] >= uncached["file_read_bytes_requested"]:
-        raise RuntimeError("bounded LRU did not reduce requested file bytes")
-    if cached["cache_hits"] == 0:
-        raise RuntimeError("synthetic workload produced no cache hits")
     return 0
 
 
