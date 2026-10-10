@@ -718,9 +718,13 @@ pub struct RuntimeOptions {
     #[arg(
         long = "moe-stream",
         visible_alias = "moe_stream",
-        action = clap::ArgAction::SetTrue,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
         default_value_t = false,
-        env = "MISTRALRS_MOE_STREAM"
+        env = "MISTRALRS_MOE_STREAM",
+        value_parser = parse_moe_bool
     )]
     #[serde(default)]
     pub moe_stream: bool,
@@ -739,14 +743,18 @@ pub struct RuntimeOptions {
     #[serde(default = "default_moe_cache_floor_mb")]
     pub moe_cache_floor_mb: usize,
 
-    /// Hard ceiling for an auto-sized expert cache. Omit to disable the ceiling.
+    /// Hard ceiling for an auto-sized expert cache in MiB; use "none" to disable the ceiling.
     #[arg(
         long = "cache-ceil-mb",
         env = "MISTRALRS_MOE_CACHE_CEIL_MB",
-        default_value = "4096"
+        default_value = "4096",
+        value_parser = parse_cache_ceil
     )]
-    #[serde(default)]
-    pub moe_cache_ceil_mb: Option<usize>,
+    #[serde(
+        default = "default_moe_cache_ceil_mb",
+        deserialize_with = "deserialize_cache_ceil"
+    )]
+    pub moe_cache_ceil_mb: String,
 
     /// Number of parallel expert-read lanes.
     #[arg(
@@ -758,19 +766,104 @@ pub struct RuntimeOptions {
     pub moe_io_threads: usize,
 
     /// Queue expert reads ahead of compute so storage I/O overlaps with CPU MoE compute.
-    #[arg(long, env = "MISTRALRS_MOE_OVERLAP")]
+    #[arg(
+        long = "moe-overlap",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_OVERLAP",
+        value_parser = parse_moe_bool
+    )]
     #[serde(default = "default_moe_overlap")]
     pub moe_overlap: bool,
 
     /// Try Linux O_DIRECT for expert reads; falls back to buffered I/O when unsupported.
-    #[arg(long = "o-direct", env = "MISTRALRS_MOE_O_DIRECT")]
+    #[arg(
+        long = "o-direct",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_O_DIRECT",
+        value_parser = parse_moe_bool
+    )]
     #[serde(default)]
     pub moe_o_direct: bool,
 
     /// Emit periodic MoE cache/I/O telemetry to the log.
-    #[arg(long = "moe-stats", env = "MISTRALRS_MOE_STATS")]
+    #[arg(
+        long = "moe-stats",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_STATS",
+        value_parser = parse_moe_bool
+    )]
     #[serde(default)]
     pub moe_stats: bool,
+
+    /// Keep mmap-backed expert weights instead of copying routed weights into heap buffers.
+    #[arg(long = "moe-zero-copy", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_ZERO_COPY", value_parser = parse_moe_bool)]
+    #[serde(default = "default_moe_zero_copy")]
+    pub moe_zero_copy: bool,
+
+    /// Prefault file-backed expert pages on background workers.
+    #[arg(long = "moe-prefault", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_PREFAULT", value_parser = parse_moe_bool)]
+    #[serde(default = "default_moe_prefault")]
+    pub moe_prefault: bool,
+
+    /// Per-tensor heap-cache quota (0 disables the quota).
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    #[serde(default)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold file-backed expert pages via MADV_DONTNEED.
+    #[arg(
+        long = "moe-release-cold",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_RELEASE_COLD",
+        value_parser = parse_moe_bool
+    )]
+    #[serde(default)]
+    pub moe_release_cold: bool,
+
+    /// Number of cache access-clock ticks before a mapped expert is considered cold.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    #[serde(default = "default_moe_release_idle")]
+    pub moe_release_idle: u64,
+
+    /// CPU worker count for the fused GPT-OSS MXFP4 path: a positive integer or "physical".
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", value_parser = parse_moe_threads)]
+    #[serde(default)]
+    pub moe_threads: Option<String>,
+
+    /// Maximum routes for the fused decode kernel; larger batches use the routed GEMM path.
+    #[arg(long = "moe-fused-route-limit", env = "MISTRALRS_MOE_FUSED_ROUTE_LIMIT", value_parser = model::parse_positive_usize)]
+    #[serde(default)]
+    pub moe_fused_route_limit: Option<usize>,
+
+    /// Print live decode throughput to stderr while generating.
+    #[arg(
+        long = "realtime-stats",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_REALTIME_STATS",
+        value_parser = parse_moe_bool
+    )]
+    #[serde(default)]
+    pub realtime_stats: bool,
 
     /// Path to an MCP client configuration JSON. Also reads `MCP_CONFIG_PATH` if unset.
     #[arg(long)]
@@ -928,8 +1021,114 @@ impl AgentCliOptions {
     }
 }
 
-#[derive(clap::Args, Clone, Default)]
+#[derive(clap::Args, Clone)]
 pub struct BenchRuntimeOptions {
+    /// Stream routed MoE expert weights from GGUF instead of materializing the full expert stack.
+    #[arg(
+        long = "moe-stream",
+        visible_alias = "moe_stream",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_STREAM",
+        value_parser = parse_moe_bool
+    )]
+    pub moe_stream: bool,
+
+    /// Expert-cache budget in MiB, or auto to derive it from available memory.
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
+    pub moe_cache_mb: String,
+
+    /// Memory to leave available when auto-sizing the expert cache.
+    #[arg(long = "cache-floor-mb", env = "MISTRALRS_MOE_CACHE_FLOOR_MB", default_value_t = 1536)]
+    pub moe_cache_floor_mb: usize,
+
+    /// Hard ceiling for an auto-sized expert cache in MiB; use "none" to disable the ceiling.
+    #[arg(long = "cache-ceil-mb", env = "MISTRALRS_MOE_CACHE_CEIL_MB", default_value = "4096", value_parser = parse_cache_ceil)]
+    pub moe_cache_ceil_mb: String,
+
+    /// Number of parallel expert-read lanes.
+    #[arg(long = "io-threads", env = "MISTRALRS_MOE_IO_THREADS", default_value_t = 4)]
+    pub moe_io_threads: usize,
+
+    /// Queue expert reads ahead of compute to overlap storage I/O and CPU compute.
+    #[arg(
+        long = "moe-overlap",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_OVERLAP",
+        value_parser = parse_moe_bool
+    )]
+    pub moe_overlap: bool,
+
+    /// Try Linux O_DIRECT for expert reads.
+    #[arg(
+        long = "o-direct",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_O_DIRECT",
+        value_parser = parse_moe_bool
+    )]
+    pub moe_o_direct: bool,
+
+    /// Emit periodic MoE cache/I/O telemetry.
+    #[arg(
+        long = "moe-stats",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_STATS",
+        value_parser = parse_moe_bool
+    )]
+    pub moe_stats: bool,
+
+    /// Keep mmap-backed expert weights rather than copying routed weights into heap buffers.
+    #[arg(long = "moe-zero-copy", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_ZERO_COPY", value_parser = parse_moe_bool)]
+    pub moe_zero_copy: bool,
+
+    /// Prefault file-backed expert pages on background workers.
+    #[arg(long = "moe-prefault", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_PREFAULT", value_parser = parse_moe_bool)]
+    pub moe_prefault: bool,
+
+    /// Per-tensor heap-cache quota (0 disables the quota).
+    #[arg(long = "moe-cache-per-source", env = "MISTRALRS_MOE_CACHE_PER_SOURCE", default_value_t = 0)]
+    pub moe_cache_per_source: usize,
+
+    /// Release cold file-backed expert pages via MADV_DONTNEED.
+    #[arg(
+        long = "moe-release-cold",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        default_value_t = false,
+        env = "MISTRALRS_MOE_RELEASE_COLD",
+        value_parser = parse_moe_bool
+    )]
+    pub moe_release_cold: bool,
+
+    /// Number of cache access-clock ticks before a mapped expert is considered cold.
+    #[arg(long = "moe-release-idle", env = "MISTRALRS_MOE_RELEASE_IDLE", default_value_t = 4096)]
+    pub moe_release_idle: u64,
+
+    /// CPU worker count for the fused GPT-OSS MXFP4 path: a positive integer or "physical".
+    #[arg(long = "moe-threads", env = "MISTRALRS_MOE_THREADS", value_parser = parse_moe_threads)]
+    pub moe_threads: Option<String>,
+
+    /// Maximum routes for the fused decode kernel.
+    #[arg(long = "moe-fused-route-limit", env = "MISTRALRS_MOE_FUSED_ROUTE_LIMIT", value_parser = model::parse_positive_usize)]
+    pub moe_fused_route_limit: Option<usize>,
+
     /// Disable KV cache entirely
     #[arg(long)]
     pub no_kv_cache: bool,
@@ -959,7 +1158,57 @@ pub struct BenchRuntimeOptions {
     pub mtp_draft_sampling: MtpDraftSamplingArg,
 }
 
+impl Default for BenchRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            moe_stream: false,
+            moe_cache_mb: "auto".to_string(),
+            moe_cache_floor_mb: 1536,
+            moe_cache_ceil_mb: "4096".to_string(),
+            moe_io_threads: 4,
+            moe_overlap: false,
+            moe_o_direct: false,
+            moe_stats: false,
+            moe_zero_copy: true,
+            moe_prefault: true,
+            moe_cache_per_source: 0,
+            moe_release_cold: false,
+            moe_release_idle: 4096,
+            moe_threads: None,
+            moe_fused_route_limit: None,
+            no_kv_cache: false,
+            matformer_config_path: None,
+            matformer_slice_name: None,
+            mtp: false,
+            mtp_model: None,
+            mtp_n_predict: None,
+            mtp_draft_sampling: MtpDraftSamplingArg::default(),
+        }
+    }
+}
+
 impl BenchRuntimeOptions {
+    pub fn apply_moe_stream_env(&self) {
+        apply_moe_stream_env(
+            self.moe_stream,
+            &self.moe_cache_mb,
+            self.moe_cache_floor_mb,
+            &self.moe_cache_ceil_mb,
+            self.moe_io_threads,
+            self.moe_overlap,
+            self.moe_o_direct,
+            self.moe_stats,
+            self.moe_zero_copy,
+            self.moe_prefault,
+            self.moe_cache_per_source,
+            self.moe_release_cold,
+            self.moe_release_idle,
+            self.moe_threads.as_deref(),
+            self.moe_fused_route_limit,
+            false,
+        );
+    }
+
     pub fn matformer_selection(&self) -> MatformerSelection {
         MatformerSelection {
             config_path: self.matformer_config_path.clone(),
@@ -1034,20 +1283,24 @@ pub struct MatformerSelection {
 
 impl RuntimeOptions {
     pub fn apply_moe_stream_env(&self) {
-        std::env::set_var("MISTRALRS_MOE_STREAM", if self.moe_stream { "1" } else { "0" });
-        std::env::set_var("MISTRALRS_MOE_CACHE_MB", &self.moe_cache_mb);
-        std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", self.moe_cache_floor_mb.to_string());
-        match self.moe_cache_ceil_mb {
-            Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
-            None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
-        }
-        std::env::set_var(
-            "MISTRALRS_MOE_IO_THREADS",
-            self.moe_io_threads.clamp(1, 32).to_string(),
+        apply_moe_stream_env(
+            self.moe_stream,
+            &self.moe_cache_mb,
+            self.moe_cache_floor_mb,
+            &self.moe_cache_ceil_mb,
+            self.moe_io_threads,
+            self.moe_overlap,
+            self.moe_o_direct,
+            self.moe_stats,
+            self.moe_zero_copy,
+            self.moe_prefault,
+            self.moe_cache_per_source,
+            self.moe_release_cold,
+            self.moe_release_idle,
+            self.moe_threads.as_deref(),
+            self.moe_fused_route_limit,
+            self.realtime_stats,
         );
-        std::env::set_var("MISTRALRS_MOE_OVERLAP", if self.moe_overlap { "1" } else { "0" });
-        std::env::set_var("MISTRALRS_MOE_O_DIRECT", if self.moe_o_direct { "1" } else { "0" });
-        std::env::set_var("MISTRALRS_MOE_STATS", if self.moe_stats { "1" } else { "0" });
     }
 
     pub fn matformer_selection(&self) -> MatformerSelection {
@@ -1142,11 +1395,19 @@ impl Default for RuntimeOptions {
             moe_stream: false,
             moe_cache_mb: "auto".to_string(),
             moe_cache_floor_mb: 1536,
-            moe_cache_ceil_mb: Some(4096),
+            moe_cache_ceil_mb: "4096".to_string(),
             moe_io_threads: 4,
             moe_overlap: false,
             moe_o_direct: false,
             moe_stats: false,
+            moe_zero_copy: true,
+            moe_prefault: true,
+            moe_cache_per_source: 0,
+            moe_release_cold: false,
+            moe_release_idle: 4096,
+            moe_threads: None,
+            moe_fused_route_limit: None,
+            realtime_stats: false,
             mcp_config: None,
             agent: false,
             enable_search: false,
@@ -1189,6 +1450,112 @@ fn default_moe_io_threads() -> usize {
 fn default_moe_overlap() -> bool {
     false
 }
+
+fn apply_moe_stream_env(
+    stream: bool,
+    cache_mb: &str,
+    cache_floor_mb: usize,
+    cache_ceil_mb: &str,
+    io_threads: usize,
+    overlap: bool,
+    o_direct: bool,
+    stats: bool,
+    zero_copy: bool,
+    prefault: bool,
+    cache_per_source: usize,
+    release_cold: bool,
+    release_idle: u64,
+    threads: Option<&str>,
+    fused_route_limit: Option<usize>,
+    realtime_stats: bool,
+) {
+    let set_bool = |name: &str, value: bool| {
+        std::env::set_var(name, if value { "true" } else { "false" });
+    };
+    set_bool("MISTRALRS_MOE_STREAM", stream);
+    std::env::set_var("MISTRALRS_MOE_CACHE_MB", cache_mb);
+    std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", cache_floor_mb.to_string());
+    // The low-level parser understands "none" as an explicit request to
+    // disable the cache ceiling; removing the env var restores the default cap.
+    std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", cache_ceil_mb);
+    std::env::set_var("MISTRALRS_MOE_IO_THREADS", io_threads.clamp(1, 32).to_string());
+    set_bool("MISTRALRS_MOE_OVERLAP", overlap);
+    set_bool("MISTRALRS_MOE_O_DIRECT", o_direct);
+    set_bool("MISTRALRS_MOE_STATS", stats);
+    set_bool("MISTRALRS_MOE_ZERO_COPY", zero_copy);
+    set_bool("MISTRALRS_MOE_PREFAULT", prefault);
+    std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", cache_per_source.min(128).to_string());
+    set_bool("MISTRALRS_MOE_RELEASE_COLD", release_cold);
+    std::env::set_var("MISTRALRS_MOE_RELEASE_IDLE", release_idle.max(256).to_string());
+    match threads {
+        Some(value) if !value.eq_ignore_ascii_case("auto") => std::env::set_var("MISTRALRS_MOE_THREADS", value),
+        _ => std::env::remove_var("MISTRALRS_MOE_THREADS"),
+    }
+    match fused_route_limit {
+        Some(value) => std::env::set_var("MISTRALRS_MOE_FUSED_ROUTE_LIMIT", value.to_string()),
+        None => std::env::remove_var("MISTRALRS_MOE_FUSED_ROUTE_LIMIT"),
+    }
+    set_bool("MISTRALRS_REALTIME_STATS", realtime_stats);
+}
+
+fn parse_cache_ceil(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("unlimited") {
+        return Ok("none".to_string());
+    }
+    value
+        .parse::<usize>()
+        .map(|mb| mb.to_string())
+        .map_err(|error| format!("invalid cache ceiling {value:?}: {error}"))
+}
+
+fn default_moe_cache_ceil_mb() -> String {
+    "4096".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CacheCeilingValue {
+    Mib(usize),
+    Text(String),
+}
+
+fn deserialize_cache_ceil<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<CacheCeilingValue>::deserialize(deserializer)?;
+    match value {
+        None => Ok("none".to_string()),
+        Some(CacheCeilingValue::Mib(mib)) => Ok(mib.to_string()),
+        Some(CacheCeilingValue::Text(text)) => {
+            parse_cache_ceil(&text).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn parse_moe_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("invalid boolean value {value:?}; expected true/false")),
+    }
+}
+
+fn parse_moe_threads(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("physical") {
+        return Ok(value.to_ascii_lowercase());
+    }
+    match value.parse::<usize>() {
+        Ok(threads) if threads > 0 => Ok(threads.to_string()),
+        _ => Err(format!("invalid MoE worker count {value:?}; expected auto, physical, or a positive integer")),
+    }
+}
+
+fn default_moe_zero_copy() -> bool { true }
+fn default_moe_prefault() -> bool { true }
+fn default_moe_release_idle() -> u64 { 4096 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
     s.parse()
@@ -1721,6 +2088,99 @@ mod tests {
         assert!(runtime.moe_stream);
         assert_eq!(runtime.moe_cache_mb, "1536");
         assert_eq!(runtime.moe_io_threads, 4);
+        assert!(runtime.moe_stats);
+    }
+
+    #[test]
+    fn moe_boolean_controls_accept_explicit_false_values() {
+        let cli = Cli::try_parse_from([
+            "mistralrs", "run", "-m", "org/model",
+            "--moe-stream", "--moe-overlap=false",
+            "--moe-zero-copy=false", "--moe-prefault=false",
+            "--moe-release-cold=false", "--realtime-stats=true",
+            "--moe-threads", "physical", "--moe-fused-route-limit", "8",
+        ]).unwrap();
+        let Command::Run { runtime, .. } = cli.command else {
+            panic!("expected run command");
+        };
+        assert!(runtime.moe_stream);
+        assert!(!runtime.moe_overlap);
+        assert!(!runtime.moe_zero_copy);
+        assert!(!runtime.moe_prefault);
+        assert!(!runtime.moe_release_cold);
+        assert!(runtime.realtime_stats);
+        assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
+        assert_eq!(runtime.moe_fused_route_limit, Some(8));
+    }
+
+    #[test]
+    fn cache_ceiling_config_preserves_numeric_values_and_accepts_none() {
+        #[derive(Deserialize)]
+        struct TestConfig {
+            #[serde(
+                default = "default_moe_cache_ceil_mb",
+                deserialize_with = "deserialize_cache_ceil"
+            )]
+            cache: String,
+        }
+
+        let numeric: TestConfig = serde_json::from_value(serde_json::json!({"cache": 768})).unwrap();
+        assert_eq!(numeric.cache, "768");
+        let string: TestConfig =
+            serde_json::from_value(serde_json::json!({"cache": "1024"})).unwrap();
+        assert_eq!(string.cache, "1024");
+        let none: TestConfig = serde_json::from_value(serde_json::json!({"cache": null})).unwrap();
+        assert_eq!(none.cache, "none");
+        let missing: TestConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(missing.cache, "4096");
+        assert!(parse_cache_ceil("invalid").is_err());
+    }
+
+    #[test]
+    fn bench_parses_advanced_moe_streaming_controls() {
+        let cli = Cli::try_parse_from([
+            "mistralrs",
+            "bench",
+            "-m",
+            "org/model",
+            "--moe-stream",
+            "--cache-mb",
+            "768",
+            "--cache-floor-mb",
+            "1024",
+            "--cache-ceil-mb",
+            "768",
+            "--io-threads",
+            "3",
+            "--moe-overlap=false",
+            "--moe-zero-copy=false",
+            "--moe-prefault=false",
+            "--moe-release-cold",
+            "--moe-release-idle",
+            "1024",
+            "--moe-threads",
+            "physical",
+            "--moe-fused-route-limit",
+            "8",
+            "--moe-stats",
+        ])
+        .unwrap_or_else(|error| panic!("advanced MoE flags must parse in bench: {error}"));
+
+        let Command::Bench { runtime, .. } = cli.command else {
+            panic!("expected bench command");
+        };
+        assert!(runtime.moe_stream);
+        assert_eq!(runtime.moe_cache_mb, "768");
+        assert_eq!(runtime.moe_cache_floor_mb, 1024);
+        assert_eq!(runtime.moe_cache_ceil_mb, "768");
+        assert_eq!(runtime.moe_io_threads, 3);
+        assert!(!runtime.moe_overlap);
+        assert!(!runtime.moe_zero_copy);
+        assert!(!runtime.moe_prefault);
+        assert!(runtime.moe_release_cold);
+        assert_eq!(runtime.moe_release_idle, 1024);
+        assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
+        assert_eq!(runtime.moe_fused_route_limit, Some(8));
         assert!(runtime.moe_stats);
     }
 

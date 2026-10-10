@@ -168,9 +168,15 @@ mistralrs run --cpu -f /path/to/model.gguf \
   --moe-stats
 ```
 
-The cache is sized once at model initialization for `--cache-mb auto`; `--cache-floor-mb` reserves
-memory for the rest of the process/system and `--cache-ceil-mb` caps the resulting budget. The
-streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
+The cache is sized once at model initialization for `--cache-mb auto`. On Linux, the
+available-memory estimate uses the lower of `/proc/meminfo`'s `MemAvailable` value and any
+discoverable cgroup v1/v2 memory remaining, so container and systemd memory limits are respected.
+`--cache-floor-mb` reserves memory for the rest of the process/system and `--cache-ceil-mb` caps
+the resulting budget. This is a startup snapshot, not a dynamic guarantee: non-expert weights,
+resident mapped expert pages, KV cache, and other processes can still consume RAM. On constrained
+systems, set an explicit cache ceiling and start with a modest context length.
+
+The streamer is disabled for distributed ranks, non-GGUF sources, ISQ materialization, accelerator-
 resident expert layers, and dynamic LoRA, where resident backends remain authoritative.
 
 For RAM-constrained Linux systems, `--moe-zero-copy` keeps routed MXFP4 experts file-backed,
@@ -189,17 +195,56 @@ expert access can fault the bytes back from GGUF storage.
 
 The CLI uses the same `run`, `serve`, and `bench` commands for model repositories, local directories, and GGUF files.
 
-For MoE performance work, `mistralrs bench` defaults to 256 generated tokens so decode
-measurements are long enough to expose cache churn and storage stalls. Use the same
-`--moe-stream`, `--cache-mb`, `--io-threads`, `--moe-threads`, `--moe-overlap`,
-`--moe-zero-copy`, and `--moe-prefault` controls for repeatable comparisons. Boolean controls
-accept explicit values, so `--moe-zero-copy false` and `--moe-prefault false` provide clean
-baseline runs without changing the benchmark command structure.
+For MoE performance work, pass an explicit `--gen-len 256` (the CLI default is shorter)
+so decode measurements are long enough to expose cache churn and storage stalls. The `bench`
+subcommand accepts the same MoE controls as `run` and `serve`, including `--moe-stream`,
+`--cache-mb`, `--cache-floor-mb`, `--cache-ceil-mb`, `--io-threads`, `--moe-threads`,
+`--moe-overlap`, `--moe-zero-copy`, `--moe-prefault`, `--moe-cache-per-source`,
+`--moe-release-cold`, `--moe-release-idle`, `--moe-fused-route-limit`, and `--moe-stats`.
+Boolean controls accept explicit values with equals syntax: `--moe-zero-copy=false` and
+`--moe-prefault=false` provide clean baseline runs without changing the benchmark command.
 
-For GPT-OSS CPU comparisons, record at least generation length, compute threads, I/O threads,
-cache budget, logical hit rate, physical mmap residency, actual I/O milliseconds, and decode
-tok/s. A 40-token result is useful for smoke testing but should not be treated as a steady-state
-cache benchmark.
+Example for a local GPT-OSS MXFP4 GGUF on a RAM-constrained CPU system (adjust the 768 MiB
+cache to your available memory):
+
+```bash
+mistralrs bench --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \
+  --moe-stream --cache-mb 768 --cache-floor-mb 1024 --cache-ceil-mb 768 \
+  --io-threads 4 --moe-threads physical --moe-overlap \
+  --moe-zero-copy --moe-prefault --moe-stats \
+  --prompt-len 128 --gen-len 256 --depth 128 --iterations 3 --warmup 1
+```
+
+For repeatable local comparisons, the repository includes a three-profile script
+(`baseline-buffered`, `tuned-overlap`, and `low-residency`):
+
+```bash
+bash scripts/bench_moe_stream.sh /path/to/gpt-oss-20b-MXFP4.gguf
+```
+
+The script saves the hardware summary and each benchmark log into a timestamped directory. It
+does not assume the tuned profile wins: compare its measured decode tok/s, TTFT/TPOT, memory
+pressure, and MoE telemetry on your actual CPU and SSD before selecting defaults.
+
+For an 8 GiB system, start with a short context and a conservative cache, then raise settings only
+after a successful long-run test. Example interactive invocation:
+
+```bash
+mistralrs run --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \
+  --max-model-len 2048 --moe-stream --cache-mb 512 --cache-ceil-mb 512 \
+  --io-threads 2 --moe-threads physical --moe-overlap \
+  --moe-zero-copy --moe-prefault --moe-release-cold --moe-release-idle 1024 \
+  --moe-stats --realtime-stats
+```
+
+This is a conservative starting point, not a guarantee that GPT-OSS 20B fits or runs smoothly on
+every 8 GiB machine. File-backed mappings, non-expert weights, KV cache, context length, and
+other processes still affect peak resident memory.
+
+For GPT-OSS CPU comparisons, record the exact GGUF checksum, generation length, CPU thread
+count, I/O thread count, cache budget, logical hit rate, physical mmap residency, actual I/O
+milliseconds, peak RAM, and decode tok/s. Compare cold and warm runs separately. A short smoke
+test establishes that inference works; it is not a steady-state performance benchmark.
 
 - **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
 - **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)

@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex,
     },
     thread,
@@ -17,7 +17,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
+use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
@@ -140,18 +140,164 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn available_memory_bytes() -> usize {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
-            if let Some(kib) = text
-                .lines()
-                .find_map(|line| line.strip_prefix("MemAvailable:"))
-                .and_then(|v| v.split_whitespace().next())
-                .and_then(|v| v.parse::<usize>().ok())
-            {
-                return kib.saturating_mul(1024);
-            }
+        let host_available = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| parse_mem_available_bytes(&text));
+        let cgroup_available = cgroup_available_memory_bytes();
+
+        // In containers, host MemAvailable can be far larger than the memory
+        // limit imposed on this process. The more restrictive amount is the
+        // useful estimate for sizing an in-memory expert cache.
+        min_available_memory_bytes(host_available, cgroup_available)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+fn parse_mem_available_bytes(meminfo: &str) -> Option<usize> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|kib| kib.parse::<usize>().ok())
+        .map(|kib| kib.saturating_mul(1024))
+}
+
+fn min_available_memory_bytes(
+    host_available: Option<usize>,
+    cgroup_available: Option<usize>,
+) -> usize {
+    match (host_available, cgroup_available) {
+        (Some(host), Some(cgroup)) => host.min(cgroup),
+        (Some(host), None) => host,
+        (None, Some(cgroup)) => cgroup,
+        (None, None) => 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum CgroupMemoryVersion {
+    V1,
+    V2,
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_available_memory_bytes() -> Option<usize> {
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let mut available = None;
+
+    for line in cgroups.lines() {
+        let mut fields = line.splitn(3, ':');
+        let Some(_hierarchy) = fields.next() else {
+            continue;
+        };
+        let Some(controllers) = fields.next() else {
+            continue;
+        };
+        let Some(group_path) = fields.next() else {
+            continue;
+        };
+
+        let candidate = if controllers.is_empty() {
+            cgroup_path_available_bytes(
+                Path::new("/sys/fs/cgroup"),
+                group_path,
+                "memory.max",
+                "memory.current",
+                CgroupMemoryVersion::V2,
+            )
+        } else if controllers.split(',').any(|name| name == "memory") {
+            cgroup_path_available_bytes(
+                Path::new("/sys/fs/cgroup/memory"),
+                group_path,
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+                CgroupMemoryVersion::V1,
+            )
+        } else {
+            None
+        };
+
+        if let Some(candidate) = candidate {
+            available = Some(
+                available.map_or(candidate, |current: usize| current.min(candidate)),
+            );
         }
     }
-    0
+
+    available
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_path_available_bytes(
+    mount: &Path,
+    group_path: &str,
+    limit_file: &str,
+    usage_file: &str,
+    version: CgroupMemoryVersion,
+) -> Option<usize> {
+    let mut current = mount.to_path_buf();
+    for component in group_path.trim_start_matches('/').split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        // Do not allow a malformed cgroup path to escape the known mount.
+        if component == "." || component == ".." {
+            return None;
+        }
+        current.push(component);
+    }
+
+    let mut available = None;
+    loop {
+        if let (Ok(limit), Ok(usage)) = (
+            std::fs::read_to_string(current.join(limit_file)),
+            std::fs::read_to_string(current.join(usage_file)),
+        ) {
+            let remaining = match version {
+                CgroupMemoryVersion::V1 => parse_cgroup_v1_remaining_bytes(&limit, &usage),
+                CgroupMemoryVersion::V2 => parse_cgroup_v2_remaining_bytes(&limit, &usage),
+            };
+            if let Some(remaining) = remaining {
+                available = Some(
+                    available.map_or(remaining, |current: usize| current.min(remaining)),
+                );
+            }
+        }
+
+        if current == mount || !current.pop() {
+            break;
+        }
+    }
+
+    available
+}
+
+fn parse_cgroup_v2_remaining_bytes(limit: &str, usage: &str) -> Option<usize> {
+    let limit = limit.trim();
+    if limit == "max" {
+        return None;
+    }
+
+    let limit = limit.parse::<usize>().ok()?;
+    let usage = usage.trim().parse::<usize>().ok()?;
+    Some(limit.saturating_sub(usage))
+}
+
+fn parse_cgroup_v1_remaining_bytes(limit: &str, usage: &str) -> Option<usize> {
+    let limit = limit.trim().parse::<u64>().ok()?;
+    // cgroup v1 represents an unlimited memory limit with a very large
+    // sentinel value (commonly just below i64::MAX).
+    if limit >= (1_u64 << 60) {
+        return None;
+    }
+
+    let usage = usage.trim().parse::<u64>().ok()?;
+    usize::try_from(limit.saturating_sub(usage)).ok()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -304,9 +450,9 @@ struct CacheInner {
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
-    queues: Vec<SyncSender<ReadJob>>,
+    queues: Vec<Sender<ReadJob>>,
     next_queue: AtomicUsize,
-    prefault_queues: Vec<SyncSender<PrefaultJob>>,
+    prefault_queues: Vec<Sender<PrefaultJob>>,
     next_prefault_queue: AtomicUsize,
     paths: Vec<PathBuf>,
     archive: Arc<crate::GgufArchive>,
@@ -325,7 +471,10 @@ impl MxFp4StreamCache {
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
 
-        let queue_size = 8usize;
+        // These queues carry only per-expert job descriptors and one-shot reply
+        // senders. Avoid blocking while scheduling a full routed-expert batch:
+        // backpressure here can make prefetch wait for page faults or disk reads
+        // to finish before the CPU has a chance to overlap them with compute.
         let mut queues = Vec::new();
         let mut prefault_queues = Vec::new();
         let stats = Arc::new(Stats::default());
@@ -334,7 +483,7 @@ impl MxFp4StreamCache {
             let worker_count = config.io_threads.min(2).max(1);
             prefault_queues.reserve(worker_count);
             for worker_id in 0..worker_count {
-                let (queue_tx, queue_rx) = mpsc::sync_channel::<PrefaultJob>(queue_size);
+                let (queue_tx, queue_rx) = mpsc::channel::<PrefaultJob>();
                 prefault_queues.push(queue_tx);
                 let worker_stats = stats.clone();
                 thread::Builder::new()
@@ -363,7 +512,7 @@ impl MxFp4StreamCache {
         if !config.zero_copy || config.o_direct {
             queues.reserve(config.io_threads);
             for worker_id in 0..config.io_threads {
-                let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
+                let (queue_tx, queue_rx) = mpsc::channel::<ReadJob>();
                 queues.push(queue_tx);
 
                 let worker_paths = paths.clone();
@@ -583,7 +732,10 @@ impl MxFp4StreamCache {
             return Ok(None);
         }
 
-        let (reply, rx) = mpsc::sync_channel(1);
+        // A rendezvous reply channel prevents prefault workers from touching
+        // an unbounded number of mmap pages ahead of the consumer. The worker
+        // can advance as soon as resolve() takes the current result.
+        let (reply, rx) = mpsc::sync_channel(0);
         let worker = self
             .next_prefault_queue
             .fetch_add(1, Ordering::Relaxed)
@@ -618,7 +770,10 @@ impl MxFp4StreamCache {
             ));
         }
 
-        let (tx, rx) = mpsc::sync_channel(1);
+        // Bound live read buffers by the number of I/O workers. With capacity
+        // zero, a worker cannot read and retain every queued expert result while
+        // the caller is still scheduling a layer's prefetch batch.
+        let (tx, rx) = mpsc::sync_channel(0);
         let worker = self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len();
 
         self.queues[worker]
@@ -1080,6 +1235,89 @@ mod tests {
         assert_eq!(parse_cache_mb("auto"), None);
         assert_eq!(parse_cache_mb("1536"), Some(1536));
         assert_eq!(parse_cache_mb("bogus"), None);
+    }
+
+    #[test]
+    fn parses_mem_available_from_proc_meminfo() {
+        let meminfo = "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n";
+        assert_eq!(
+            parse_mem_available_bytes(meminfo),
+            Some(4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_mem_available_bytes("MemTotal: 1024 kB\n"), None);
+    }
+
+    #[test]
+    fn cgroup_v2_budget_uses_remaining_memory() {
+        assert_eq!(
+            parse_cgroup_v2_remaining_bytes("8589934592\n", "6442450944\n"),
+            Some(2 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_cgroup_v2_remaining_bytes("max\n", "1024\n"), None);
+        assert_eq!(
+            parse_cgroup_v2_remaining_bytes("1024\n", "2048\n"),
+            Some(0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_budget_uses_tighter_ancestor_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "mistralrs-cgroup-budget-{}",
+            std::process::id()
+        ));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        std::fs::write(root.join("memory.max"), "1024\n").unwrap();
+        std::fs::write(root.join("memory.current"), "800\n").unwrap();
+        std::fs::write(child.join("memory.max"), "2048\n").unwrap();
+        std::fs::write(child.join("memory.current"), "1024\n").unwrap();
+
+        assert_eq!(
+            cgroup_path_available_bytes(
+                &root,
+                "/child",
+                "memory.max",
+                "memory.current",
+                CgroupMemoryVersion::V2,
+            ),
+            Some(224)
+        );
+        assert!(cgroup_path_available_bytes(
+            &root,
+            "../child",
+            "memory.max",
+            "memory.current",
+            CgroupMemoryVersion::V2,
+        )
+        .is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cgroup_v1_unlimited_sentinel_is_ignored() {
+        assert_eq!(
+            parse_cgroup_v1_remaining_bytes("9223372036854771712\n", "1024\n"),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_v1_remaining_bytes("4096\n", "1024\n"),
+            Some(3072)
+        );
+    }
+
+    #[test]
+    fn automatic_memory_estimate_respects_the_tighter_limit() {
+        assert_eq!(
+            min_available_memory_bytes(Some(12 * MIB), Some(2 * MIB)),
+            2 * MIB
+        );
+        assert_eq!(min_available_memory_bytes(Some(12 * MIB), None), 12 * MIB);
+        assert_eq!(min_available_memory_bytes(None, Some(2 * MIB)), 2 * MIB);
+        assert_eq!(min_available_memory_bytes(None, None), 0);
     }
 
     #[test]
