@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - linux-cli-only
+      - perf/gpt-oss-ssd-cache-ci
   pull_request:
     branches:
       - master
