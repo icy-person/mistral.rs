@@ -70,13 +70,15 @@ jobs:
           # Separate the buffered streaming path from zero-copy promotion.
           MISTRALRS_MOE_ZERO_COPY: "false"
           MISTRALRS_MOE_OVERLAP: "false"
-          # Keep whole-MLP fusion out of the smoke test; the bench profiles cover it separately.
+          # First isolate the generic streamed MoE route from whole-MLP fusion.
+          # Route limit 1 forces the 4-route decode step through the reference path.
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "1"
         run: |
+          set -o pipefail
           curl --fail --location --retry 5 --retry-all-errors \
             --output gpt-oss-20b-MXFP4.gguf \
             "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf"
-          ./target/release/mistralrs run \
+          if ./target/release/mistralrs run \
             --cpu \
             -f "$PWD/gpt-oss-20b-MXFP4.gguf" \
             --moe-stream \
@@ -87,16 +89,20 @@ jobs:
             --reasoning-effort low \
             --max-tokens 2048 \
             -i "Reply with exactly this number and nothing else: 323" \
-            2>model.stderr | tee model.stdout
-          mkdir -p gpt-oss-moe-benchmark
-          cp model.stdout model.stderr gpt-oss-moe-benchmark/
-          echo "===== GPT-OSS MODEL STDOUT ====="
+            2>model.stderr | tee model.stdout; then
+            run_status=0
+          else
+            run_status=$?
+          fi
+          echo "===== GPT-OSS MODEL STDERR (last 200 lines) ====="
+          tail -n 200 model.stderr >&2
+          echo "===== END GPT-OSS MODEL STDERR ====="
+          echo "===== GPT-OSS MODEL RESPONSE ====="
           cat model.stdout
-          echo "===== GPT-OSS MODEL STDERR ====="
-          cat model.stderr
-          echo "===== END GPT-OSS MODEL LOGS ====="
-          # The generated text should be distinct from the telemetry summary.
-          # Keep this check model-agnostic instead of matching a literal answer.
+          echo "===== END GPT-OSS MODEL RESPONSE ====="
+          if [[ "$run_status" -ne 0 ]]; then
+            exit "$run_status"
+          fi
           test -s model.stdout
           grep -Eiv '^(Stats:|Prompt:|Decode:|Prefix cache:|Sampling:|[[:space:]]*$)' model.stdout | grep -q .
           grep -q '323' model.stdout
