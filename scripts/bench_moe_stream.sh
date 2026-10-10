@@ -88,7 +88,13 @@ run_case() {
   echo
   echo "===== $name ====="
   echo "Log: $OUT_DIR/$name.log"
-  "$BIN" "${common[@]}" "$@" 2>&1 | tee "$OUT_DIR/$name.log"
+  echo "Resource report: $OUT_DIR/$name.resources.txt"
+  # GNU time records peak RSS, major page faults, filesystem input blocks and
+  # elapsed time for each fresh model process. The detailed runner log remains
+  # in the artifact so cold/warm behavior and MoE telemetry can be compared.
+  /usr/bin/time -v -o "$OUT_DIR/$name.resources.txt" \
+    "$BIN" "${common[@]}" "$@" 2>&1 | tee "$OUT_DIR/$name.log"
+  cat "$OUT_DIR/$name.resources.txt" >> "$OUT_DIR/$name.log"
 }
 
 run_case baseline-buffered \
