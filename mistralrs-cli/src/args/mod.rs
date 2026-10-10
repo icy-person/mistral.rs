@@ -1031,7 +1031,6 @@ pub struct BenchRuntimeOptions {
         env = "MISTRALRS_MOE_STREAM",
         value_parser = parse_moe_bool
     )]
-    #[serde(default)]
     pub moe_stream: bool,
 
     /// Expert-cache budget in MiB, or auto to derive it from available memory.
@@ -1061,7 +1060,6 @@ pub struct BenchRuntimeOptions {
         env = "MISTRALRS_MOE_OVERLAP",
         value_parser = parse_moe_bool
     )]
-    #[serde(default)]
     pub moe_overlap: bool,
 
     /// Try Linux O_DIRECT for expert reads.
@@ -1075,7 +1073,6 @@ pub struct BenchRuntimeOptions {
         env = "MISTRALRS_MOE_O_DIRECT",
         value_parser = parse_moe_bool
     )]
-    #[serde(default)]
     pub moe_o_direct: bool,
 
     /// Emit periodic MoE cache/I/O telemetry.
@@ -1089,7 +1086,6 @@ pub struct BenchRuntimeOptions {
         env = "MISTRALRS_MOE_STATS",
         value_parser = parse_moe_bool
     )]
-    #[serde(default)]
     pub moe_stats: bool,
 
     /// Keep mmap-backed expert weights rather than copying routed weights into heap buffers.
@@ -1115,7 +1111,6 @@ pub struct BenchRuntimeOptions {
         env = "MISTRALRS_MOE_RELEASE_COLD",
         value_parser = parse_moe_bool
     )]
-    #[serde(default)]
     pub moe_release_cold: bool,
 
     /// Number of cache access-clock ticks before a mapped expert is considered cold.
