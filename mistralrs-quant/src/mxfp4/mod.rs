@@ -328,6 +328,7 @@ impl MxFp4StreamingExpertLayer {
         (count > 0).then_some(count)
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn unique_physical_core_count(ids: impl IntoIterator<Item = (u32, u32)>) -> usize {
         use std::collections::HashSet;
         ids.into_iter().collect::<HashSet<_>>().len()
@@ -3671,6 +3672,7 @@ impl QuantizedSerde for MXFP4Layer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     #[test]
     fn physical_core_count_keeps_package_identity() {
         // SMT siblings share both ids; the same core_id in another package
