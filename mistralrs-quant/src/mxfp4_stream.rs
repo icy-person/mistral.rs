@@ -471,6 +471,10 @@ impl MxFp4StreamCache {
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
 
+        // These queues carry only per-expert job descriptors and one-shot reply
+        // senders. Avoid blocking while scheduling a full routed-expert batch:
+        // backpressure here can make prefetch wait for page faults or disk reads
+        // to finish before the CPU has a chance to overlap them with compute.
         let mut queues = Vec::new();
         let mut prefault_queues = Vec::new();
         let stats = Arc::new(Stats::default());
