@@ -13,17 +13,23 @@ use tracing::{trace, warn};
 use crate::{tools::ToolCallFormat, MessageContent, ModelGenerationDefaults, Tool};
 
 const SUPPORTED_ALTERNATE_EOS: &[&str] = &[
-    "<|im_end|>",      // Handle ChatML case
-    "<end_of_turn>",   // Handle Gemma2 chat case
-    "<|end_of_text|>", // Hermes
-    "<|end|>",         // Phi-3, Phi-3.5, Harmony
+    "<|im_end|>",      // ChatML
+    "<end_of_turn>",   // Gemma
+    "<|end_of_text|>", // End of text
+    "<|end|>",         // Phi-3 / Phi-3.5 (not a Harmony turn terminator)
     "<|eot_id|>",      // Llama 3
 ];
 
-const HARMONY_ALTERNATE_EOS: &[&str] = &[
-    "<|message|>", // Harmony
-    "<|start|>",   // Harmony
-    "<|channel|>", // Harmony
+// In Harmony, these mark the end of an assistant turn, unlike <|end|> which
+// only ends a message and may be followed by another assistant message.
+const HARMONY_ALTERNATE_EOS: &[&str] = &["<|return|>", "<|fim_suffix|>"];
+
+const HARMONY_NON_TERMINAL_MARKERS: &[&str] = &[
+    "<|im_end|>",
+    "<|end|>",
+    "<|message|>",
+    "<|start|>",
+    "<|channel|>",
 ];
 
 #[allow(dead_code)]
@@ -172,32 +178,38 @@ impl ChatTemplate {
     }
 }
 
+fn is_non_terminal_harmony_marker(token: &str) -> bool {
+    HARMONY_NON_TERMINAL_MARKERS.contains(&token)
+}
+
 pub fn calculate_eos_tokens(
     chat_template: &ChatTemplate,
     gen_conf: Option<&GenerationConfig>,
     tokenizer: &Tokenizer,
 ) -> Vec<u32> {
-    let mut eos_tok_ids = chat_template.eos_tok().map(|x| vec![x]).unwrap_or_default();
+    let is_harmony = chat_template.is_harmony_format();
+    let mut eos_tok_ids = chat_template
+        .eos_tok()
+        .filter(|token| !(is_harmony && is_non_terminal_harmony_marker(token)))
+        .map(|x| vec![x])
+        .unwrap_or_default();
     let mut bos_tok_ids = chat_template.bos_tok().map(|b| vec![b]).unwrap_or_default();
 
     let templates = chat_template.get_template_contents();
+    let alternate_eos = if is_harmony {
+        HARMONY_ALTERNATE_EOS
+    } else {
+        SUPPORTED_ALTERNATE_EOS
+    };
 
-    for alternate in SUPPORTED_ALTERNATE_EOS {
+    for alternate in alternate_eos {
+        let template_uses_token = templates.iter().any(|t| t.contains(*alternate));
+        // Harmony has explicit turn-ending tokens. They remain valid EOS tokens
+        // even when the Jinja template references them indirectly via eos_token.
         if tokenizer.get_vocab(true).contains_key(*alternate)
-            && templates.iter().any(|t| t.contains(*alternate))
+            && (is_harmony || template_uses_token)
         {
-            eos_tok_ids.push(alternate.to_string())
-        }
-    }
-    if chat_template.is_harmony_format() {
-        for alternate in HARMONY_ALTERNATE_EOS {
-            if tokenizer.get_vocab(true).contains_key(*alternate)
-                && templates
-                    .iter()
-                    .any(|template| template.contains(*alternate))
-            {
-                eos_tok_ids.push(alternate.to_string());
-            }
+            eos_tok_ids.push(alternate.to_string());
         }
     }
 
@@ -212,6 +224,12 @@ pub fn calculate_eos_tokens(
                     warn!("Ignoring generation config EOS token id {id}: not in the tokenizer vocabulary");
                     continue;
                 };
+                // Some GPT-OSS/GGUF metadata declares the message-ending token as
+                // EOS. For Harmony, a message can end while the assistant turn is
+                // still continuing (analysis -> final), so never stop on it.
+                if is_harmony && is_non_terminal_harmony_marker(&s) {
+                    continue;
+                }
                 if !eos_tok_ids.contains(&s) {
                     eos_tok_ids.push(s);
                 }
@@ -1023,6 +1041,51 @@ mod tests {
 
         for (template, expected) in cases {
             assert_eq!(template_tool_call_format(template), Some(expected));
+        }
+    }
+
+    #[test]
+    fn harmony_message_markers_do_not_stop_generation() {
+        use ahash::AHashMap;
+        use tokenizers::models::wordlevel::WordLevel;
+
+        let vocab = [
+            ("<unk>".to_string(), 0),
+            ("<|end|>".to_string(), 1),
+            ("<|channel|>".to_string(), 2),
+            ("<|start|>".to_string(), 3),
+            ("<|message|>".to_string(), 4),
+            ("<|return|>".to_string(), 5),
+            ("<|fim_suffix|>".to_string(), 6),
+        ]
+        .into_iter()
+        .collect::<AHashMap<_, _>>();
+        let tokenizer = Tokenizer::new(
+            WordLevel::builder()
+                .vocab(vocab)
+                .unk_token("<unk>".to_string())
+                .build()
+                .unwrap(),
+        );
+        // Deliberately model metadata that incorrectly labels <|end|> as EOS.
+        let template: ChatTemplate = serde_json::from_value(serde_json::json!({
+            "eos_token": "<|end|>",
+            "chat_template": "<|start|>assistant<|channel|>analysis<|message|>hello<|end|>"
+        }))
+        .unwrap();
+        let gen_conf: GenerationConfig = serde_json::from_value(serde_json::json!({
+            "eos_token_id": [1, 2, 3, 4]
+        }))
+        .unwrap();
+
+        let eos = calculate_eos_tokens(&template, Some(&gen_conf), &tokenizer);
+        assert!(eos.contains(&5), "Harmony turn terminator <|return|> must be accepted");
+        assert!(eos.contains(&6), "Harmony turn terminator <|fim_suffix|> must be accepted");
+        for non_terminal in [1, 2, 3, 4] {
+            assert!(
+                !eos.contains(&non_terminal),
+                "Harmony message/control token id {non_terminal} must not stop generation"
+            );
         }
     }
 

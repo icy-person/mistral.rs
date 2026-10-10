@@ -306,6 +306,23 @@ impl MxFp4StreamingExpertLayer {
     fn physical_core_count() -> Option<usize> {
         use std::fs;
 
+        // Respect both cpuset/cgroup restrictions and task-level CPU affinity.
+        // Reading /proc/self/status first avoids sizing the pool from every CPU
+        // on the host when this process can only execute on a subset.
+        let allowed_cpu_ids = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                    .and_then(Self::parse_linux_cpu_list)
+            })
+            .or_else(|| {
+                fs::read_to_string("/sys/devices/system/cpu/online")
+                    .ok()
+                    .and_then(|online| Self::parse_linux_cpu_list(&online))
+            });
+
         let mut cores = Vec::new();
         let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
             return None;
@@ -316,6 +333,16 @@ impl MxFp4StreamingExpertLayer {
             if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
+            let Some(cpu_id) = name[3..].parse::<u32>().ok() else {
+                continue;
+            };
+            if allowed_cpu_ids
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&cpu_id))
+            {
+                continue;
+            }
+
             let topology = entry.path().join("topology");
             let Some(core_id) = fs::read_to_string(topology.join("core_id"))
                 .ok()
@@ -334,6 +361,33 @@ impl MxFp4StreamingExpertLayer {
         }
         let count = Self::unique_physical_core_count(cores);
         (count > 0).then_some(count)
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn parse_linux_cpu_list(value: &str) -> Option<std::collections::HashSet<u32>> {
+        use std::collections::HashSet;
+
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        let mut cpus = HashSet::new();
+        for range in value.split(',') {
+            let mut endpoints = range.trim().split('-');
+            let start = endpoints.next()?.parse::<u32>().ok()?;
+            let end = match endpoints.next() {
+                Some(value) => value.parse::<u32>().ok()?,
+                None => start,
+            };
+            // Reject malformed ranges and pathological input before expanding.
+            if endpoints.next().is_some() || end < start || end.saturating_sub(start) > 1_000_000 {
+                return None;
+            }
+            cpus.extend(start..=end);
+        }
+
+        (!cpus.is_empty()).then_some(cpus)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -454,8 +508,18 @@ impl MxFp4StreamingExpertLayer {
 
             let gt_one = _mm256_cmpgt_epi32(mag, _mm256_set1_epi32(1));
             let odd = _mm256_and_si256(mag, _mm256_set1_epi32(1));
+            // A result whose exponent reaches 255 must be infinity, not NaN.
+            // Without this mask, e.g. scale=253 with FP4 magnitude 6 produces
+            // exponent=255 plus a nonzero mantissa (0x7fc00000).
+            let finite_exponent = _mm256_cmpgt_epi32(
+                _mm256_set1_epi32(255),
+                exponent,
+            );
             let mantissa_bits = _mm256_slli_epi32(
-                _mm256_and_si256(gt_one, odd),
+                _mm256_and_si256(
+                    _mm256_and_si256(gt_one, odd),
+                    finite_exponent,
+                ),
                 22,
             );
 
@@ -1806,6 +1870,42 @@ impl SharedOutPtr {
         ))
     }
 
+/// Order read submissions exactly as the consumer resolves their handles.
+///
+/// The stream cache uses rendezvous reply channels to bound retained expert
+/// buffers. A worker cannot advance to its next read until the receiver for
+/// the current job is waiting, so submission order must match resolution
+/// order. Single-route split gate/up experts consume both components
+/// together; multi-route experts consume component 0 first and component 1
+/// in the second pass.
+fn stream_prefetch_component_order(
+    experts: &[usize],
+    expert_offsets: &[usize],
+    weight_count: usize,
+) -> Vec<(usize, usize)> {
+    debug_assert!((1..=2).contains(&weight_count));
+    let mut order = Vec::with_capacity(experts.len() * weight_count);
+
+    for &expert in experts {
+        order.push((0, expert));
+        if weight_count == 2
+            && expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) == 1
+        {
+            order.push((1, expert));
+        }
+    }
+
+    if weight_count == 2 {
+        for &expert in experts {
+            if expert_offsets[expert + 1].saturating_sub(expert_offsets[expert]) != 1 {
+                order.push((1, expert));
+            }
+        }
+    }
+
+    order
+}
+
 impl QuantMethod for MxFp4StreamingExpertLayer {
     fn as_mxfp4_streaming(&self) -> Option<&crate::MxFp4StreamingExpertLayer> {
         Some(self)
@@ -1942,19 +2042,20 @@ impl QuantMethod for MxFp4StreamingExpertLayer {
             });
         }
 
+        let prefetch_order = stream_prefetch_component_order(
+            &experts,
+            &expert_offsets,
+            self.raw_weights.len(),
+        );
         let mut requests = Vec::with_capacity(experts.len() * self.raw_weights.len());
-        // Expert-major ordering keeps gate/up requests adjacent, allowing the
-        // single-route GPT-OSS fast path to consume both handles in one pass.
-        for &expert_idx in &experts {
-            for weight_idx in 0..self.raw_weights.len() {
-                requests.push((
-                    MxFp4StreamKey {
-                        source: self.cache_sources[weight_idx].clone(),
-                        expert_index: expert_idx,
-                    },
-                    self.raw_expert_range(weight_idx, expert_idx)?,
-                ));
-            }
+        for (weight_idx, expert_idx) in prefetch_order {
+            requests.push((
+                MxFp4StreamKey {
+                    source: self.cache_sources[weight_idx].clone(),
+                    expert_index: expert_idx,
+                },
+                self.raw_expert_range(weight_idx, expert_idx)?,
+            ));
         }
 
         let mut pending = if self.cache.overlap() {
@@ -3706,6 +3807,43 @@ impl QuantizedSerde for MXFP4Layer {
 mod tests {
     #[cfg(target_os = "linux")]
     #[test]
+    fn parses_cpu_affinity_lists() {
+        let cpus = MxFp4StreamingExpertLayer::parse_linux_cpu_list("0-3,8,10-11")
+            .expect("valid Linux CPU list");
+        assert_eq!(cpus.len(), 7);
+        for cpu in [0, 1, 2, 3, 8, 10, 11] {
+            assert!(cpus.contains(&cpu));
+        }
+
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("4-2").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("1-2-3").is_none());
+        assert!(MxFp4StreamingExpertLayer::parse_linux_cpu_list("0-1000002").is_none());
+    }
+
+    #[test]
+    fn prefetch_order_matches_mixed_single_and_multi_route_resolution() {
+        // Counts by expert: 1, 3, 1, 2. Single-route split gate/up requests
+        // are resolved together; multi-route up requests come after all gates.
+        let experts = [0, 1, 2, 3];
+        let offsets = [0, 1, 4, 5, 7];
+        assert_eq!(
+            stream_prefetch_component_order(&experts, &offsets, 2),
+            vec![
+                (0, 0),
+                (1, 0),
+                (0, 1),
+                (0, 2),
+                (1, 2),
+                (0, 3),
+                (1, 1),
+                (1, 3),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn physical_core_count_keeps_package_identity() {
         // SMT siblings share both ids; the same core_id in another package
         // must count as a distinct physical core.
@@ -3756,7 +3894,7 @@ mod tests {
             -2.0, 6.0, -6.0, 7.0, -7.0, 0.0, 0.75, -0.75,
         ];
 
-        // The production kernel clamps gate/up values before calling SwiGLU.
+        // The production kernel clamps gate/up values before calling SwiGLU; test that contract exactly.
         let clamped_gates = gates.map(|gate| gate.min(7.0));
         let clamped_ups = ups.map(|up| up.clamp(-7.0, 7.0));
         let expected: Vec<f32> = clamped_gates

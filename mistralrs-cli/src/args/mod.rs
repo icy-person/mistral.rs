@@ -730,7 +730,7 @@ pub struct RuntimeOptions {
     pub moe_stream: bool,
 
     /// Expert-cache budget in MiB, or auto to derive it from MemAvailable.
-    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto", value_parser = parse_moe_cache_mb)]
     #[serde(default = "default_moe_cache_mb")]
     pub moe_cache_mb: String,
 
@@ -1038,7 +1038,7 @@ pub struct BenchRuntimeOptions {
     pub moe_stream: bool,
 
     /// Expert-cache budget in MiB, or auto to derive it from available memory.
-    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto")]
+    #[arg(long = "cache-mb", env = "MISTRALRS_MOE_CACHE_MB", default_value = "auto", value_parser = parse_moe_cache_mb)]
     pub moe_cache_mb: String,
 
     /// Memory to leave available when auto-sizing the expert cache.
@@ -1496,6 +1496,17 @@ fn apply_moe_stream_env(
         None => std::env::remove_var("MISTRALRS_MOE_FUSED_ROUTE_LIMIT"),
     }
     set_bool("MISTRALRS_REALTIME_STATS", realtime_stats);
+}
+
+fn parse_moe_cache_mb(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+    value
+        .parse::<usize>()
+        .map(|mb| mb.to_string())
+        .map_err(|error| format!("invalid MoE cache budget {value:?}: expected auto or a non-negative MiB value ({error})"))
 }
 
 fn parse_cache_ceil(value: &str) -> Result<String, String> {
@@ -2111,6 +2122,16 @@ mod tests {
         assert!(runtime.realtime_stats);
         assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
         assert_eq!(runtime.moe_fused_route_limit, Some(8));
+    }
+
+    #[test]
+    fn cache_budget_accepts_auto_or_non_negative_mib() {
+        assert_eq!(parse_moe_cache_mb("auto").unwrap(), "auto");
+        assert_eq!(parse_moe_cache_mb(" AUTO ").unwrap(), "auto");
+        assert_eq!(parse_moe_cache_mb("768").unwrap(), "768");
+        assert_eq!(parse_moe_cache_mb("0").unwrap(), "0");
+        assert!(parse_moe_cache_mb("invalid").is_err());
+        assert!(parse_moe_cache_mb("-1").is_err());
     }
 
     #[test]
