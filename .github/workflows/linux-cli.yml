@@ -96,12 +96,12 @@ jobs:
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
         run: |
           MISTRALRS_BIN="$PWD/target/release/mistralrs" \
-            CONTEXT=512 \
-            PROMPT_LEN=32 \
-            GEN_LEN=32 \
-            DEPTH=32 \
+            CONTEXT=1024 \
+            PROMPT_LEN=128 \
+            GEN_LEN=128 \
+            DEPTH=128 \
             ITERATIONS=1 \
-            WARMUP=0 \
+            WARMUP=1 \
             CACHE_MB=512 \
             CACHE_FLOOR_MB=512 \
             CACHE_CEIL_MB=512 \
