@@ -84,6 +84,9 @@ pub async fn run_bench(
     config: BenchRunConfig,
 ) -> Result<()> {
     initialize_logging();
+    // Apply the same MoE runtime controls as run/serve before model construction,
+    // so benchmarks can compare stream/cache/thread configurations consistently.
+    runtime.apply_moe_stream_env();
 
     let BenchRunConfig {
         prompt_lens,
