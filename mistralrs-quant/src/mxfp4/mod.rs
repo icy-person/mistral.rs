@@ -3756,6 +3756,7 @@ mod tests {
             -2.0, 6.0, -6.0, 7.0, -7.0, 0.0, 0.75, -0.75,
         ];
 
+        // The production kernel clamps gate/up values before calling SwiGLU.
         let expected = gates.map(|gate| gate.min(7.0));
         let expected_up = ups.map(|up| up.clamp(-7.0, 7.0));
         let expected: Vec<f32> = expected
@@ -3767,15 +3768,16 @@ mod tests {
             .collect();
 
         let actual = unsafe {
-            let g = _mm256_loadu_ps(gates.as_ptr());
-            let u = _mm256_loadu_ps(ups.as_ptr());
+            let g = _mm256_loadu_ps(expected.as_ptr());
+            let u = _mm256_loadu_ps(expected_up.as_ptr());
             let y = MxFp4StreamingExpertLayer::swiglu8_avx2(g, u, alpha);
-            let mut out = [0.0f32; 8];
+            // Two AVX2 vectors are stored, so the destination must hold 16 lanes.
+            let mut out = [0.0f32; 16];
             _mm256_storeu_ps(out.as_mut_ptr(), y);
-            let g2 = _mm256_loadu_ps(gates.as_ptr().add(8));
-            let u2 = _mm256_loadu_ps(ups.as_ptr().add(8));
+            let g2 = _mm256_loadu_ps(expected.as_ptr().add(8));
+            let u2 = _mm256_loadu_ps(expected_up.as_ptr().add(8));
             let y2 = MxFp4StreamingExpertLayer::swiglu8_avx2(g2, u2, alpha);
-            _mm256_storeu_ps(out[8..].as_mut_ptr(), y2);
+            _mm256_storeu_ps(out.as_mut_ptr().add(8), y2);
             out.to_vec()
         };
 
