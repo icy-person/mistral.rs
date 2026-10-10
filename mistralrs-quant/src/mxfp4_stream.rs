@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender},
+        mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex,
     },
     thread,
@@ -450,9 +450,9 @@ struct CacheInner {
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
-    queues: Vec<SyncSender<ReadJob>>,
+    queues: Vec<Sender<ReadJob>>,
     next_queue: AtomicUsize,
-    prefault_queues: Vec<SyncSender<PrefaultJob>>,
+    prefault_queues: Vec<Sender<PrefaultJob>>,
     next_prefault_queue: AtomicUsize,
     paths: Vec<PathBuf>,
     archive: Arc<crate::GgufArchive>,
@@ -471,7 +471,6 @@ impl MxFp4StreamCache {
             .map(|shard| shard.path().to_path_buf())
             .collect::<Vec<_>>();
 
-        let queue_size = 8usize;
         let mut queues = Vec::new();
         let mut prefault_queues = Vec::new();
         let stats = Arc::new(Stats::default());
@@ -480,7 +479,7 @@ impl MxFp4StreamCache {
             let worker_count = config.io_threads.min(2).max(1);
             prefault_queues.reserve(worker_count);
             for worker_id in 0..worker_count {
-                let (queue_tx, queue_rx) = mpsc::sync_channel::<PrefaultJob>(queue_size);
+                let (queue_tx, queue_rx) = mpsc::channel::<PrefaultJob>();
                 prefault_queues.push(queue_tx);
                 let worker_stats = stats.clone();
                 thread::Builder::new()
@@ -509,7 +508,7 @@ impl MxFp4StreamCache {
         if !config.zero_copy || config.o_direct {
             queues.reserve(config.io_threads);
             for worker_id in 0..config.io_threads {
-                let (queue_tx, queue_rx) = mpsc::sync_channel::<ReadJob>(queue_size);
+                let (queue_tx, queue_rx) = mpsc::channel::<ReadJob>();
                 queues.push(queue_tx);
 
                 let worker_paths = paths.clone();
