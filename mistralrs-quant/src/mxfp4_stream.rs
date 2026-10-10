@@ -447,6 +447,8 @@ struct CacheEntry {
     // Hot mapped ranges are copied into the bounded heap cache after repeated use.
     hits: u16,
     promotion_claimed: bool,
+    // Set after DONTNEED is advised; reset on the next access to avoid repeated advice every 64 tokens.
+    dontneed_advised: bool,
 }
 
 #[derive(Debug)]
@@ -626,6 +628,7 @@ impl MxFp4StreamCache {
             let entry = guard.entries.get_mut(key)?;
             entry.last_used = now;
             entry.hits = entry.hits.saturating_add(1);
+            entry.dontneed_advised = false;
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
 
             let mapped_range = match entry.data.as_ref() {
@@ -733,6 +736,7 @@ impl MxFp4StreamCache {
                     last_used: now,
                     hits: 0,
                     promotion_claimed: false,
+                    dontneed_advised: false,
                 },
             );
         }
@@ -950,40 +954,50 @@ impl MxFp4StreamCache {
             return 0;
         }
 
-        let Ok(guard) = self.inner.lock() else {
-            return 0;
+        // Claim each cold mapping under the cache lock so subsequent maintenance
+        // passes don't issue the same DONTNEED advice repeatedly. A later access
+        // clears the flag and allows the range to be considered cold again.
+        let candidates = {
+            let Ok(mut guard) = self.inner.lock() else {
+                return 0;
+            };
+            let now = guard.clock;
+            let idle = self.config.release_idle;
+            let mut candidates = Vec::new();
+            for (key, entry) in guard.entries.iter_mut() {
+                if !should_advise_cold_page(
+                    entry.last_used,
+                    now,
+                    idle,
+                    entry.dontneed_advised,
+                ) {
+                    continue;
+                }
+                if let MxFp4StreamData::ArchiveMapped {
+                    shard, offset, len, ..
+                } = entry.data.as_ref() {
+                    if *len > 0 {
+                        entry.dontneed_advised = true;
+                        candidates.push((key.clone(), *shard, *offset, *len));
+                    }
+                }
+            }
+            candidates
         };
-        let now = guard.clock;
-        let idle = self.config.release_idle;
-        let candidates = guard
-            .entries
-            .values()
-            .filter_map(|entry| {
-                if now.wrapping_sub(entry.last_used) < idle {
-                    return None;
-                }
-                match entry.data.as_ref() {
-                    MxFp4StreamData::ArchiveMapped {
-                        shard,
-                        offset,
-                        len,
-                        ..
-                    } if *len != 0 => Some((*shard, *offset, *len)),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        drop(guard);
 
-        let mut released = 0usize;
-        for (shard, offset, len) in candidates {
+        let mut advised = 0usize;
+        for (key, shard, offset, len) in candidates {
             if self.archive.shard_data_dont_need(shard, offset, len).is_ok() {
-                released = released.saturating_add(len);
+                advised = advised.saturating_add(len);
+            } else if let Ok(mut guard) = self.inner.lock() {
+                // Allow a later retry if the kernel rejected the advisory call.
+                if let Some(entry) = guard.entries.get_mut(&key) {
+                    entry.dontneed_advised = false;
+                }
             }
         }
-        released
+        advised
     }
-
     fn mapped_residency(&self) -> (usize, usize) {
         let ranges = {
             let Ok(guard) = self.inner.lock() else {
@@ -1082,6 +1096,10 @@ impl MxFp4StreamCache {
             self.config.release_idle, self.config.prefault,
         );
     }
+}
+
+fn should_advise_cold_page(last_used: u64, now: u64, idle: u64, already_advised: bool) -> bool {
+    !already_advised && now.wrapping_sub(last_used) >= idle
 }
 
 fn should_promote_mapped(hits: u16, len: usize, budget_bytes: usize, promotion_claimed: bool) -> bool {
@@ -1450,5 +1468,14 @@ mod tests {
         assert!(!should_promote_mapped(3, 64, 0, false));
         assert!(!should_promote_mapped(3, 2048, 1024, false));
         assert!(!should_promote_mapped(3, 64, 1024, true));
+    }
+
+    #[test]
+    fn cold_page_advice_is_once_per_idle_period() {
+        assert!(!should_advise_cold_page(100, 4095, 4096, false));
+        assert!(should_advise_cold_page(100, 4196, 4096, false));
+        assert!(!should_advise_cold_page(100, 4196, 4096, true));
+        // Wrapping subtraction keeps age arithmetic well-defined.
+        assert!(should_advise_cold_page(u64::MAX - 3, 3, 7, false));
     }
 }
