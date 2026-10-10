@@ -1264,10 +1264,10 @@ mod tests {
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
 
-        std::fs::write(root.join("memory.max"), "1024\\n").unwrap();
-        std::fs::write(root.join("memory.current"), "800\\n").unwrap();
-        std::fs::write(child.join("memory.max"), "2048\\n").unwrap();
-        std::fs::write(child.join("memory.current"), "1024\\n").unwrap();
+        std::fs::write(root.join("memory.max"), "1024\n").unwrap();
+        std::fs::write(root.join("memory.current"), "800\n").unwrap();
+        std::fs::write(child.join("memory.max"), "2048\n").unwrap();
+        std::fs::write(child.join("memory.current"), "1024\n").unwrap();
 
         assert_eq!(
             cgroup_path_available_bytes(
