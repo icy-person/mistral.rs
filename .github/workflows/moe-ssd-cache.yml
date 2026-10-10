@@ -6,6 +6,7 @@ on:
       - perf/gpt-oss-ssd-cache-ci
     paths:
       - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "mistralrs-quant/src/mxfp4/mod.rs"
       - "scripts/bench_moe_io_pressure.py"
       - ".github/workflows/moe-ssd-cache.yml"
   pull_request:
@@ -13,6 +14,7 @@ on:
       - master
     paths:
       - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "mistralrs-quant/src/mxfp4/mod.rs"
       - "scripts/bench_moe_io_pressure.py"
       - ".github/workflows/moe-ssd-cache.yml"
   workflow_dispatch:
@@ -25,41 +27,45 @@ concurrency:
 
 jobs:
   rust-tests:
-    name: MXFP4 stream-cache unit tests
+    name: Full mistralrs-quant package tests
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Run stream-cache tests
-        run: cargo test --package mistralrs-quant --lib mxfp4_stream::tests -- --nocapture
+      - name: Run all package tests
+        run: cargo test --package mistralrs-quant
 
   io-pressure:
-    name: Synthetic SSD I/O pressure benchmark
+    name: Cache-size and SSD I/O pressure comparison
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Compare repeated reads against bounded expert LRU
+      - name: Validate benchmark syntax
+        run: python -m py_compile scripts/bench_moe_io_pressure.py
+      - name: Compare routing distributions, cache sizes, and page policies
         run: >-
           python scripts/bench_moe_io_pressure.py
-          --experts 128
-          --expert-kib 64
+          --experts 256
+          --expert-kib 128
           --requests 2048
           --cache-experts 32
-          --hot-experts 16
+          --hot-experts 32
           --hot-probability 0.85
           --seed 42
+          --matrix
           --output moe-ssd-cache-results.json
-      - name: Upload I/O benchmark results
+      - name: Upload comparison results
         uses: actions/upload-artifact@v4
         with:
-          name: moe-ssd-cache-results
+          name: moe-ssd-cache-matrix-results
           path: moe-ssd-cache-results.json
           if-no-files-found: error
+          retention-days: 14
