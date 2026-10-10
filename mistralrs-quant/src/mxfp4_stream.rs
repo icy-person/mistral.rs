@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     ops::Deref,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
@@ -17,7 +17,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(not(unix))]
 use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
+use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
@@ -1230,23 +1230,23 @@ mod tests {
 
     #[test]
     fn parses_mem_available_from_proc_meminfo() {
-        let meminfo = "MemTotal: 8388608 kB\\nMemAvailable: 4194304 kB\\n";
+        let meminfo = "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n";
         assert_eq!(
             parse_mem_available_bytes(meminfo),
             Some(4 * 1024 * 1024 * 1024)
         );
-        assert_eq!(parse_mem_available_bytes("MemTotal: 1024 kB\\n"), None);
+        assert_eq!(parse_mem_available_bytes("MemTotal: 1024 kB\n"), None);
     }
 
     #[test]
     fn cgroup_v2_budget_uses_remaining_memory() {
         assert_eq!(
-            parse_cgroup_v2_remaining_bytes("8589934592\\n", "6442450944\\n"),
+            parse_cgroup_v2_remaining_bytes("8589934592\n", "6442450944\n"),
             Some(2 * 1024 * 1024 * 1024)
         );
-        assert_eq!(parse_cgroup_v2_remaining_bytes("max\\n", "1024\\n"), None);
+        assert_eq!(parse_cgroup_v2_remaining_bytes("max\n", "1024\n"), None);
         assert_eq!(
-            parse_cgroup_v2_remaining_bytes("1024\\n", "2048\\n"),
+            parse_cgroup_v2_remaining_bytes("1024\n", "2048\n"),
             Some(0)
         );
     }
@@ -1254,11 +1254,11 @@ mod tests {
     #[test]
     fn cgroup_v1_unlimited_sentinel_is_ignored() {
         assert_eq!(
-            parse_cgroup_v1_remaining_bytes("9223372036854771712\\n", "1024\\n"),
+            parse_cgroup_v1_remaining_bytes("9223372036854771712\n", "1024\n"),
             None
         );
         assert_eq!(
-            parse_cgroup_v1_remaining_bytes("4096\\n", "1024\\n"),
+            parse_cgroup_v1_remaining_bytes("4096\n", "1024\n"),
             Some(3072)
         );
     }
