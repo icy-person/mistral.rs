@@ -28,8 +28,9 @@ env:
 
 jobs:
   build-linux-cli:
-    name: Linux x86_64 CLI
+    name: Linux x86_64 CLI and GPT-OSS model benchmark
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -61,10 +62,13 @@ jobs:
           ./target/release/mistralrs stream --help >/dev/null
           test -x target/release/mistralrs
 
-      - name: Run GPT-OSS 20B response smoke test
+      - name: Run GPT-OSS 20B buffered-stream response smoke test
+        id: model-smoke
+        continue-on-error: true
         env:
           RUST_LOG: error
-          MISTRALRS_MOE_ZERO_COPY: "true"
+          # Separate the buffered streaming path from zero-copy promotion.
+          MISTRALRS_MOE_ZERO_COPY: "false"
           MISTRALRS_MOE_OVERLAP: "false"
           # First isolate the generic streamed MoE route from whole-MLP fusion.
           # Route limit 1 forces the 4-route decode step through the reference path.
@@ -100,7 +104,43 @@ jobs:
             exit "$run_status"
           fi
           test -s model.stdout
-          grep -q "323" model.stdout
+          grep -Eiv '^(Stats:|Prompt:|Decode:|Prefix cache:|Sampling:|[[:space:]]*$)' model.stdout | grep -q .
+          grep -q '323' model.stdout
+
+      - name: Compare GPT-OSS streaming configurations on the real model
+        if: always()
+        env:
+          RUST_LOG: info
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
+        run: |
+          MISTRALRS_BIN="$PWD/target/release/mistralrs" \
+            CONTEXT=1024 \
+            PROMPT_LEN=128 \
+            GEN_LEN=128 \
+            DEPTH=128 \
+            ITERATIONS=1 \
+            WARMUP=1 \
+            CACHE_MB=512 \
+            CACHE_FLOOR_MB=512 \
+            CACHE_CEIL_MB=512 \
+            bash scripts/bench_moe_stream.sh \
+              "$PWD/gpt-oss-20b-MXFP4.gguf" \
+              "$PWD/gpt-oss-moe-benchmark"
+
+      - name: Enforce GPT-OSS response smoke test result
+        if: always() && steps.model-smoke.outcome == 'failure'
+        run: |
+          echo "GPT-OSS inference returned no visible text response; see model.stdout/model.stderr artifact."
+          exit 1
+
+      - name: Upload GPT-OSS benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-oss-20b-real-model-benchmark
+          path: gpt-oss-moe-benchmark/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package CLI
         run: |

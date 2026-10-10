@@ -21,6 +21,10 @@ use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
+const HOT_PROMOTION_HITS: u16 = 3;
+// A fused gate/up source can have the LRU entry plus two persistent OnceLock descriptors.
+// More references indicate a live request should be allowed to finish before DONTNEED.
+const MAX_IDLE_MMAP_REFS: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MxFp4StreamConfig {
@@ -453,10 +457,15 @@ struct Stats {
     io_nanos: AtomicU64,
     io_wait_nanos: AtomicU64,
     evictions: AtomicU64,
+    promotions: AtomicU64,
+    promoted_bytes: AtomicU64,
+    advised_dontneed_bytes: AtomicU64,
     prefault_jobs: AtomicU64,
     prefault_nanos: AtomicU64,
     prefault_wait_nanos: AtomicU64,
     report_calls: AtomicU64,
+    // Independent of logging: memory maintenance must still run when stats are disabled.
+    maintenance_calls: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -464,6 +473,11 @@ struct CacheEntry {
     data: Arc<MxFp4StreamData>,
     bytes: usize,
     last_used: u64,
+    // Hot mapped ranges are copied into the bounded heap cache after repeated use.
+    hits: u16,
+    promotion_claimed: bool,
+    // Set after DONTNEED is advised; reset on the next access to avoid repeated advice every 64 tokens.
+    dontneed_advised: bool,
 }
 
 #[derive(Debug)]
@@ -502,6 +516,8 @@ pub(crate) struct MxFp4StreamCache {
     budget_bytes: usize,
     stats: Arc<Stats>,
     warned_cache_cliff: std::sync::atomic::AtomicBool,
+    // Process-wide storage bytes at cache construction; available on Linux via /proc/self/io.
+    process_storage_read_bytes_at_start: Option<u64>,
 }
 
 impl MxFp4StreamCache {
@@ -627,6 +643,7 @@ impl MxFp4StreamCache {
             config,
             stats,
             warned_cache_cliff: std::sync::atomic::AtomicBool::new(false),
+            process_storage_read_bytes_at_start: process_storage_read_bytes(),
         }))
     }
 
@@ -642,26 +659,49 @@ impl MxFp4StreamCache {
 
     #[inline]
     fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
-        let mut guard = self.inner.lock().ok()?;
-        guard.clock = guard.clock.wrapping_add(1);
-        let now = guard.clock;
-        let entry = guard.entries.get_mut(key)?;
-        entry.last_used = now;
-        self.stats.hits.fetch_add(1, Ordering::Relaxed);
-        Some(entry.data.clone())
+        // Share the hot-promotion path with the explicit fast-path touch. The
+        // overlap/prefetch path uses lookup(), so promotion must happen here too.
+        self.touch(key)
     }
 
     #[inline]
-    pub(crate) fn touch(&self, key: &MxFp4StreamKey) {
-        let Ok(mut guard) = self.inner.lock() else {
-            return;
-        };
-        guard.clock = guard.clock.wrapping_add(1);
-        let now = guard.clock;
-        if let Some(entry) = guard.entries.get_mut(key) {
+    pub(crate) fn touch(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
+        let (current, promote_range) = {
+            let mut guard = self.inner.lock().ok()?;
+            guard.clock = guard.clock.wrapping_add(1);
+            let now = guard.clock;
+            let entry = guard.entries.get_mut(key)?;
             entry.last_used = now;
+            entry.hits = entry.hits.saturating_add(1);
+            entry.dontneed_advised = false;
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
+
+            let mapped_range = match entry.data.as_ref() {
+                MxFp4StreamData::ArchiveMapped { shard, offset, len, .. }
+                    if should_promote_mapped(entry.hits, *len, self.budget_bytes, entry.promotion_claimed) =>
+                    Some((*shard, *offset, *len)),
+                _ => None,
+            };
+            if mapped_range.is_some() {
+                // Claim promotion while holding the cache lock to avoid duplicate copies.
+                entry.promotion_claimed = true;
+            }
+            (entry.data.clone(), mapped_range)
+        };
+
+        if let Some((shard, offset, len)) = promote_range {
+            if let Ok(bytes) = self.archive.shard_data_slice(shard, offset, len) {
+                // Keep a bounded anonymous-RAM copy of experts that prove hot so
+                // page-cache eviction doesn't force a later SSD read for the same expert.
+                let owned = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())));
+                self.insert(key.clone(), owned.clone());
+                self.stats.promotions.fetch_add(1, Ordering::Relaxed);
+                self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                return Some(owned);
+            }
         }
+
+        Some(current)
     }
 
     fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
@@ -732,6 +772,9 @@ impl MxFp4StreamCache {
                     data,
                     bytes: len,
                     last_used: now,
+                    hits: 0,
+                    promotion_claimed: false,
+                    dontneed_advised: false,
                 },
             );
         }
@@ -948,40 +991,51 @@ impl MxFp4StreamCache {
             return 0;
         }
 
-        let Ok(guard) = self.inner.lock() else {
-            return 0;
+        // Claim each cold mapping under the cache lock so subsequent maintenance
+        // passes don't issue the same DONTNEED advice repeatedly. A later access
+        // clears the flag and allows the range to be considered cold again.
+        let candidates = {
+            let Ok(mut guard) = self.inner.lock() else {
+                return 0;
+            };
+            let now = guard.clock;
+            let idle = self.config.release_idle;
+            let mut candidates = Vec::new();
+            for (key, entry) in guard.entries.iter_mut() {
+                if !should_advise_cold_page(
+                    entry.last_used,
+                    now,
+                    idle,
+                    entry.dontneed_advised,
+                    Arc::strong_count(&entry.data),
+                ) {
+                    continue;
+                }
+                if let MxFp4StreamData::ArchiveMapped {
+                    shard, offset, len, ..
+                } = entry.data.as_ref() {
+                    if *len > 0 {
+                        entry.dontneed_advised = true;
+                        candidates.push((key.clone(), *shard, *offset, *len));
+                    }
+                }
+            }
+            candidates
         };
-        let now = guard.clock;
-        let idle = self.config.release_idle;
-        let candidates = guard
-            .entries
-            .values()
-            .filter_map(|entry| {
-                if now.wrapping_sub(entry.last_used) < idle {
-                    return None;
-                }
-                match entry.data.as_ref() {
-                    MxFp4StreamData::ArchiveMapped {
-                        shard,
-                        offset,
-                        len,
-                        ..
-                    } if *len != 0 => Some((*shard, *offset, *len)),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<_>>();
-        drop(guard);
 
-        let mut released = 0usize;
-        for (shard, offset, len) in candidates {
+        let mut advised = 0usize;
+        for (key, shard, offset, len) in candidates {
             if self.archive.shard_data_dont_need(shard, offset, len).is_ok() {
-                released = released.saturating_add(len);
+                advised = advised.saturating_add(len);
+            } else if let Ok(mut guard) = self.inner.lock() {
+                // Allow a later retry if the kernel rejected the advisory call.
+                if let Some(entry) = guard.entries.get_mut(&key) {
+                    entry.dontneed_advised = false;
+                }
             }
         }
-        released
+        advised
     }
-
     fn mapped_residency(&self) -> (usize, usize) {
         let ranges = {
             let Ok(guard) = self.inner.lock() else {
@@ -1022,10 +1076,10 @@ impl MxFp4StreamCache {
             return;
         }
 
+        if !self.config.stats { return; }
+
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
-        if report != 0 && !report.is_multiple_of(256) {
-            return;
-        }
+        if report != 0 && !report.is_multiple_of(256) { return; }
 
         let released_bytes = self.release_cold_pages();
         if !self.config.stats {
@@ -1037,14 +1091,10 @@ impl MxFp4StreamCache {
         };
         let entry_count = guard.entries.len();
         let used_bytes = guard.used_bytes;
-        let mapped_bytes = guard
-            .entries
-            .values()
-            .filter_map(|entry| match entry.data.as_ref() {
-                MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
-                MxFp4StreamData::Owned(_) => None,
-            })
-            .sum::<usize>();
+        let mapped_bytes = guard.entries.values().filter_map(|entry| match entry.data.as_ref() {
+            MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
+            MxFp4StreamData::Owned(_) => None,
+        }).sum::<usize>();
         drop(guard);
 
         let hits = self.stats.hits.load(Ordering::Relaxed);
@@ -1061,45 +1111,70 @@ impl MxFp4StreamCache {
             mapped_resident_bytes as f64 / mapped_bytes_total as f64 * 100.0
         };
 
+        // Unlike logical pread counters, /proc/self/io sees storage reads caused
+        // by mmap page faults in Zero-Copy mode. This is process-wide, not model-exclusive.
+        let process_storage_read_mib = self.process_storage_read_bytes_at_start
+            .and_then(|start| process_storage_read_bytes().map(|current| current.saturating_sub(start)))
+            .map(|value| value as f64 / MIB as f64)
+            .unwrap_or(-1.0);
+
         let requests = hits.saturating_add(misses);
-        let hit_rate = if requests == 0 {
-            0.0
-        } else {
-            hits as f64 / requests as f64
-        };
+        let hit_rate = if requests == 0 { 0.0 } else { hits as f64 / requests as f64 };
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, released_now_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
-            entry_count,
-            used_bytes / MIB,
-            self.budget_bytes / MIB,
-            mapped_bytes / MIB,
-            mapped_resident_bytes / MIB,
-            mapped_residency,
-            self.config.cache_per_source,
-            hits,
-            misses,
-            hit_rate * 100.0,
-            reads,
-            bytes / (MIB as u64),
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, promotions={}, promoted_mib={}, advised_dontneed_total_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            entry_count, used_bytes / MIB, self.budget_bytes / MIB, mapped_bytes / MIB,
+            mapped_resident_bytes / MIB, mapped_residency, self.config.cache_per_source,
+            hits, misses, hit_rate * 100.0, reads, bytes / (MIB as u64), process_storage_read_mib,
             self.stats.io_jobs.load(Ordering::Relaxed),
             self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.io_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            evictions,
-            released_bytes / MIB,
-            self.config.io_threads,
-            self.config.overlap,
-            self.config.zero_copy,
-            self.config.o_direct,
-            self.config.release_cold,
-            self.config.release_idle,
-            self.config.prefault,
+            evictions, promotions, promoted_bytes / (MIB as u64), advised_dontneed_bytes / (MIB as u64), self.config.io_threads, self.config.overlap,
+            self.config.zero_copy, self.config.o_direct, self.config.release_cold,
+            self.config.release_idle, self.config.prefault,
         );
     }
+}
+
+fn should_advise_cold_page(
+    last_used: u64,
+    now: u64,
+    idle: u64,
+    already_advised: bool,
+    strong_refs: usize,
+) -> bool {
+    !already_advised
+        && now.wrapping_sub(last_used) >= idle
+        && strong_refs <= MAX_IDLE_MMAP_REFS
+}
+
+fn should_promote_mapped(hits: u16, len: usize, budget_bytes: usize, promotion_claimed: bool) -> bool {
+    !promotion_claimed && hits >= HOT_PROMOTION_HITS && len > 0
+        && budget_bytes > 0 && len <= budget_bytes
+}
+
+fn release_cold_scan_due(call: u64, release_cold: bool, zero_copy: bool) -> bool {
+    release_cold && zero_copy && call > 0 && call.is_multiple_of(64)
+}
+
+fn parse_process_storage_read_bytes(io_text: &str) -> Option<u64> {
+    io_text.lines()
+        .find_map(|line| line.strip_prefix("read_bytes:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn process_storage_read_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let io_text = std::fs::read_to_string("/proc/self/io").ok()?;
+        parse_process_storage_read_bytes(&io_text)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { None }
 }
 
 fn prefault_mapped(data: &MxFp4StreamData) -> io::Result<()> {
@@ -1470,5 +1545,41 @@ mod tests {
             prefault: true,
         };
         assert_eq!(cfg.cache_budget_bytes(), 2048 * MIB);
+    }
+
+    #[test]
+    fn cold_page_maintenance_is_rate_limited_and_not_logging_gated() {
+        assert!(!release_cold_scan_due(63, true, true));
+        assert!(release_cold_scan_due(64, true, true));
+        assert!(!release_cold_scan_due(64, false, true));
+        assert!(!release_cold_scan_due(64, true, false));
+        assert!(!release_cold_scan_due(0, true, true));
+    }
+
+    #[test]
+    fn parses_process_storage_read_counter() {
+        let sample = "rchar: 1200\nwchar: 100\nsyscr: 12\nsyscw: 3\nread_bytes: 8192\nwrite_bytes: 4096\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_process_storage_read_bytes(sample), Some(8192));
+        assert_eq!(parse_process_storage_read_bytes("rchar: 1\n"), None);
+    }
+
+    #[test]
+    fn promotes_only_repeated_mapped_experts_that_fit_the_budget() {
+        assert!(!should_promote_mapped(2, 64, 1024, false));
+        assert!(should_promote_mapped(3, 64, 1024, false));
+        assert!(!should_promote_mapped(3, 64, 0, false));
+        assert!(!should_promote_mapped(3, 2048, 1024, false));
+        assert!(!should_promote_mapped(3, 64, 1024, true));
+    }
+
+    #[test]
+    fn cold_page_advice_is_once_per_idle_period_and_skips_live_users() {
+        assert!(!should_advise_cold_page(100, 4095, 4096, false, 1));
+        assert!(should_advise_cold_page(100, 4196, 4096, false, 3));
+        assert!(!should_advise_cold_page(100, 4196, 4096, true, 1));
+        // Cache entry + persistent descriptor(s) can be idle; another Arc means a live user.
+        assert!(!should_advise_cold_page(100, 4196, 4096, false, 4));
+        // Wrapping subtraction keeps age arithmetic well-defined.
+        assert!(should_advise_cold_page(u64::MAX - 3, 3, 7, false, 1));
     }
 }

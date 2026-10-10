@@ -22,6 +22,8 @@ jobs:
       CARGO_NET_RETRY: "5"
       CARGO_HTTP_TIMEOUT: "120"
       CARGO_HTTP_MULTIPLEXING: "false"
+      # Avoid compiling host-specific native instructions on GitHub's virtual CPU.
+      RUSTFLAGS: "-C target-cpu=generic"
 
     steps:
       - name: Checkout

@@ -71,9 +71,6 @@ MODEL_FILE=$(realpath "$MODEL_FILE")
 common=(
   bench --cpu -f "$MODEL_FILE" --moe-stream
   --max-model-len "$CONTEXT"
-  --cache-mb "$CACHE_MB"
-  --cache-floor-mb "$CACHE_FLOOR_MB"
-  --cache-ceil-mb "$CACHE_CEIL_MB"
   --moe-stats
   --prompt-len "$PROMPT_LEN"
   --gen-len "$GEN_LEN"
@@ -82,30 +79,66 @@ common=(
   --warmup "$WARMUP"
 )
 
+BENCH_FAILED=0
+
 run_case() {
   local name=$1
-  shift
+  local case_cache_mb=$2
+  shift 2
   echo
   echo "===== $name ====="
+  echo "Cache budget: $case_cache_mb MiB"
   echo "Log: $OUT_DIR/$name.log"
-  "$BIN" "${common[@]}" "$@" 2>&1 | tee "$OUT_DIR/$name.log"
+  echo "Resource report: $OUT_DIR/$name.resources.txt"
+  # GNU time records peak RSS, major page faults, filesystem input blocks and
+  # elapsed time for each fresh model process. The detailed runner log remains
+  # in the artifact so cold/warm behavior and MoE telemetry can be compared.
+  if /usr/bin/time -v -o "$OUT_DIR/$name.resources.txt" \
+    "$BIN" "${common[@]}" \
+      --cache-mb "$case_cache_mb" \
+      --cache-floor-mb "$CACHE_FLOOR_MB" \
+      --cache-ceil-mb "$case_cache_mb" \
+      "$@" 2>&1 | tee "$OUT_DIR/$name.log"; then
+    :
+  else
+    local status=$?
+    BENCH_FAILED=1
+    echo "Benchmark case $name failed with exit code $status; continuing to collect other profiles." | tee -a "$OUT_DIR/$name.log"
+  fi
+  if [[ -f "$OUT_DIR/$name.resources.txt" ]]; then
+    cat "$OUT_DIR/$name.resources.txt" >> "$OUT_DIR/$name.log"
+  fi
 }
 
-run_case baseline-buffered \
+run_case baseline-buffered "$CACHE_MB" \
   --io-threads 1 \
   --moe-overlap=false \
   --moe-zero-copy=false \
   --moe-prefault=false \
   --moe-threads 1
 
-run_case tuned-overlap \
+run_case tuned-overlap-cache-256 256 \
   --io-threads 4 \
   --moe-overlap \
   --moe-zero-copy \
   --moe-prefault \
   --moe-threads physical
 
-run_case low-residency \
+run_case tuned-overlap-cache-512 "$CACHE_MB" \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-zero-copy \
+  --moe-prefault \
+  --moe-threads physical
+
+run_case tuned-overlap-cache-1024 1024 \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-zero-copy \
+  --moe-prefault \
+  --moe-threads physical
+
+run_case low-residency "$CACHE_MB" \
   --io-threads 2 \
   --moe-overlap \
   --moe-zero-copy \
@@ -117,3 +150,7 @@ run_case low-residency \
 echo
 echo "Benchmark logs saved to: $OUT_DIR"
 echo "Compare decode tok/s, TTFT/TPOT, peak RAM, cache hit rate, physical mmap residency and I/O wait."
+if [[ "$BENCH_FAILED" -ne 0 ]]; then
+  echo "One or more model benchmark profiles failed; inspect the per-profile logs above." >&2
+  exit 1
+fi

@@ -267,7 +267,11 @@ impl MxFp4StreamingExpertLayer {
         expert_idx: usize,
         data: Arc<MxFp4StreamData>,
     ) -> Arc<MxFp4StreamData> {
-        if !self.cache.zero_copy() {
+        // The side table is only a fast path for zero-copy descriptors. Never pin
+        // an owned hot-cache buffer here: LRU eviction must be able to free it.
+        if !self.cache.zero_copy()
+            || !matches!(data.as_ref(), MxFp4StreamData::ArchiveMapped { .. })
+        {
             return data;
         }
         let slot = &self.zero_copy_experts[weight_idx][expert_idx];
@@ -283,10 +287,14 @@ impl MxFp4StreamingExpertLayer {
         key: &MxFp4StreamKey,
         range: MxFp4StreamRange,
     ) -> Result<Arc<MxFp4StreamData>> {
-        if self.cache.zero_copy() {
-            if let Some(data) = self.zero_copy_experts[weight_idx][expert_idx].get() {
-                self.cache.touch(key);
-                return Ok(data.clone());
+        if self.cache.zero_copy()
+            && self.zero_copy_experts[weight_idx][expert_idx].get().is_some()
+        {
+            // A mapped descriptor is cheap, but the cache may have promoted it
+            // to an owned RAM copy. Always use the cache's current entry, and
+            // re-resolve if LRU eviction removed that entry.
+            if let Some(data) = self.cache.touch(key) {
+                return Ok(data);
             }
         }
 
@@ -548,7 +556,7 @@ impl MxFp4StreamingExpertLayer {
         let (lo1, hi1) = unpack8(packed.add(8));
 
         let s = raw_expert[block_start] as u32;
-        if (3..=253).contains(&s) {
+        if (3..=252).contains(&s) {
             // The vector decoder adds the E2M1 exponent adjustment to this
             // exponent field. Use the full E8M0 exponent, not exponent - 1:
             // the canonical FP4 magnitudes below are not doubled.
@@ -3570,18 +3578,42 @@ impl MXFP4Layer {
         }
 
         let (num_tokens, topk, k, x_has_topk) = if x_dims.len() == 2 {
+            if x_dims[0] != indices_dims[0] {
+                candle_core::bail!(
+                    "MXFP4 CPU MoE input token count {} does not match indices token count {}",
+                    x_dims[0],
+                    indices_dims[0]
+                );
+            }
             (x_dims[0], indices_dims[1], x_dims[1], false)
         } else if x_dims.len() == 3 {
-            if x_dims[0] != indices_dims[0] || x_dims[1] != indices_dims[1] {
-                candle_core::bail!("MXFP4 CPU MoE input and indices shapes do not agree");
+            // MoE callers may provide either a separately gathered row for each
+            // selected expert ([tokens, topk, K]) or one shared row per token
+            // ([tokens, 1, K]). The latter must broadcast across all index slots.
+            if x_dims[0] != indices_dims[0]
+                || (x_dims[1] != 1 && x_dims[1] != indices_dims[1])
+            {
+                candle_core::bail!(
+                    "MXFP4 CPU MoE input shape {:?} is incompatible with indices shape {:?}",
+                    x_dims,
+                    indices_dims
+                );
             }
-            (x_dims[0], x_dims[1], x_dims[2], true)
+            (
+                x_dims[0],
+                indices_dims[1],
+                x_dims[2],
+                x_dims[1] != 1,
+            )
         } else {
             candle_core::bail!(
                 "MXFP4 CPU MoE fallback expects rank-2 or rank-3 input, got rank {}",
                 x_dims.len()
             );
         };
+        if topk == 0 {
+            candle_core::bail!("MXFP4 CPU MoE requires at least one selected expert");
+        }
 
         if !k.is_multiple_of(MXFP4_BLOCK_SIZE) {
             candle_core::bail!(
@@ -3847,6 +3879,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_swiglu_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return;
+        }
         let alpha = 1.702f32;
         let values = [
             -18.0f32, -8.0, -2.0, -1.0, -0.25, 0.0, 0.25, 1.0,
@@ -3858,34 +3894,36 @@ mod tests {
             -2.0, 6.0, -6.0, 7.0, -7.0, 0.0, 0.75, -0.75,
         ];
 
-        let expected = gates.map(|gate| gate.min(7.0));
-        let expected_up = ups.map(|up| up.clamp(-7.0, 7.0));
-        let expected: Vec<f32> = expected
+        // The production kernel clamps gate/up values before calling SwiGLU; test that contract exactly.
+        let clamped_gates = gates.map(|gate| gate.min(7.0));
+        let clamped_ups = ups.map(|up| up.clamp(-7.0, 7.0));
+        let expected: Vec<f32> = clamped_gates
             .iter()
-            .zip(expected_up.iter())
+            .zip(clamped_ups.iter())
             .map(|(&gate, &up)| {
                 (up + 1.0) * gate / (1.0 + (-gate * alpha).exp())
             })
             .collect();
 
         let actual = unsafe {
-            let g = _mm256_loadu_ps(gates.as_ptr());
-            let u = _mm256_loadu_ps(ups.as_ptr());
+            let g = _mm256_loadu_ps(clamped_gates.as_ptr());
+            let u = _mm256_loadu_ps(clamped_ups.as_ptr());
             let y = MxFp4StreamingExpertLayer::swiglu8_avx2(g, u, alpha);
-            let mut out = [0.0f32; 8];
+            // Two AVX2 vectors are stored, so the destination must hold 16 lanes.
+            let mut out = [0.0f32; 16];
             _mm256_storeu_ps(out.as_mut_ptr(), y);
-            let g2 = _mm256_loadu_ps(gates.as_ptr().add(8));
-            let u2 = _mm256_loadu_ps(ups.as_ptr().add(8));
+            let g2 = _mm256_loadu_ps(clamped_gates.as_ptr().add(8));
+            let u2 = _mm256_loadu_ps(clamped_ups.as_ptr().add(8));
             let y2 = MxFp4StreamingExpertLayer::swiglu8_avx2(g2, u2, alpha);
-            _mm256_storeu_ps(out[8..].as_mut_ptr(), y2);
+            _mm256_storeu_ps(out.as_mut_ptr().add(8), y2);
             out.to_vec()
         };
 
-        for (got, want) in actual.iter().zip(expected.iter()) {
+        for (lane, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
             let tol = 2e-4f32.max(want.abs() * 2e-4);
             assert!(
                 (got - want).abs() <= tol,
-                "got={got} want={want} diff={}",
+                "lane={lane} got={got} want={want} diff={}",
                 (got - want).abs()
             );
         }
@@ -3894,6 +3932,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_fused_dequant_matches_reference_all_normal_scales() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return;
+        }
         let mut raw = vec![0u8; MXFP4_BLOCK_SIZE / 2 + 1];
         for scale in 2u16..=253 {
             raw[0] = scale as u8;
@@ -3937,6 +3979,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_fused_row_kernel_matches_scalar() -> Result<()> {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return Ok(());
+        }
         let in_dim = 64;
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
@@ -4200,6 +4246,30 @@ mod tests {
         assert_eq!(MXFP4Layer::DEQUANT_LUT[128][2], 2.0);
         assert!(MXFP4Layer::DEQUANT_LUT[255][2].is_infinite());
         Ok(())
+    }
+
+    #[test]
+    fn stacked_mxfp4_gather_broadcasts_single_input_across_topk() -> Result<()> {
+        let layer = stacked_test_layer()?;
+        let input = Tensor::ones((2, 1, TEST_HIDDEN_SIZE), DType::F32, &Device::Cpu)?;
+        let indices = Tensor::from_vec(vec![0u32, 1, 1, 0], (2, 2), &Device::Cpu)?;
+
+        let actual = layer.gather_forward(&input, &indices)?;
+        assert_eq!(actual.dims(), &[2, 2, 4]);
+        assert_close(
+            &actual,
+            &Tensor::from_vec(
+                vec![
+                    64.0f32, 65.0, 66.0, 67.0, // token 0, expert 0
+                    68.0, 69.0, 70.0, 71.0, // token 0, expert 1
+                    68.0, 69.0, 70.0, 71.0, // token 1, expert 1
+                    64.0, 65.0, 66.0, 67.0, // token 1, expert 0
+                ],
+                (2, 2, 4),
+                &Device::Cpu,
+            )?,
+            1e-4,
+        )
     }
 
     #[test]

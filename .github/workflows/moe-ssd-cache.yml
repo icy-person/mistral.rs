@@ -1,0 +1,82 @@
+name: MoE SSD cache regression
+
+on:
+  push:
+    branches:
+      - perf/gpt-oss-ssd-cache-ci
+    paths:
+      - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "mistralrs-quant/src/mxfp4/mod.rs"
+      - "mistralrs-cli/src/commands/bench.rs"
+      - "scripts/bench_moe_io_pressure.py"
+      - "scripts/bench_moe_stream.sh"
+      - ".github/workflows/linux-cli.yml"
+      - ".github/workflows/moe-ssd-cache.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "mistralrs-quant/src/mxfp4/mod.rs"
+      - "scripts/bench_moe_io_pressure.py"
+      - ".github/workflows/moe-ssd-cache.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: moe-ssd-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: MXFP4 routed-shape and stream-cache tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Override .cargo/config.toml's target-cpu=native: hosted virtual CPUs
+      # may not expose the host's full ISA, leading to SIGILL in unit tests.
+      RUSTFLAGS: "-C target-cpu=generic"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test single input row broadcast across top-k
+        run: cargo test --package mistralrs-quant --lib stacked_mxfp4_gather_broadcasts_single_input_across_topk -- --nocapture
+      - name: Test stream-cache maintenance and promotion
+        run: cargo test --package mistralrs-quant --lib mxfp4_stream::tests -- --nocapture
+      - name: Run all quantization tests serially
+        run: cargo test --package mistralrs-quant -- --test-threads=1
+
+  io-pressure:
+    name: Cache-size and SSD I/O pressure comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate benchmark syntax
+        run: python -m py_compile scripts/bench_moe_io_pressure.py
+      - name: Compare routing distributions, cache sizes, and page policies
+        run: >-
+          python scripts/bench_moe_io_pressure.py
+          --experts 256
+          --expert-kib 128
+          --requests 2048
+          --cache-experts 32
+          --hot-experts 32
+          --hot-probability 0.85
+          --seed 42
+          --matrix
+          --output moe-ssd-cache-results.json
+      - name: Upload comparison results
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-ssd-cache-matrix-results
+          path: moe-ssd-cache-results.json
+          if-no-files-found: error
+          retention-days: 14
