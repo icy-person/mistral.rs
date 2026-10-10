@@ -324,7 +324,7 @@ impl MxFp4StreamingExpertLayer {
                 .unwrap_or(0);
             cores.push((package_id, core_id));
         }
-        let count = unique_physical_core_count(cores);
+        let count = Self::unique_physical_core_count(cores);
         (count > 0).then_some(count)
     }
 
@@ -3678,7 +3678,7 @@ mod tests {
         // SMT siblings share both ids; the same core_id in another package
         // must count as a distinct physical core.
         assert_eq!(
-            unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
+            MXFP4Layer::unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
             3
         );
     }
