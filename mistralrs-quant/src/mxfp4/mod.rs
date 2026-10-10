@@ -3686,7 +3686,7 @@ mod tests {
         // SMT siblings share both ids; the same core_id in another package
         // must count as a distinct physical core.
         assert_eq!(
-            unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
+            MxFp4StreamingExpertLayer::unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
             3
         );
     }
