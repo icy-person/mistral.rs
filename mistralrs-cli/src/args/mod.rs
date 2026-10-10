@@ -743,14 +743,15 @@ pub struct RuntimeOptions {
     #[serde(default = "default_moe_cache_floor_mb")]
     pub moe_cache_floor_mb: usize,
 
-    /// Hard ceiling for an auto-sized expert cache. Omit to disable the ceiling.
+    /// Hard ceiling for an auto-sized expert cache in MiB; use "none" to disable the ceiling.
     #[arg(
         long = "cache-ceil-mb",
         env = "MISTRALRS_MOE_CACHE_CEIL_MB",
-        default_value = "4096"
+        default_value = "4096",
+        value_parser = parse_cache_ceil
     )]
-    #[serde(default)]
-    pub moe_cache_ceil_mb: Option<usize>,
+    #[serde(default = "default_moe_cache_ceil_mb")]
+    pub moe_cache_ceil_mb: String,
 
     /// Number of parallel expert-read lanes.
     #[arg(
@@ -1041,9 +1042,9 @@ pub struct BenchRuntimeOptions {
     #[arg(long = "cache-floor-mb", env = "MISTRALRS_MOE_CACHE_FLOOR_MB", default_value_t = 1536)]
     pub moe_cache_floor_mb: usize,
 
-    /// Hard ceiling for an auto-sized expert cache.
-    #[arg(long = "cache-ceil-mb", env = "MISTRALRS_MOE_CACHE_CEIL_MB", default_value = "4096")]
-    pub moe_cache_ceil_mb: Option<usize>,
+    /// Hard ceiling for an auto-sized expert cache in MiB; use "none" to disable the ceiling.
+    #[arg(long = "cache-ceil-mb", env = "MISTRALRS_MOE_CACHE_CEIL_MB", default_value = "4096", value_parser = parse_cache_ceil)]
+    pub moe_cache_ceil_mb: String,
 
     /// Number of parallel expert-read lanes.
     #[arg(long = "io-threads", env = "MISTRALRS_MOE_IO_THREADS", default_value_t = 4)]
@@ -1160,7 +1161,7 @@ impl Default for BenchRuntimeOptions {
             moe_stream: false,
             moe_cache_mb: "auto".to_string(),
             moe_cache_floor_mb: 1536,
-            moe_cache_ceil_mb: Some(4096),
+            moe_cache_ceil_mb: "4096".to_string(),
             moe_io_threads: 4,
             moe_overlap: false,
             moe_o_direct: false,
@@ -1189,7 +1190,7 @@ impl BenchRuntimeOptions {
             self.moe_stream,
             &self.moe_cache_mb,
             self.moe_cache_floor_mb,
-            self.moe_cache_ceil_mb,
+            &self.moe_cache_ceil_mb,
             self.moe_io_threads,
             self.moe_overlap,
             self.moe_o_direct,
@@ -1283,7 +1284,7 @@ impl RuntimeOptions {
             self.moe_stream,
             &self.moe_cache_mb,
             self.moe_cache_floor_mb,
-            self.moe_cache_ceil_mb,
+            &self.moe_cache_ceil_mb,
             self.moe_io_threads,
             self.moe_overlap,
             self.moe_o_direct,
@@ -1391,7 +1392,7 @@ impl Default for RuntimeOptions {
             moe_stream: false,
             moe_cache_mb: "auto".to_string(),
             moe_cache_floor_mb: 1536,
-            moe_cache_ceil_mb: Some(4096),
+            moe_cache_ceil_mb: "4096".to_string(),
             moe_io_threads: 4,
             moe_overlap: false,
             moe_o_direct: false,
@@ -1451,7 +1452,7 @@ fn apply_moe_stream_env(
     stream: bool,
     cache_mb: &str,
     cache_floor_mb: usize,
-    cache_ceil_mb: Option<usize>,
+    cache_ceil_mb: &str,
     io_threads: usize,
     overlap: bool,
     o_direct: bool,
@@ -1471,10 +1472,9 @@ fn apply_moe_stream_env(
     set_bool("MISTRALRS_MOE_STREAM", stream);
     std::env::set_var("MISTRALRS_MOE_CACHE_MB", cache_mb);
     std::env::set_var("MISTRALRS_MOE_CACHE_FLOOR_MB", cache_floor_mb.to_string());
-    match cache_ceil_mb {
-        Some(value) => std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", value.to_string()),
-        None => std::env::remove_var("MISTRALRS_MOE_CACHE_CEIL_MB"),
-    }
+    // The low-level parser understands "none" as an explicit request to
+    // disable the cache ceiling; removing the env var restores the default cap.
+    std::env::set_var("MISTRALRS_MOE_CACHE_CEIL_MB", cache_ceil_mb);
     std::env::set_var("MISTRALRS_MOE_IO_THREADS", io_threads.clamp(1, 32).to_string());
     set_bool("MISTRALRS_MOE_OVERLAP", overlap);
     set_bool("MISTRALRS_MOE_O_DIRECT", o_direct);
@@ -1493,6 +1493,21 @@ fn apply_moe_stream_env(
         None => std::env::remove_var("MISTRALRS_MOE_FUSED_ROUTE_LIMIT"),
     }
     set_bool("MISTRALRS_REALTIME_STATS", realtime_stats);
+}
+
+fn parse_cache_ceil(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("unlimited") {
+        return Ok("none".to_string());
+    }
+    value
+        .parse::<usize>()
+        .map(|mb| mb.to_string())
+        .map_err(|error| format!("invalid cache ceiling {value:?}: {error}"))
+}
+
+fn default_moe_cache_ceil_mb() -> String {
+    "4096".to_string()
 }
 
 fn parse_moe_bool(value: &str) -> Result<bool, String> {
@@ -2110,7 +2125,7 @@ mod tests {
         assert!(runtime.moe_stream);
         assert_eq!(runtime.moe_cache_mb, "768");
         assert_eq!(runtime.moe_cache_floor_mb, 1024);
-        assert_eq!(runtime.moe_cache_ceil_mb, Some(768));
+        assert_eq!(runtime.moe_cache_ceil_mb, "768");
         assert_eq!(runtime.moe_io_threads, 3);
         assert!(!runtime.moe_overlap);
         assert!(!runtime.moe_zero_copy);
