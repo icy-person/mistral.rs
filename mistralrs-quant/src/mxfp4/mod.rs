@@ -492,7 +492,7 @@ impl MxFp4StreamingExpertLayer {
         let (lo1, hi1) = unpack8(packed.add(8));
 
         let s = raw_expert[block_start] as u32;
-        if (3..=253).contains(&s) {
+        if (3..=252).contains(&s) {
             // The vector decoder adds the E2M1 exponent adjustment to this
             // exponent field. Use the full E8M0 exponent, not exponent - 1:
             // the canonical FP4 magnitudes below are not doubled.
