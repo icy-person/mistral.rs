@@ -71,9 +71,6 @@ MODEL_FILE=$(realpath "$MODEL_FILE")
 common=(
   bench --cpu -f "$MODEL_FILE" --moe-stream
   --max-model-len "$CONTEXT"
-  --cache-mb "$CACHE_MB"
-  --cache-floor-mb "$CACHE_FLOOR_MB"
-  --cache-ceil-mb "$CACHE_CEIL_MB"
   --moe-stats
   --prompt-len "$PROMPT_LEN"
   --gen-len "$GEN_LEN"
@@ -84,34 +81,54 @@ common=(
 
 run_case() {
   local name=$1
-  shift
+  local case_cache_mb=$2
+  shift 2
   echo
   echo "===== $name ====="
+  echo "Cache budget: $case_cache_mb MiB"
   echo "Log: $OUT_DIR/$name.log"
   echo "Resource report: $OUT_DIR/$name.resources.txt"
   # GNU time records peak RSS, major page faults, filesystem input blocks and
   # elapsed time for each fresh model process. The detailed runner log remains
   # in the artifact so cold/warm behavior and MoE telemetry can be compared.
   /usr/bin/time -v -o "$OUT_DIR/$name.resources.txt" \
-    "$BIN" "${common[@]}" "$@" 2>&1 | tee "$OUT_DIR/$name.log"
+    "$BIN" "${common[@]}" \
+      --cache-mb "$case_cache_mb" \
+      --cache-floor-mb "$CACHE_FLOOR_MB" \
+      --cache-ceil-mb "$case_cache_mb" \
+      "$@" 2>&1 | tee "$OUT_DIR/$name.log"
   cat "$OUT_DIR/$name.resources.txt" >> "$OUT_DIR/$name.log"
 }
 
-run_case baseline-buffered \
+run_case baseline-buffered "$CACHE_MB" \
   --io-threads 1 \
   --moe-overlap=false \
   --moe-zero-copy=false \
   --moe-prefault=false \
   --moe-threads 1
 
-run_case tuned-overlap \
+run_case tuned-overlap-cache-256 256 \
   --io-threads 4 \
   --moe-overlap \
   --moe-zero-copy \
   --moe-prefault \
   --moe-threads physical
 
-run_case low-residency \
+run_case tuned-overlap-cache-512 "$CACHE_MB" \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-zero-copy \
+  --moe-prefault \
+  --moe-threads physical
+
+run_case tuned-overlap-cache-1024 1024 \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-zero-copy \
+  --moe-prefault \
+  --moe-threads physical
+
+run_case low-residency "$CACHE_MB" \
   --io-threads 2 \
   --moe-overlap \
   --moe-zero-copy \
