@@ -3757,35 +3757,35 @@ mod tests {
         ];
 
         // The production kernel clamps gate/up values before calling SwiGLU.
-        let expected = gates.map(|gate| gate.min(7.0));
-        let expected_up = ups.map(|up| up.clamp(-7.0, 7.0));
-        let expected: Vec<f32> = expected
+        let clamped_gates = gates.map(|gate| gate.min(7.0));
+        let clamped_ups = ups.map(|up| up.clamp(-7.0, 7.0));
+        let expected: Vec<f32> = clamped_gates
             .iter()
-            .zip(expected_up.iter())
+            .zip(clamped_ups.iter())
             .map(|(&gate, &up)| {
                 (up + 1.0) * gate / (1.0 + (-gate * alpha).exp())
             })
             .collect();
 
         let actual = unsafe {
-            let g = _mm256_loadu_ps(expected.as_ptr());
-            let u = _mm256_loadu_ps(expected_up.as_ptr());
+            let g = _mm256_loadu_ps(clamped_gates.as_ptr());
+            let u = _mm256_loadu_ps(clamped_ups.as_ptr());
             let y = MxFp4StreamingExpertLayer::swiglu8_avx2(g, u, alpha);
             // Two AVX2 vectors are stored, so the destination must hold 16 lanes.
             let mut out = [0.0f32; 16];
             _mm256_storeu_ps(out.as_mut_ptr(), y);
-            let g2 = _mm256_loadu_ps(expected.as_ptr().add(8));
-            let u2 = _mm256_loadu_ps(expected_up.as_ptr().add(8));
+            let g2 = _mm256_loadu_ps(clamped_gates.as_ptr().add(8));
+            let u2 = _mm256_loadu_ps(clamped_ups.as_ptr().add(8));
             let y2 = MxFp4StreamingExpertLayer::swiglu8_avx2(g2, u2, alpha);
             _mm256_storeu_ps(out.as_mut_ptr().add(8), y2);
             out.to_vec()
         };
 
-        for (got, want) in actual.iter().zip(expected.iter()) {
+        for (lane, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
             let tol = 2e-4f32.max(want.abs() * 2e-4);
             assert!(
                 (got - want).abs() <= tol,
-                "got={got} want={want} diff={}",
+                "lane={lane} got={got} want={want} diff={}",
                 (got - want).abs()
             );
         }
