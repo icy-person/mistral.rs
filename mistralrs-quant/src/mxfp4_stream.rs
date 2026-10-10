@@ -259,12 +259,8 @@ fn cgroup_path_available_bytes(
             std::fs::read_to_string(current.join(usage_file)),
         ) {
             let remaining = match version {
-                CgroupMemoryVersion::V1 => {
-                    parse_cgroup_v1_remaining_bytes(&limit, &usage)
-                }
-                CgroupMemoryVersion::V2 => {
-                    parse_cgroup_v2_remaining_bytes(&limit, &usage)
-                }
+                CgroupMemoryVersion::V1 => parse_cgroup_v1_remaining_bytes(&limit, &usage),
+                CgroupMemoryVersion::V2 => parse_cgroup_v2_remaining_bytes(&limit, &usage),
             };
             if let Some(remaining) = remaining {
                 available = Some(
