@@ -70,7 +70,8 @@ jobs:
           # Separate the buffered streaming path from zero-copy promotion.
           MISTRALRS_MOE_ZERO_COPY: "false"
           MISTRALRS_MOE_OVERLAP: "false"
-          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
+          # Keep whole-MLP fusion out of the smoke test; the bench profiles cover it separately.
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "1"
         run: |
           curl --fail --location --retry 5 --retry-all-errors \
             --output gpt-oss-20b-MXFP4.gguf \
@@ -83,7 +84,7 @@ jobs:
             --cache-floor-mb 1024 \
             --cache-ceil-mb 1024 \
             --io-threads 4 \
-            --reasoning-effort low \
+            --thinking false \
             --max-tokens 64 \
             -i "Say hello in one short sentence." \
             2>model.stderr | tee model.stdout

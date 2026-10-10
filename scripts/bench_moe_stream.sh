@@ -79,6 +79,8 @@ common=(
   --warmup "$WARMUP"
 )
 
+BENCH_FAILED=0
+
 run_case() {
   local name=$1
   local case_cache_mb=$2
@@ -91,13 +93,21 @@ run_case() {
   # GNU time records peak RSS, major page faults, filesystem input blocks and
   # elapsed time for each fresh model process. The detailed runner log remains
   # in the artifact so cold/warm behavior and MoE telemetry can be compared.
-  /usr/bin/time -v -o "$OUT_DIR/$name.resources.txt" \
+  if /usr/bin/time -v -o "$OUT_DIR/$name.resources.txt" \
     "$BIN" "${common[@]}" \
       --cache-mb "$case_cache_mb" \
       --cache-floor-mb "$CACHE_FLOOR_MB" \
       --cache-ceil-mb "$case_cache_mb" \
-      "$@" 2>&1 | tee "$OUT_DIR/$name.log"
-  cat "$OUT_DIR/$name.resources.txt" >> "$OUT_DIR/$name.log"
+      "$@" 2>&1 | tee "$OUT_DIR/$name.log"; then
+    :
+  else
+    local status=$?
+    BENCH_FAILED=1
+    echo "Benchmark case $name failed with exit code $status; continuing to collect other profiles." | tee -a "$OUT_DIR/$name.log"
+  fi
+  if [[ -f "$OUT_DIR/$name.resources.txt" ]]; then
+    cat "$OUT_DIR/$name.resources.txt" >> "$OUT_DIR/$name.log"
+  fi
 }
 
 run_case baseline-buffered "$CACHE_MB" \
@@ -140,3 +150,7 @@ run_case low-residency "$CACHE_MB" \
 echo
 echo "Benchmark logs saved to: $OUT_DIR"
 echo "Compare decode tok/s, TTFT/TPOT, peak RAM, cache hit rate, physical mmap residency and I/O wait."
+if [[ "$BENCH_FAILED" -ne 0 ]]; then
+  echo "One or more model benchmark profiles failed; inspect the per-profile logs above." >&2
+  exit 1
+fi

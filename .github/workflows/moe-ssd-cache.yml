@@ -7,7 +7,10 @@ on:
     paths:
       - "mistralrs-quant/src/mxfp4_stream.rs"
       - "mistralrs-quant/src/mxfp4/mod.rs"
+      - "mistralrs-cli/src/commands/bench.rs"
       - "scripts/bench_moe_io_pressure.py"
+      - "scripts/bench_moe_stream.sh"
+      - ".github/workflows/linux-cli.yml"
       - ".github/workflows/moe-ssd-cache.yml"
   pull_request:
     branches:
@@ -27,7 +30,7 @@ concurrency:
 
 jobs:
   rust-tests:
-    name: Full mistralrs-quant package tests
+    name: MXFP4 routed-shape and stream-cache tests
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -36,8 +39,12 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Run all package tests
-        run: cargo test --package mistralrs-quant
+      - name: Test single input row broadcast across top-k
+        run: cargo test --package mistralrs-quant --lib stacked_mxfp4_gather_broadcasts_single_input_across_topk -- --nocapture
+      - name: Test stream-cache maintenance and promotion
+        run: cargo test --package mistralrs-quant --lib mxfp4_stream::tests -- --nocapture
+      - name: Run all quantization tests serially
+        run: cargo test --package mistralrs-quant -- --test-threads=1
 
   io-pressure:
     name: Cache-size and SSD I/O pressure comparison

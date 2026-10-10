@@ -3741,6 +3741,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_swiglu_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return;
+        }
         let alpha = 1.702f32;
         let values = [
             -18.0f32, -8.0, -2.0, -1.0, -0.25, 0.0, 0.25, 1.0,
@@ -3788,6 +3792,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_fused_dequant_matches_reference_all_normal_scales() {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return;
+        }
         let mut raw = vec![0u8; MXFP4_BLOCK_SIZE / 2 + 1];
         for scale in 2u16..=253 {
             raw[0] = scale as u8;
@@ -3831,6 +3839,10 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn streaming_fused_row_kernel_matches_scalar() -> Result<()> {
+        if !std::is_x86_feature_detected!("avx2") {
+            eprintln!("Skipping AVX2-specific test: AVX2 is not available on this runner");
+            return Ok(());
+        }
         let in_dim = 64;
         let blocks_per_row = in_dim / MXFP4_BLOCK_SIZE;
         let row_bytes = blocks_per_row * (MXFP4_BLOCK_SIZE / 2 + 1);
