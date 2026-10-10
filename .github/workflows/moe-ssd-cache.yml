@@ -33,6 +33,10 @@ jobs:
     name: MXFP4 routed-shape and stream-cache tests
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Override .cargo/config.toml's target-cpu=native: hosted virtual CPUs
+      # may not expose the host's full ISA, leading to SIGILL in unit tests.
+      RUSTFLAGS: "-C target-cpu=generic"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
