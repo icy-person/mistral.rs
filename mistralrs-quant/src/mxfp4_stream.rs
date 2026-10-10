@@ -223,7 +223,9 @@ fn cgroup_available_memory_bytes() -> Option<usize> {
         };
 
         if let Some(candidate) = candidate {
-            available = Some(available.map_or(candidate, |current: usize| current.min(candidate)));
+            available = Some(
+                available.map_or(candidate, |current: usize| current.min(candidate)),
+            );
         }
     }
 
@@ -265,7 +267,9 @@ fn cgroup_path_available_bytes(
                 }
             };
             if let Some(remaining) = remaining {
-                available = Some(available.map_or(remaining, |current: usize| current.min(remaining)));
+                available = Some(
+                    available.map_or(remaining, |current: usize| current.min(remaining)),
+                );
             }
         }
 
