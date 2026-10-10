@@ -431,6 +431,8 @@ struct Stats {
     prefault_nanos: AtomicU64,
     prefault_wait_nanos: AtomicU64,
     report_calls: AtomicU64,
+    // Independent of logging: memory maintenance must still run when stats are disabled.
+    maintenance_calls: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -460,6 +462,8 @@ pub(crate) struct MxFp4StreamCache {
     budget_bytes: usize,
     stats: Arc<Stats>,
     warned_cache_cliff: std::sync::atomic::AtomicBool,
+    // Process-wide storage bytes at cache construction; available on Linux via /proc/self/io.
+    process_storage_read_bytes_at_start: Option<u64>,
 }
 
 impl MxFp4StreamCache {
@@ -585,6 +589,7 @@ impl MxFp4StreamCache {
             config,
             stats,
             warned_cache_cliff: std::sync::atomic::AtomicBool::new(false),
+            process_storage_read_bytes_at_start: process_storage_read_bytes(),
         }))
     }
 
@@ -982,28 +987,25 @@ impl MxFp4StreamCache {
     }
 
     pub(crate) fn log_stats(&self) {
-        if !self.config.stats {
-            return;
-        }
+        // Called from the routed forward path; cold-page maintenance must not
+        // depend on the optional telemetry switch.
+        let released_bytes = if self.config.release_cold && self.zero_copy() {
+            let call = self.stats.maintenance_calls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            if release_cold_scan_due(call, true, true) { self.release_cold_pages() } else { 0 }
+        } else { 0 };
+
+        if !self.config.stats { return; }
 
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
-        if report != 0 && !report.is_multiple_of(256) {
-            return;
-        }
+        if report != 0 && !report.is_multiple_of(256) { return; }
 
-        let Ok(guard) = self.inner.lock() else {
-            return;
-        };
+        let Ok(guard) = self.inner.lock() else { return; };
         let entry_count = guard.entries.len();
         let used_bytes = guard.used_bytes;
-        let mapped_bytes = guard
-            .entries
-            .values()
-            .filter_map(|entry| match entry.data.as_ref() {
-                MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
-                MxFp4StreamData::Owned(_) => None,
-            })
-            .sum::<usize>();
+        let mapped_bytes = guard.entries.values().filter_map(|entry| match entry.data.as_ref() {
+            MxFp4StreamData::ArchiveMapped { len, .. } => Some(*len),
+            MxFp4StreamData::Owned(_) => None,
+        }).sum::<usize>();
         drop(guard);
 
         let hits = self.stats.hits.load(Ordering::Relaxed);
@@ -1012,52 +1014,57 @@ impl MxFp4StreamCache {
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
-        let released_bytes = self.release_cold_pages();
-        let mapped_residency = if mapped_bytes_total == 0 {
-            0.0
-        } else {
+        let mapped_residency = if mapped_bytes_total == 0 { 0.0 } else {
             mapped_resident_bytes as f64 / mapped_bytes_total as f64 * 100.0
         };
 
+        // Unlike logical pread counters, /proc/self/io sees storage reads caused
+        // by mmap page faults in Zero-Copy mode. This is process-wide, not model-exclusive.
+        let process_storage_read_mib = self.process_storage_read_bytes_at_start
+            .and_then(|start| process_storage_read_bytes().map(|current| current.saturating_sub(start)))
+            .map(|value| value as f64 / MIB as f64)
+            .unwrap_or(-1.0);
+
         let requests = hits.saturating_add(misses);
-        let hit_rate = if requests == 0 {
-            0.0
-        } else {
-            hits as f64 / requests as f64
-        };
+        let hit_rate = if requests == 0 { 0.0 } else { hits as f64 / requests as f64 };
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, released_now_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
-            entry_count,
-            used_bytes / MIB,
-            self.budget_bytes / MIB,
-            mapped_bytes / MIB,
-            mapped_resident_bytes / MIB,
-            mapped_residency,
-            self.config.cache_per_source,
-            hits,
-            misses,
-            hit_rate * 100.0,
-            reads,
-            bytes / (MIB as u64),
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, advised_dontneed_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            entry_count, used_bytes / MIB, self.budget_bytes / MIB, mapped_bytes / MIB,
+            mapped_resident_bytes / MIB, mapped_residency, self.config.cache_per_source,
+            hits, misses, hit_rate * 100.0, reads, bytes / (MIB as u64), process_storage_read_mib,
             self.stats.io_jobs.load(Ordering::Relaxed),
             self.stats.io_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.io_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            evictions,
-            released_bytes / MIB,
-            self.config.io_threads,
-            self.config.overlap,
-            self.config.zero_copy,
-            self.config.o_direct,
-            self.config.release_cold,
-            self.config.release_idle,
-            self.config.prefault,
+            evictions, released_bytes / MIB, self.config.io_threads, self.config.overlap,
+            self.config.zero_copy, self.config.o_direct, self.config.release_cold,
+            self.config.release_idle, self.config.prefault,
         );
     }
+}
+
+fn release_cold_scan_due(call: u64, release_cold: bool, zero_copy: bool) -> bool {
+    release_cold && zero_copy && call > 0 && call.is_multiple_of(64)
+}
+
+fn parse_process_storage_read_bytes(io_text: &str) -> Option<u64> {
+    io_text.lines()
+        .find_map(|line| line.strip_prefix("read_bytes:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn process_storage_read_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let io_text = std::fs::read_to_string("/proc/self/io").ok()?;
+        parse_process_storage_read_bytes(&io_text)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { None }
 }
 
 fn prefault_mapped(data: &MxFp4StreamData) -> io::Result<()> {
@@ -1376,5 +1383,21 @@ mod tests {
             prefault: true,
         };
         assert_eq!(cfg.cache_budget_bytes(), 2048 * MIB);
+    }
+
+    #[test]
+    fn cold_page_maintenance_is_rate_limited_and_not_logging_gated() {
+        assert!(!release_cold_scan_due(63, true, true));
+        assert!(release_cold_scan_due(64, true, true));
+        assert!(!release_cold_scan_due(64, false, true));
+        assert!(!release_cold_scan_due(64, true, false));
+        assert!(!release_cold_scan_due(0, true, true));
+    }
+
+    #[test]
+    fn parses_process_storage_read_counter() {
+        let sample = "rchar: 1200\nwchar: 100\nsyscr: 12\nsyscw: 3\nread_bytes: 8192\nwrite_bytes: 4096\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_process_storage_read_bytes(sample), Some(8192));
+        assert_eq!(parse_process_storage_read_bytes("rchar: 1\n"), None);
     }
 }

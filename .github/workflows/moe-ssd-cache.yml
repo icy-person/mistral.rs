@@ -1,0 +1,61 @@
+name: MoE SSD cache regression
+
+on:
+  push:
+    branches:
+      - perf/gpt-oss-ssd-cache-ci
+    paths:
+      - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "scripts/bench_moe_io_pressure.py"
+      - ".github/workflows/moe-ssd-cache.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moe-ssd-cache-regression
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: MXFP4 stream-cache unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --package mistralrs-quant -- --check
+      - name: Run stream-cache tests
+        run: cargo test --package mistralrs-quant --lib mxfp4_stream::tests -- --nocapture
+
+  io-pressure:
+    name: Synthetic SSD I/O pressure benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compare repeated reads against bounded expert LRU
+        run: >-
+          python scripts/bench_moe_io_pressure.py
+          --experts 128
+          --expert-kib 64
+          --requests 2048
+          --cache-experts 32
+          --hot-experts 16
+          --hot-probability 0.85
+          --seed 42
+          --output moe-ssd-cache-results.json
+      - name: Upload I/O benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-ssd-cache-results
+          path: moe-ssd-cache-results.json
+          if-no-files-found: error
