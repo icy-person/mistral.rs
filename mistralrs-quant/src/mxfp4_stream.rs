@@ -1077,7 +1077,7 @@ impl MxFp4StreamCache {
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            evictions, promotions, promoted_bytes / MIB, advised_dontneed_bytes / (MIB as u64), self.config.io_threads, self.config.overlap,
+            evictions, promotions, promoted_bytes / (MIB as u64), advised_dontneed_bytes / (MIB as u64), self.config.io_threads, self.config.overlap,
             self.config.zero_copy, self.config.o_direct, self.config.release_cold,
             self.config.release_idle, self.config.prefault,
         );
