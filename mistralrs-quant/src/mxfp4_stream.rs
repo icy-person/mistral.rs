@@ -982,12 +982,19 @@ impl MxFp4StreamCache {
     }
 
     pub(crate) fn log_stats(&self) {
-        if !self.config.stats {
+        // Page reclamation is cache maintenance, not telemetry. It must still
+        // run when --moe-release-cold is enabled without --moe-stats.
+        if !self.config.stats && !self.config.release_cold {
             return;
         }
 
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
         if report != 0 && !report.is_multiple_of(256) {
+            return;
+        }
+
+        let released_bytes = self.release_cold_pages();
+        if !self.config.stats {
             return;
         }
 
@@ -1011,8 +1018,9 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        // Measure after any scheduled MADV_DONTNEED so telemetry reflects the
+        // residency left after cold-page reclamation.
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
-        let released_bytes = self.release_cold_pages();
         let mapped_residency = if mapped_bytes_total == 0 {
             0.0
         } else {
