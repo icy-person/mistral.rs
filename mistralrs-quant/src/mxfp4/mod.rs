@@ -267,7 +267,11 @@ impl MxFp4StreamingExpertLayer {
         expert_idx: usize,
         data: Arc<MxFp4StreamData>,
     ) -> Arc<MxFp4StreamData> {
-        if !self.cache.zero_copy() {
+        // The side table is only a fast path for zero-copy descriptors. Never pin
+        // an owned hot-cache buffer here: LRU eviction must be able to free it.
+        if !self.cache.zero_copy()
+            || !matches!(data.as_ref(), MxFp4StreamData::ArchiveMapped { .. })
+        {
             return data;
         }
         let slot = &self.zero_copy_experts[weight_idx][expert_idx];
@@ -283,10 +287,14 @@ impl MxFp4StreamingExpertLayer {
         key: &MxFp4StreamKey,
         range: MxFp4StreamRange,
     ) -> Result<Arc<MxFp4StreamData>> {
-        if self.cache.zero_copy() {
-            if let Some(data) = self.zero_copy_experts[weight_idx][expert_idx].get() {
-                self.cache.touch(key);
-                return Ok(data.clone());
+        if self.cache.zero_copy()
+            && self.zero_copy_experts[weight_idx][expert_idx].get().is_some()
+        {
+            // A mapped descriptor is cheap, but the cache may have promoted it
+            // to an owned RAM copy. Always use the cache's current entry, and
+            // re-resolve if LRU eviction removed that entry.
+            if let Some(data) = self.cache.touch(key) {
+                return Ok(data);
             }
         }
 

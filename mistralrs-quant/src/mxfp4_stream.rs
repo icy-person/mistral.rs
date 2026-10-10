@@ -21,6 +21,7 @@ use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
+const HOT_PROMOTION_HITS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MxFp4StreamConfig {
@@ -427,6 +428,8 @@ struct Stats {
     io_nanos: AtomicU64,
     io_wait_nanos: AtomicU64,
     evictions: AtomicU64,
+    promotions: AtomicU64,
+    promoted_bytes: AtomicU64,
     prefault_jobs: AtomicU64,
     prefault_nanos: AtomicU64,
     prefault_wait_nanos: AtomicU64,
@@ -440,6 +443,9 @@ struct CacheEntry {
     data: Arc<MxFp4StreamData>,
     bytes: usize,
     last_used: u64,
+    // Hot mapped ranges are copied into the bounded heap cache after repeated use.
+    hits: u16,
+    promotion_claimed: bool,
 }
 
 #[derive(Debug)]
@@ -615,16 +621,42 @@ impl MxFp4StreamCache {
     }
 
     #[inline]
-    pub(crate) fn touch(&self, key: &MxFp4StreamKey) {
-        let Ok(mut guard) = self.inner.lock() else {
-            return;
-        };
-        guard.clock = guard.clock.wrapping_add(1);
-        let now = guard.clock;
-        if let Some(entry) = guard.entries.get_mut(key) {
+    pub(crate) fn touch(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
+        let (current, promote_range) = {
+            let mut guard = self.inner.lock().ok()?;
+            guard.clock = guard.clock.wrapping_add(1);
+            let now = guard.clock;
+            let entry = guard.entries.get_mut(key)?;
             entry.last_used = now;
+            entry.hits = entry.hits.saturating_add(1);
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
+
+            let mapped_range = match entry.data.as_ref() {
+                MxFp4StreamData::ArchiveMapped { shard, offset, len, .. }
+                    if should_promote_mapped(entry.hits, *len, self.budget_bytes, entry.promotion_claimed) =>
+                    Some((*shard, *offset, *len)),
+                _ => None,
+            };
+            if mapped_range.is_some() {
+                // Claim promotion while holding the cache lock to avoid duplicate copies.
+                entry.promotion_claimed = true;
+            }
+            (entry.data.clone(), mapped_range)
+        };
+
+        if let Some((shard, offset, len)) = promote_range {
+            if let Ok(bytes) = self.archive.shard_data_slice(shard, offset, len) {
+                // Keep a bounded anonymous-RAM copy of experts that prove hot so
+                // page-cache eviction doesn't force a later SSD read for the same expert.
+                let owned = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())));
+                self.insert(key.clone(), owned.clone());
+                self.stats.promotions.fetch_add(1, Ordering::Relaxed);
+                self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                return Some(owned);
+            }
         }
+
+        Some(current)
     }
 
     fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
@@ -702,6 +734,8 @@ impl MxFp4StreamCache {
                     data,
                     bytes: len,
                     last_used: now,
+                    hits: 0,
+                    promotion_claimed: false,
                 },
             );
         }
@@ -1013,6 +1047,8 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        let promotions = self.stats.promotions.load(Ordering::Relaxed);
+        let promoted_bytes = self.stats.promoted_bytes.load(Ordering::Relaxed);
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
         let mapped_residency = if mapped_bytes_total == 0 { 0.0 } else {
             mapped_resident_bytes as f64 / mapped_bytes_total as f64 * 100.0
@@ -1030,7 +1066,7 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, advised_dontneed_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, promotions={}, promoted_mib={}, advised_dontneed_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
             entry_count, used_bytes / MIB, self.budget_bytes / MIB, mapped_bytes / MIB,
             mapped_resident_bytes / MIB, mapped_residency, self.config.cache_per_source,
             hits, misses, hit_rate * 100.0, reads, bytes / (MIB as u64), process_storage_read_mib,
@@ -1040,11 +1076,16 @@ impl MxFp4StreamCache {
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            evictions, released_bytes / MIB, self.config.io_threads, self.config.overlap,
+            evictions, promotions, promoted_bytes / MIB, released_bytes / MIB, self.config.io_threads, self.config.overlap,
             self.config.zero_copy, self.config.o_direct, self.config.release_cold,
             self.config.release_idle, self.config.prefault,
         );
     }
+}
+
+fn should_promote_mapped(hits: u16, len: usize, budget_bytes: usize, promotion_claimed: bool) -> bool {
+    !promotion_claimed && hits >= HOT_PROMOTION_HITS && len > 0
+        && budget_bytes > 0 && len <= budget_bytes
 }
 
 fn release_cold_scan_due(call: u64, release_cold: bool, zero_copy: bool) -> bool {
@@ -1399,5 +1440,14 @@ mod tests {
         let sample = "rchar: 1200\nwchar: 100\nsyscr: 12\nsyscw: 3\nread_bytes: 8192\nwrite_bytes: 4096\ncancelled_write_bytes: 0\n";
         assert_eq!(parse_process_storage_read_bytes(sample), Some(8192));
         assert_eq!(parse_process_storage_read_bytes("rchar: 1\n"), None);
+    }
+
+    #[test]
+    fn promotes_only_repeated_mapped_experts_that_fit_the_budget() {
+        assert!(!should_promote_mapped(2, 64, 1024, false));
+        assert!(should_promote_mapped(3, 64, 1024, false));
+        assert!(!should_promote_mapped(3, 64, 0, false));
+        assert!(!should_promote_mapped(3, 2048, 1024, false));
+        assert!(!should_promote_mapped(3, 64, 1024, true));
     }
 }
