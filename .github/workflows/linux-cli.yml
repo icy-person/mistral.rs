@@ -5,6 +5,7 @@ on:
     branches:
       - master
       - linux-cli-only
+      - verify/gpt-oss-final-response
   pull_request:
     branches:
       - master
@@ -108,7 +109,8 @@ jobs:
           grep -q '323' model.stdout
 
       - name: Compare GPT-OSS streaming configurations on the real model
-        if: always()
+        # This diagnostic branch validates user-visible response only; the PR branch keeps full profiles.
+        if: false
         env:
           RUST_LOG: info
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
