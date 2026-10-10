@@ -296,9 +296,9 @@ impl MxFp4StreamingExpertLayer {
 
     #[cfg(target_os = "linux")]
     fn physical_core_count() -> Option<usize> {
-        use std::{collections::HashSet, fs};
+        use std::fs;
 
-        let mut cores = HashSet::new();
+        let mut cores = Vec::new();
         let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") else {
             return None;
         };
@@ -322,9 +322,10 @@ impl MxFp4StreamingExpertLayer {
                 .ok()
                 .and_then(|value| value.trim().parse::<u32>().ok())
                 .unwrap_or(0);
-            cores.insert((package_id, core_id));
+            cores.push((package_id, core_id));
         }
-        (!cores.is_empty()).then_some(cores.len())
+        let count = unique_physical_core_count(cores);
+        (count > 0).then_some(count)
     }
 
     fn unique_physical_core_count(ids: impl IntoIterator<Item = (u32, u32)>) -> usize {
