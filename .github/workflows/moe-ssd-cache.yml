@@ -8,8 +8,14 @@ on:
       - "mistralrs-quant/src/mxfp4_stream.rs"
       - "scripts/bench_moe_io_pressure.py"
       - ".github/workflows/moe-ssd-cache.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "mistralrs-quant/src/mxfp4_stream.rs"
+      - "scripts/bench_moe_io_pressure.py"
+      - ".github/workflows/moe-ssd-cache.yml"
   workflow_dispatch:
-
 permissions:
   contents: read
 
