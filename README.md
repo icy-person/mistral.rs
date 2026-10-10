@@ -195,17 +195,30 @@ expert access can fault the bytes back from GGUF storage.
 
 The CLI uses the same `run`, `serve`, and `bench` commands for model repositories, local directories, and GGUF files.
 
-For MoE performance work, `mistralrs bench` defaults to 256 generated tokens so decode
-measurements are long enough to expose cache churn and storage stalls. Use the same
-`--moe-stream`, `--cache-mb`, `--io-threads`, `--moe-threads`, `--moe-overlap`,
-`--moe-zero-copy`, and `--moe-prefault` controls for repeatable comparisons. Boolean controls
-accept explicit values, so `--moe-zero-copy false` and `--moe-prefault false` provide clean
-baseline runs without changing the benchmark command structure.
+For MoE performance work, pass an explicit `--gen-len 256` (the CLI default is shorter)
+so decode measurements are long enough to expose cache churn and storage stalls. The `bench`
+subcommand accepts the same MoE controls as `run` and `serve`, including `--moe-stream`,
+`--cache-mb`, `--cache-floor-mb`, `--cache-ceil-mb`, `--io-threads`, `--moe-threads`,
+`--moe-overlap`, `--moe-zero-copy`, `--moe-prefault`, `--moe-cache-per-source`,
+`--moe-release-cold`, `--moe-release-idle`, `--moe-fused-route-limit`, and `--moe-stats`.
+Boolean controls accept explicit values with equals syntax: `--moe-zero-copy=false` and
+`--moe-prefault=false` provide clean baseline runs without changing the benchmark command.
 
-For GPT-OSS CPU comparisons, record at least generation length, compute threads, I/O threads,
-cache budget, logical hit rate, physical mmap residency, actual I/O milliseconds, and decode
-tok/s. A 40-token result is useful for smoke testing but should not be treated as a steady-state
-cache benchmark.
+Example for a local GPT-OSS MXFP4 GGUF on a RAM-constrained CPU system (adjust the 768 MiB
+cache to your available memory):
+
+```bash
+mistralrs bench --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \
+  --moe-stream --cache-mb 768 --cache-floor-mb 1024 --cache-ceil-mb 768 \
+  --io-threads 4 --moe-threads physical --moe-overlap \
+  --moe-zero-copy --moe-prefault --moe-stats \
+  --prompt-len 128 --gen-len 256 --depth 128 --iterations 3 --warmup 1
+```
+
+For GPT-OSS CPU comparisons, record the exact GGUF checksum, generation length, CPU thread
+count, I/O thread count, cache budget, logical hit rate, physical mmap residency, actual I/O
+milliseconds, peak RAM, and decode tok/s. Compare cold and warm runs separately. A short smoke
+test establishes that inference works; it is not a steady-state performance benchmark.
 
 - **Auto-detection**: Automatically detects model architecture, quantization format, and chat template
 - **All-in-one**: Single binary for chat, server, benchmarks, and web UI (`run`, `serve`, `bench`)
