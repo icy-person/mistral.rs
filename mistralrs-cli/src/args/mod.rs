@@ -750,7 +750,10 @@ pub struct RuntimeOptions {
         default_value = "4096",
         value_parser = parse_cache_ceil
     )]
-    #[serde(default = "default_moe_cache_ceil_mb")]
+    #[serde(
+        default = "default_moe_cache_ceil_mb",
+        deserialize_with = "deserialize_cache_ceil"
+    )]
     pub moe_cache_ceil_mb: String,
 
     /// Number of parallel expert-read lanes.
@@ -1510,6 +1513,27 @@ fn default_moe_cache_ceil_mb() -> String {
     "4096".to_string()
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CacheCeilingValue {
+    MiB(usize),
+    Text(String),
+}
+
+fn deserialize_cache_ceil<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<CacheCeilingValue>::deserialize(deserializer)?;
+    match value {
+        None => Ok("none".to_string()),
+        Some(CacheCeilingValue::MiB(mib)) => Ok(mib.to_string()),
+        Some(CacheCeilingValue::Text(text)) => {
+            parse_cache_ceil(&text).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 fn parse_moe_bool(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -2087,6 +2111,29 @@ mod tests {
         assert!(runtime.realtime_stats);
         assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
         assert_eq!(runtime.moe_fused_route_limit, Some(8));
+    }
+
+    #[test]
+    fn cache_ceiling_config_preserves_numeric_values_and_accepts_none() {
+        #[derive(Deserialize)]
+        struct TestConfig {
+            #[serde(
+                default = "default_moe_cache_ceil_mb",
+                deserialize_with = "deserialize_cache_ceil"
+            )]
+            cache: String,
+        }
+
+        let numeric: TestConfig = serde_json::from_value(serde_json::json!({"cache": 768})).unwrap();
+        assert_eq!(numeric.cache, "768");
+        let string: TestConfig =
+            serde_json::from_value(serde_json::json!({"cache": "1024"})).unwrap();
+        assert_eq!(string.cache, "1024");
+        let none: TestConfig = serde_json::from_value(serde_json::json!({"cache": null})).unwrap();
+        assert_eq!(none.cache, "none");
+        let missing: TestConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(missing.cache, "4096");
+        assert!(parse_cache_ceil("invalid").is_err());
     }
 
     #[test]
