@@ -1516,7 +1516,7 @@ fn default_moe_cache_ceil_mb() -> String {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum CacheCeilingValue {
-    MiB(usize),
+    Mib(usize),
     Text(String),
 }
 
@@ -1527,7 +1527,7 @@ where
     let value = Option::<CacheCeilingValue>::deserialize(deserializer)?;
     match value {
         None => Ok("none".to_string()),
-        Some(CacheCeilingValue::MiB(mib)) => Ok(mib.to_string()),
+        Some(CacheCeilingValue::Mib(mib)) => Ok(mib.to_string()),
         Some(CacheCeilingValue::Text(text)) => {
             parse_cache_ceil(&text).map_err(serde::de::Error::custom)
         }
