@@ -324,7 +324,7 @@ impl MxFp4StreamingExpertLayer {
                 .unwrap_or(0);
             cores.push((package_id, core_id));
         }
-        let count = unique_physical_core_count(cores);
+        let count = Self::unique_physical_core_count(cores);
         (count > 0).then_some(count)
     }
 
