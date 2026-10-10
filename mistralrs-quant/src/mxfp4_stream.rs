@@ -1254,6 +1254,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_v2_budget_uses_tighter_ancestor_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "mistralrs-cgroup-budget-{}",
+            std::process::id()
+        ));
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        std::fs::write(root.join("memory.max"), "1024\\n").unwrap();
+        std::fs::write(root.join("memory.current"), "800\\n").unwrap();
+        std::fs::write(child.join("memory.max"), "2048\\n").unwrap();
+        std::fs::write(child.join("memory.current"), "1024\\n").unwrap();
+
+        assert_eq!(
+            cgroup_path_available_bytes(
+                &root,
+                "/child",
+                "memory.max",
+                "memory.current",
+                CgroupMemoryVersion::V2,
+            ),
+            Some(224)
+        );
+        assert!(cgroup_path_available_bytes(
+            &root,
+            "../child",
+            "memory.max",
+            "memory.current",
+            CgroupMemoryVersion::V2,
+        )
+        .is_none());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cgroup_v1_unlimited_sentinel_is_ignored() {
         assert_eq!(
