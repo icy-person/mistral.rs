@@ -308,12 +308,28 @@ impl MxFp4StreamingExpertLayer {
             if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
-            let path = entry.path().join("topology/core_id");
-            if let Ok(core_id) = fs::read_to_string(path) {
-                cores.insert(core_id.trim().to_string());
-            }
+            let topology = entry.path().join("topology");
+            let Some(core_id) = fs::read_to_string(topology.join("core_id"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // Core ids commonly repeat across CPU packages. Deduplicate by
+            // (package, core), not by core_id alone, or multi-socket machines
+            // will undercount physical cores and underutilize the fused kernel.
+            let package_id = fs::read_to_string(topology.join("physical_package_id"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            cores.insert((package_id, core_id));
         }
         (!cores.is_empty()).then_some(cores.len())
+    }
+
+    fn unique_physical_core_count(ids: impl IntoIterator<Item = (u32, u32)>) -> usize {
+        use std::collections::HashSet;
+        ids.into_iter().collect::<HashSet<_>>().len()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3654,6 +3670,16 @@ impl QuantizedSerde for MXFP4Layer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn physical_core_count_keeps_package_identity() {
+        // SMT siblings share both ids; the same core_id in another package
+        // must count as a distinct physical core.
+        assert_eq!(
+            unique_physical_core_count([(0, 0), (0, 0), (0, 1), (1, 0)]),
+            3
+        );
+    }
+
     #[test]
     fn cpu_device_support_is_enabled() {
         assert!(MXFP4Layer::device_supported(&Device::Cpu));
