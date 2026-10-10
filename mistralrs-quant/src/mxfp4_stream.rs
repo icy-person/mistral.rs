@@ -430,6 +430,7 @@ struct Stats {
     evictions: AtomicU64,
     promotions: AtomicU64,
     promoted_bytes: AtomicU64,
+    advised_dontneed_bytes: AtomicU64,
     prefault_jobs: AtomicU64,
     prefault_nanos: AtomicU64,
     prefault_wait_nanos: AtomicU64,
@@ -611,13 +612,9 @@ impl MxFp4StreamCache {
 
     #[inline]
     fn lookup(&self, key: &MxFp4StreamKey) -> Option<Arc<MxFp4StreamData>> {
-        let mut guard = self.inner.lock().ok()?;
-        guard.clock = guard.clock.wrapping_add(1);
-        let now = guard.clock;
-        let entry = guard.entries.get_mut(key)?;
-        entry.last_used = now;
-        self.stats.hits.fetch_add(1, Ordering::Relaxed);
-        Some(entry.data.clone())
+        // Share the hot-promotion path with the explicit fast-path touch. The
+        // overlap/prefetch path uses lookup(), so promotion must happen here too.
+        self.touch(key)
     }
 
     #[inline]
@@ -1027,6 +1024,9 @@ impl MxFp4StreamCache {
             let call = self.stats.maintenance_calls.fetch_add(1, Ordering::Relaxed).saturating_add(1);
             if release_cold_scan_due(call, true, true) { self.release_cold_pages() } else { 0 }
         } else { 0 };
+        if released_bytes > 0 {
+            self.stats.advised_dontneed_bytes.fetch_add(released_bytes as u64, Ordering::Relaxed);
+        }
 
         if !self.config.stats { return; }
 
@@ -1049,6 +1049,7 @@ impl MxFp4StreamCache {
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
         let promotions = self.stats.promotions.load(Ordering::Relaxed);
         let promoted_bytes = self.stats.promoted_bytes.load(Ordering::Relaxed);
+        let advised_dontneed_bytes = self.stats.advised_dontneed_bytes.load(Ordering::Relaxed);
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
         let mapped_residency = if mapped_bytes_total == 0 { 0.0 } else {
             mapped_resident_bytes as f64 / mapped_bytes_total as f64 * 100.0
@@ -1066,7 +1067,7 @@ impl MxFp4StreamCache {
 
         tracing::info!(
             target: "mistralrs_moe_stream",
-            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, promotions={}, promoted_mib={}, advised_dontneed_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
+            "GPT-OSS MXFP4 stream cache: entries={}, used_mib={}, budget_mib={}, mapped_mib={}, mapped_resident_mib={}, mapped_residency={:.1}%, per_source={}, hits={}, misses={}, hit_rate={:.1}%, reads={}, read_mib={}, process_storage_read_mib={:.1}, io_jobs={}, io_ms={}, io_wait_ms={}, prefault_jobs={}, prefault_ms={}, prefault_wait_ms={}, evictions={}, promotions={}, promoted_mib={}, advised_dontneed_total_mib={}, io_threads={}, overlap={}, zero_copy={}, o_direct={}, release_cold={}, release_idle={}, prefault={}",
             entry_count, used_bytes / MIB, self.budget_bytes / MIB, mapped_bytes / MIB,
             mapped_resident_bytes / MIB, mapped_residency, self.config.cache_per_source,
             hits, misses, hit_rate * 100.0, reads, bytes / (MIB as u64), process_storage_read_mib,
@@ -1076,7 +1077,7 @@ impl MxFp4StreamCache {
             self.stats.prefault_jobs.load(Ordering::Relaxed),
             self.stats.prefault_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.stats.prefault_wait_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            evictions, promotions, promoted_bytes / MIB, released_bytes / MIB, self.config.io_threads, self.config.overlap,
+            evictions, promotions, promoted_bytes / MIB, advised_dontneed_bytes / (MIB as u64), self.config.io_threads, self.config.overlap,
             self.config.zero_copy, self.config.o_direct, self.config.release_cold,
             self.config.release_idle, self.config.prefault,
         );
