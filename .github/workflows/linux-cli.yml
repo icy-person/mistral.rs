@@ -95,14 +95,26 @@ jobs:
           echo "===== GPT-OSS MODEL STDERR ====="
           cat model.stderr
           echo "===== END GPT-OSS MODEL LOGS ====="
-          # The generated text should be distinct from the telemetry summary.
-          # Keep this check model-agnostic instead of matching a literal answer.
-          test -s model.stdout
-          grep -Eiv '^(Stats:|Prompt:|Decode:|Prefix cache:|Sampling:|[[:space:]]*$)' model.stdout | grep -q .
-          grep -q '323' model.stdout
+          # Require the expected answer in final visible text, not in GPT-OSS reasoning.
+          # The CLI wraps reasoning in ANSI gray/reset markers and prints stats after "Stats:".
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          output = Path("model.stdout").read_text(errors="replace")
+          output = re.sub(r"\x1b\[90m.*?\x1b\[0m", "", output, flags=re.S)
+          output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+          answer = output.split("Stats:", 1)[0].strip()
+          print("===== FINAL VISIBLE ANSWER =====")
+          print(answer or "<EMPTY>")
+          if not re.search(r"(?<!\d)323(?!\d)", answer):
+              print("ERROR: model did not emit the expected final answer '323'", file=sys.stderr)
+              sys.exit(1)
+          PY
 
       - name: Compare GPT-OSS streaming configurations on the real model
-        if: always()
+        if: steps.model-smoke.outcome == 'success'
         env:
           RUST_LOG: info
           MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
