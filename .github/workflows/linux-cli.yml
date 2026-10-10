@@ -28,8 +28,9 @@ env:
 
 jobs:
   build-linux-cli:
-    name: Linux x86_64 CLI
+    name: Linux x86_64 CLI and GPT-OSS model benchmark
     runs-on: ubuntu-22.04
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -80,7 +81,7 @@ jobs:
             --cache-ceil-mb 1024 \
             --io-threads 4 \
             --reasoning-effort low \
-            --max-tokens 2048 \
+            --max-tokens 64 \
             -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
           echo "===== GPT-OSS MODEL RESPONSE ====="
@@ -88,6 +89,34 @@ jobs:
           echo "===== END GPT-OSS MODEL RESPONSE ====="
           test -s model.stdout
           grep -q "323" model.stdout
+
+      - name: Compare GPT-OSS streaming configurations on the real model
+        env:
+          RUST_LOG: info
+          MISTRALRS_MOE_FUSED_ROUTE_LIMIT: "16"
+        run: |
+          MISTRALRS_BIN="$PWD/target/release/mistralrs" \
+            CONTEXT=512 \
+            PROMPT_LEN=32 \
+            GEN_LEN=32 \
+            DEPTH=32 \
+            ITERATIONS=1 \
+            WARMUP=0 \
+            CACHE_MB=512 \
+            CACHE_FLOOR_MB=512 \
+            CACHE_CEIL_MB=512 \
+            bash scripts/bench_moe_stream.sh \
+              "$PWD/gpt-oss-20b-MXFP4.gguf" \
+              "$PWD/gpt-oss-moe-benchmark"
+
+      - name: Upload GPT-OSS benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpt-oss-20b-real-model-benchmark
+          path: gpt-oss-moe-benchmark/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Package CLI
         run: |
