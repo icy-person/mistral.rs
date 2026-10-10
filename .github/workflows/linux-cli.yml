@@ -84,9 +84,9 @@ jobs:
             --cache-floor-mb 1024 \
             --cache-ceil-mb 1024 \
             --io-threads 4 \
-            --thinking false \
-            --max-tokens 64 \
-            -i "Say hello in one short sentence." \
+            --reasoning-effort low \
+            --max-tokens 2048 \
+            -i "Reply with exactly this number and nothing else: 323" \
             2>model.stderr | tee model.stdout
           mkdir -p gpt-oss-moe-benchmark
           cp model.stdout model.stderr gpt-oss-moe-benchmark/
@@ -99,6 +99,7 @@ jobs:
           # Keep this check model-agnostic instead of matching a literal answer.
           test -s model.stdout
           grep -Eiv '^(Stats:|Prompt:|Decode:|Prefix cache:|Sampling:|[[:space:]]*$)' model.stdout | grep -q .
+          grep -q '323' model.stdout
 
       - name: Compare GPT-OSS streaming configurations on the real model
         if: always()
