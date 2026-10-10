@@ -71,6 +71,17 @@ impl MxFp4StreamConfig {
             Err(_) => defaults.cache_ceil_mb,
         };
 
+        // Edge0-inspired RAM cache mode: retain actual expert bytes in the bounded
+        // LRU and prefer direct reads so Linux's page cache does not duplicate the
+        // same working set. Direct I/O falls back to buffered reads if unavailable.
+        let ram_cache = env_bool("MISTRALRS_MOE_RAM_CACHE", false);
+        let (zero_copy, o_direct, prefault) = resolve_ram_cache_io(
+            ram_cache,
+            env_bool("MISTRALRS_MOE_ZERO_COPY", defaults.zero_copy),
+            env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
+            env_bool("MISTRALRS_MOE_PREFAULT", defaults.prefault),
+        );
+
         Self {
             cache_mb,
             cache_floor_mb,
@@ -80,14 +91,14 @@ impl MxFp4StreamConfig {
                 defaults.cache_per_source,
             )
             .min(128),
-            zero_copy: env_bool("MISTRALRS_MOE_ZERO_COPY", defaults.zero_copy),
+            zero_copy,
             io_threads: env_usize("MISTRALRS_MOE_IO_THREADS", defaults.io_threads).clamp(1, 32),
             overlap: env_bool("MISTRALRS_MOE_OVERLAP", defaults.overlap),
-            o_direct: env_bool("MISTRALRS_MOE_O_DIRECT", defaults.o_direct),
+            o_direct,
             stats: env_bool("MISTRALRS_MOE_STATS", defaults.stats),
             release_cold: env_bool("MISTRALRS_MOE_RELEASE_COLD", defaults.release_cold),
             release_idle: env_u64("MISTRALRS_MOE_RELEASE_IDLE", defaults.release_idle).max(256),
-            prefault: env_bool("MISTRALRS_MOE_PREFAULT", defaults.prefault),
+            prefault,
         }
     }
 
@@ -101,6 +112,21 @@ impl MxFp4StreamConfig {
         self.cache_ceil_mb
             .map_or(mb, |cap| mb.min(cap))
             .saturating_mul(MIB)
+    }
+}
+
+fn resolve_ram_cache_io(
+    ram_cache: bool,
+    zero_copy: bool,
+    o_direct: bool,
+    prefault: bool,
+) -> (bool, bool, bool) {
+    if ram_cache {
+        // O_DIRECT is Linux-specific. Other platforms still get the owned LRU
+        // with their normal buffered reads.
+        (false, cfg!(target_os = "linux"), false)
+    } else {
+        (zero_copy, o_direct, prefault)
     }
 }
 
@@ -447,6 +473,22 @@ struct CacheInner {
     clock: u64,
 }
 
+// Like Edge0's lease-aware HotStack, only evict entries whose bytes are not
+// currently borrowed by an in-flight expert computation.
+fn oldest_unleased_key(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    source: Option<&str>,
+) -> Option<MxFp4StreamKey> {
+    entries
+        .iter()
+        .filter(|(key, entry)| {
+            source.map_or(true, |wanted| key.source.as_ref() == wanted)
+                && Arc::strong_count(&entry.data) == 1
+        })
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, _)| key.clone())
+}
+
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
@@ -635,52 +677,45 @@ impl MxFp4StreamCache {
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
 
-        if let Some(old) = guard.entries.remove(&key) {
-            guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+        // Concurrent prefetches can race on the same key. Preserve the resident
+        // entry rather than replacing it and under-counting an older live buffer.
+        if let Some(existing) = guard.entries.get_mut(&key) {
+            existing.last_used = now;
+            return;
         }
 
-        // ArchiveMapped entries are just tiny descriptors pointing at the
-        // existing GGUF mmap, so they consume no heap-cache budget. Do not
-        // evict them by the per-source quota: keeping the full routed-expert
-        // working set avoids repeated cache misses and repeated page advice.
+        // ArchiveMapped entries are only descriptors and stay outside the
+        // heap-byte budget. Owned entries contain the actual RAM-resident bytes.
         let heap_backed = len != 0;
 
         if heap_backed {
-            let source = key.source.clone();
-            while self.config.cache_per_source > 0
-                && guard
+            let source = key.source.as_ref();
+            if self.config.cache_per_source > 0 {
+                while guard
                     .entries
                     .iter()
-                    .filter(|(entry_key, _)| entry_key.source == source)
+                    .filter(|(entry_key, _)| entry_key.source.as_ref() == source)
                     .count()
                     >= self.config.cache_per_source
-            {
-                let Some(victim) = guard
-                    .entries
-                    .iter()
-                    .filter(|(entry_key, _)| entry_key.source == source)
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(entry_key, _)| entry_key.clone())
-                else {
-                    break;
-                };
-
-                if let Some(old) = guard.entries.remove(&victim) {
-                    guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
-                    self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                {
+                    let Some(victim) = oldest_unleased_key(&guard.entries, Some(source)) else {
+                        // All entries for this source are leased. Do not exceed the
+                        // per-source limit just to retain one more copy.
+                        return;
+                    };
+                    if let Some(old) = guard.entries.remove(&victim) {
+                        guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                        self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
             while guard.used_bytes.saturating_add(len) > self.budget_bytes {
-                let Some(victim) = guard
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(entry_key, _)| entry_key.clone())
-                else {
-                    break;
+                let Some(victim) = oldest_unleased_key(&guard.entries, None) else {
+                    // All candidates are actively used. Serve this call with its
+                    // returned Arc, then drop it instead of exceeding the cache budget.
+                    return;
                 };
-
                 if let Some(old) = guard.entries.remove(&victim) {
                     guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -701,7 +736,6 @@ impl MxFp4StreamCache {
             );
         }
     }
-
     #[inline]
     fn mapped_range(&self, range: MxFp4StreamRange) -> Option<Arc<MxFp4StreamData>> {
         if !self.config.zero_copy || self.config.o_direct {
@@ -982,12 +1016,19 @@ impl MxFp4StreamCache {
     }
 
     pub(crate) fn log_stats(&self) {
-        if !self.config.stats {
+        // Page reclamation is cache maintenance, not telemetry. It must still
+        // run when --moe-release-cold is enabled without --moe-stats.
+        if !self.config.stats && !self.config.release_cold {
             return;
         }
 
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
         if report != 0 && !report.is_multiple_of(256) {
+            return;
+        }
+
+        let released_bytes = self.release_cold_pages();
+        if !self.config.stats {
             return;
         }
 
@@ -1011,8 +1052,9 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        // Measure after any scheduled MADV_DONTNEED so telemetry reflects the
+        // residency left after cold-page reclamation.
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
-        let released_bytes = self.release_cold_pages();
         let mapped_residency = if mapped_bytes_total == 0 {
             0.0
         } else {
@@ -1337,6 +1379,58 @@ mod tests {
     fn prefault_owned_buffer_is_safe() {
         let data = MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![1u8; 8193]));
         assert!(prefault_mapped(&data).is_ok());
+    }
+
+    #[test]
+    fn ram_cache_profile_uses_owned_buffers_and_direct_io() {
+        assert_eq!(
+            resolve_ram_cache_io(true, true, false, true),
+            (false, cfg!(target_os = "linux"), false)
+        );
+        assert_eq!(
+            resolve_ram_cache_io(false, true, false, true),
+            (true, false, true)
+        );
+    }
+
+    #[test]
+    fn lru_skips_entries_with_active_leases() {
+        let cold_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 1,
+        };
+        let leased_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 2,
+        };
+        let mut entries = HashMap::new();
+
+        let cold_data = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![1u8; 8])));
+        entries.insert(
+            cold_key.clone(),
+            CacheEntry {
+                data: cold_data.clone(),
+                bytes: 8,
+                last_used: 1,
+            },
+        );
+        drop(cold_data);
+
+        let leased_data = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![2u8; 8])));
+        entries.insert(
+            leased_key.clone(),
+            CacheEntry {
+                data: leased_data.clone(),
+                bytes: 8,
+                last_used: 0,
+            },
+        );
+        let active_lease = leased_data.clone();
+        drop(leased_data);
+
+        assert_eq!(oldest_unleased_key(&entries, None), Some(cold_key));
+        drop(active_lease);
+        assert_eq!(oldest_unleased_key(&entries, None), Some(leased_key));
     }
 
     #[test]
