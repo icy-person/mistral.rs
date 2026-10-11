@@ -809,10 +809,9 @@ impl MxFp4StreamCache {
             return Ok(None);
         }
 
-        // A rendezvous reply channel prevents prefault workers from touching
-        // an unbounded number of mmap pages ahead of the consumer. The worker
-        // can advance as soon as resolve() takes the current result.
-        let (reply, rx) = mpsc::sync_channel(0);
+        // Permit one completed prefault to queue while the consumer computes.
+        // Each worker remains bounded to one buffered result plus its active job.
+        let (reply, rx) = mpsc::sync_channel(1);
         let worker = self
             .next_prefault_queue
             .fetch_add(1, Ordering::Relaxed)
@@ -847,10 +846,10 @@ impl MxFp4StreamCache {
             ));
         }
 
-        // Bound live read buffers by the number of I/O workers. With capacity
-        // zero, a worker cannot read and retain every queued expert result while
-        // the caller is still scheduling a layer's prefetch batch.
-        let (tx, rx) = mpsc::sync_channel(0);
+        // One buffered result lets a worker issue the next read while compute
+        // consumes the prior expert. Memory stays bounded to at most two expert
+        // results per worker (one buffered and one active send/read).
+        let (tx, rx) = mpsc::sync_channel(1);
         let worker = self.next_queue.fetch_add(1, Ordering::Relaxed) % self.queues.len();
 
         self.queues[worker]
