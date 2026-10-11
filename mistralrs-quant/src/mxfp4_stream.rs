@@ -520,6 +520,20 @@ fn oldest_unleased_heap_key(
         .map(|(key, _)| key.clone())
 }
 
+fn reclaimable_heap_bytes(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    exclude: Option<&MxFp4StreamKey>,
+) -> usize {
+    entries
+        .iter()
+        .filter(|(key, entry)| {
+            entry.bytes > 0
+                && exclude.map_or(true, |excluded| *key != excluded)
+                && Arc::strong_count(&entry.data) == 1
+        })
+        .fold(0usize, |sum, (_, entry)| sum.saturating_add(entry.bytes))
+}
+
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
@@ -744,11 +758,20 @@ impl MxFp4StreamCache {
             return false;
         };
 
+        // Decide whether promotion can fit before evicting anything. Otherwise a
+        // partially reclaimable cache would lose useful hot entries even though the
+        // promotion itself must be abandoned because remaining buffers are leased.
+        let needed_bytes = guard
+            .used_bytes
+            .saturating_add(len)
+            .saturating_sub(self.budget_bytes);
+        if reclaimable_heap_bytes(&guard.entries, Some(key)) < needed_bytes {
+            return false;
+        }
+
         while guard.used_bytes.saturating_add(len) > self.budget_bytes {
-            let Some(victim) = oldest_unleased_heap_key(&guard.entries, Some(key)) else {
-                // Keep the current mmap entry rather than exceeding the configured RAM cap.
-                return false;
-            };
+            let victim = oldest_unleased_heap_key(&guard.entries, Some(key))
+                .expect("reclaimable byte preflight guarantees an evictable heap entry");
             if let Some(old) = guard.entries.remove(&victim) {
                 guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1623,6 +1646,49 @@ mod tests {
         );
 
         assert_eq!(oldest_unleased_heap_key(&entries, None), Some(heap_key));
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 8);
+        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 0);
+    }
+
+    #[test]
+    fn failed_promotion_preflight_preserves_cache_contents() {
+        let heap_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 2,
+        };
+        let leased_key = MxFp4StreamKey {
+            source: Arc::<str>::from("up"),
+            expert_index: 3,
+        };
+        let mut entries = HashMap::new();
+        entries.insert(
+            heap_key.clone(),
+            CacheEntry {
+                data: Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![1u8; 4]))),
+                bytes: 4,
+                last_used: 1,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+        let leased = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![2u8; 4])));
+        entries.insert(
+            leased_key,
+            CacheEntry {
+                data: leased.clone(),
+                bytes: 4,
+                last_used: 0,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 4);
+        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 4);
+        // Keep the leased Arc alive to represent an in-flight expert consumer.
+        drop(leased);
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 4);
     }
 
     #[test]
