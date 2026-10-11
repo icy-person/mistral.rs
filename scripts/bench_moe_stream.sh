@@ -147,6 +147,14 @@ run_case low-residency "$CACHE_MB" \
   --moe-release-idle 1024 \
   --moe-threads physical
 
+# Exercise the bounded owned-RAM cache with O_DIRECT reads. This profile forces
+# buffered mmap off and lets the real-model benchmark compare token rate and
+# process storage-read telemetry against the mapped/page-cache profiles.
+MISTRALRS_MOE_RAM_CACHE=true run_case ram-cache-direct-io "$CACHE_MB" \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-threads physical
+
 echo
 echo "Benchmark logs saved to: $OUT_DIR"
 echo "Compare decode tok/s, TTFT/TPOT, peak RAM, cache hit rate, physical mmap residency and I/O wait."
