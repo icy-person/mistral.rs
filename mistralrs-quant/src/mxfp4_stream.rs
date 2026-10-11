@@ -758,16 +758,12 @@ impl MxFp4StreamCache {
         guard.clock = guard.clock.wrapping_add(1);
         let now = guard.clock;
         guard.used_bytes = guard.used_bytes.saturating_sub(old_bytes).saturating_add(len);
-        let Some(entry) = guard.entries.get_mut(key) else {
-            // This cannot normally happen while holding the mutex, but keep accounting safe.
-            guard.used_bytes = guard.used_bytes.saturating_sub(len);
-            return false;
-        };
-        if !matches!(entry.data.as_ref(), MxFp4StreamData::ArchiveMapped { .. }) {
-            guard.used_bytes = guard.used_bytes.saturating_sub(len);
-            guard.used_bytes = guard.used_bytes.saturating_add(old_bytes);
-            return false;
-        }
+        // The cache mutex has remained locked since the descriptor was validated above,
+        // so this entry cannot be removed or replaced between validation and mutation.
+        let entry = guard
+            .entries
+            .get_mut(key)
+            .expect("validated mapped cache entry must remain present under lock");
         entry.data = data;
         entry.bytes = len;
         entry.last_used = now;
