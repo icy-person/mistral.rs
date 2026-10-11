@@ -729,20 +729,42 @@ impl MxFp4StreamCache {
         };
 
         if let Some((shard, offset, len)) = promote_range {
-            if let Ok(bytes) = self.archive.shard_data_slice(shard, offset, len) {
-                // Copy a repeatedly used mmap range into the bounded heap cache.
-                // insert() intentionally leaves duplicate keys untouched, so promotion
-                // must replace the existing descriptor and account for its RAM bytes.
-                let owned = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())));
-                if self.replace_mapped_with_owned(key, owned.clone()) {
-                    self.stats.promotions.fetch_add(1, Ordering::Relaxed);
-                    self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                    return Some(owned);
-                }
+            let promoted = self
+                .archive
+                .shard_data_slice(shard, offset, len)
+                .ok()
+                .map(|bytes| {
+                    // Copy a repeatedly used mmap range into the bounded heap cache.
+                    // insert() leaves duplicate keys untouched, so promotion must replace
+                    // the descriptor and account for its actual RAM bytes.
+                    Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())))
+                })
+                .filter(|owned| self.replace_mapped_with_owned(key, owned.clone()));
+
+            if let Some(owned) = promoted {
+                self.stats.promotions.fetch_add(1, Ordering::Relaxed);
+                self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                return Some(owned);
             }
+
+            // Do not permanently disable promotion when the cache was temporarily full
+            // or the mapped slice could not be read. A later access can retry after LRU
+            // entries become evictable.
+            self.reset_promotion_claim(key);
         }
 
         Some(current)
+    }
+
+    fn reset_promotion_claim(&self, key: &MxFp4StreamKey) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = guard.entries.get_mut(key) {
+            if matches!(entry.data.as_ref(), MxFp4StreamData::ArchiveMapped { .. }) {
+                entry.promotion_claimed = false;
+            }
+        }
     }
 
     fn replace_mapped_with_owned(
