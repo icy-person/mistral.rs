@@ -807,6 +807,11 @@ pub struct RuntimeOptions {
     #[serde(default)]
     pub moe_stats: bool,
 
+    /// Use a byte-bounded RAM cache for hot MXFP4 experts and bypass the duplicate Linux page cache when possible.
+    #[arg(long = "moe-ram-cache", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = false, env = "MISTRALRS_MOE_RAM_CACHE", value_parser = parse_moe_bool)]
+    #[serde(default)]
+    pub moe_ram_cache: bool,
+
     /// Keep mmap-backed expert weights instead of copying routed weights into heap buffers.
     #[arg(long = "moe-zero-copy", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_ZERO_COPY", value_parser = parse_moe_bool)]
     #[serde(default = "default_moe_zero_copy")]
@@ -1092,6 +1097,10 @@ pub struct BenchRuntimeOptions {
     )]
     pub moe_stats: bool,
 
+    /// Use a byte-bounded RAM cache for hot MXFP4 experts and bypass the duplicate Linux page cache when possible.
+    #[arg(long = "moe-ram-cache", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = false, env = "MISTRALRS_MOE_RAM_CACHE", value_parser = parse_moe_bool)]
+    pub moe_ram_cache: bool,
+
     /// Keep mmap-backed expert weights rather than copying routed weights into heap buffers.
     #[arg(long = "moe-zero-copy", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = true, env = "MISTRALRS_MOE_ZERO_COPY", value_parser = parse_moe_bool)]
     pub moe_zero_copy: bool,
@@ -1169,6 +1178,7 @@ impl Default for BenchRuntimeOptions {
             moe_overlap: false,
             moe_o_direct: false,
             moe_stats: false,
+            moe_ram_cache: false,
             moe_zero_copy: true,
             moe_prefault: true,
             moe_cache_per_source: 0,
@@ -1198,6 +1208,7 @@ impl BenchRuntimeOptions {
             self.moe_overlap,
             self.moe_o_direct,
             self.moe_stats,
+            self.moe_ram_cache,
             self.moe_zero_copy,
             self.moe_prefault,
             self.moe_cache_per_source,
@@ -1292,6 +1303,7 @@ impl RuntimeOptions {
             self.moe_overlap,
             self.moe_o_direct,
             self.moe_stats,
+            self.moe_ram_cache,
             self.moe_zero_copy,
             self.moe_prefault,
             self.moe_cache_per_source,
@@ -1400,6 +1412,7 @@ impl Default for RuntimeOptions {
             moe_overlap: false,
             moe_o_direct: false,
             moe_stats: false,
+            moe_ram_cache: false,
             moe_zero_copy: true,
             moe_prefault: true,
             moe_cache_per_source: 0,
@@ -1460,6 +1473,7 @@ fn apply_moe_stream_env(
     overlap: bool,
     o_direct: bool,
     stats: bool,
+    ram_cache: bool,
     zero_copy: bool,
     prefault: bool,
     cache_per_source: usize,
@@ -1482,6 +1496,7 @@ fn apply_moe_stream_env(
     set_bool("MISTRALRS_MOE_OVERLAP", overlap);
     set_bool("MISTRALRS_MOE_O_DIRECT", o_direct);
     set_bool("MISTRALRS_MOE_STATS", stats);
+    set_bool("MISTRALRS_MOE_RAM_CACHE", ram_cache);
     set_bool("MISTRALRS_MOE_ZERO_COPY", zero_copy);
     set_bool("MISTRALRS_MOE_PREFAULT", prefault);
     std::env::set_var("MISTRALRS_MOE_CACHE_PER_SOURCE", cache_per_source.min(128).to_string());
