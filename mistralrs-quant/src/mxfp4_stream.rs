@@ -534,6 +534,14 @@ fn reclaimable_heap_bytes(
         .fold(0usize, |sum, (_, entry)| sum.saturating_add(entry.bytes))
 }
 
+fn can_reclaim_heap_bytes(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    exclude: Option<&MxFp4StreamKey>,
+    needed: usize,
+) -> bool {
+    reclaimable_heap_bytes(entries, exclude) >= needed
+}
+
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
@@ -765,7 +773,7 @@ impl MxFp4StreamCache {
             .used_bytes
             .saturating_add(len)
             .saturating_sub(self.budget_bytes);
-        if reclaimable_heap_bytes(&guard.entries, Some(key)) < needed_bytes {
+        if !can_reclaim_heap_bytes(&guard.entries, Some(key), needed_bytes) {
             return false;
         }
 
@@ -1685,10 +1693,12 @@ mod tests {
             },
         );
         assert_eq!(reclaimable_heap_bytes(&entries, None), 4);
-        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 4);
-        // Keep the leased Arc alive to represent an in-flight expert consumer.
+        // Excluding the only unleased item leaves no reclaimable bytes.
+        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 0);
+        assert!(!can_reclaim_heap_bytes(&entries, None, 5));
         drop(leased);
-        assert_eq!(reclaimable_heap_bytes(&entries, None), 4);
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 8);
+        assert!(can_reclaim_heap_bytes(&entries, None, 5));
     }
 
     #[test]
