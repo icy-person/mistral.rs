@@ -1169,6 +1169,9 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        let promotions = self.stats.promotions.load(Ordering::Relaxed);
+        let promoted_bytes = self.stats.promoted_bytes.load(Ordering::Relaxed);
+        let advised_dontneed_bytes = self.stats.advised_dontneed_bytes.load(Ordering::Relaxed);
         // Measure after any scheduled MADV_DONTNEED so telemetry reflects the
         // residency left after cold-page reclamation.
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
