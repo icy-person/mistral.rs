@@ -1076,13 +1076,21 @@ impl MxFp4StreamCache {
             return;
         }
 
-        if !self.config.stats { return; }
+        // Check cold mappings on a bounded cadence independently of logging.
+        // log_stats() is reached from the model path, so this also runs when
+        // telemetry is disabled and does not scan the cache on every layer.
+        let maintenance_call = self.stats.maintenance_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if release_cold_scan_due(maintenance_call, self.config.release_cold, self.zero_copy()) {
+            let released_bytes = self.release_cold_pages() as u64;
+            self.stats.advised_dontneed_bytes.fetch_add(released_bytes, Ordering::Relaxed);
+        }
+
+        if !self.config.stats {
+            return;
+        }
 
         let report = self.stats.report_calls.fetch_add(1, Ordering::Relaxed);
-        if report != 0 && !report.is_multiple_of(256) { return; }
-
-        let released_bytes = self.release_cold_pages();
-        if !self.config.stats {
+        if report != 0 && !report.is_multiple_of(256) {
             return;
         }
 
@@ -1102,6 +1110,9 @@ impl MxFp4StreamCache {
         let reads = self.stats.reads.load(Ordering::Relaxed);
         let bytes = self.stats.bytes_read.load(Ordering::Relaxed);
         let evictions = self.stats.evictions.load(Ordering::Relaxed);
+        let promotions = self.stats.promotions.load(Ordering::Relaxed);
+        let promoted_bytes = self.stats.promoted_bytes.load(Ordering::Relaxed);
+        let advised_dontneed_bytes = self.stats.advised_dontneed_bytes.load(Ordering::Relaxed);
         // Measure after any scheduled MADV_DONTNEED so telemetry reflects the
         // residency left after cold-page reclamation.
         let (mapped_resident_bytes, mapped_bytes_total) = self.mapped_residency();
