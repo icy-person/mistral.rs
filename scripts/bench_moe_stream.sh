@@ -138,6 +138,12 @@ run_case tuned-overlap-cache-1024 1024 \
   --moe-prefault \
   --moe-threads physical
 
+run_case tuned-ram-cache "$CACHE_MB" \
+  --io-threads 4 \
+  --moe-overlap \
+  --moe-ram-cache \
+  --moe-threads physical
+
 run_case low-residency "$CACHE_MB" \
   --io-threads 2 \
   --moe-overlap \
