@@ -2199,6 +2199,7 @@ mod tests {
             "--moe-fused-route-limit",
             "8",
             "--moe-stats",
+            "--moe-ram-cache",
         ])
         .unwrap_or_else(|error| panic!("advanced MoE flags must parse in bench: {error}"));
 
@@ -2218,6 +2219,7 @@ mod tests {
         assert_eq!(runtime.moe_threads.as_deref(), Some("physical"));
         assert_eq!(runtime.moe_fused_route_limit, Some(8));
         assert!(runtime.moe_stats);
+        assert!(runtime.moe_ram_cache);
     }
 
     #[test]
