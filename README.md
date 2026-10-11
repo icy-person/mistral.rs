@@ -187,6 +187,27 @@ byte budget as the cache authority. With `--moe-stats`, GPT-OSS telemetry includ
 hit rate, mapped bytes, physically resident mapped bytes, actual read timing, prefault timing, and
 optional cold-page release counters.
 
+When the priority is **fewer repeated SSD reads** and the routed working set has useful locality,
+try `--moe-ram-cache`. It reads expert slices into owned RAM buffers and retains them in the
+byte-bounded LRU cache. On Linux it prefers `O_DIRECT` to avoid also filling the OS page cache with
+the same read data; unsupported direct-I/O paths fall back to buffered reads. The cache budget still
+limits retained expert bytes, so a too-small budget can cause eviction and rereads. This mode
+replaces the mmap/zero-copy plus prefault path rather than stacking another cache on top of it.
+
+Example for a local GPT-OSS MXFP4 GGUF; adjust the 1024 MiB cache to the RAM you can spare:
+
+```bash
+mistralrs run --cpu -f /path/to/gpt-oss-20b-MXFP4.gguf \\
+  --moe-stream --moe-ram-cache \\
+  --cache-mb 1024 --cache-floor-mb 1536 --cache-ceil-mb 1024 \\
+  --io-threads 4 --moe-overlap --moe-threads physical --moe-stats
+```
+
+Compare this with `--moe-zero-copy --moe-prefault` using the same model, prompt, decode length,
+and cache budget. Check `promotions`, `hit_rate`, `process_storage_read_mib`, `io_wait_ms`, and
+decode tokens/s from `--moe-stats`; the best setting depends on the expert-routing locality and
+available RAM.
+
 On Linux, `--moe-release-cold` can issue `MADV_DONTNEED` for sufficiently idle file-backed
 expert pages. It is opt-in because the kernel may reclaim those pages later and a subsequent
 expert access can fault the bytes back from GGUF storage.
@@ -199,8 +220,9 @@ For MoE performance work, pass an explicit `--gen-len 256` (the CLI default is s
 so decode measurements are long enough to expose cache churn and storage stalls. The `bench`
 subcommand accepts the same MoE controls as `run` and `serve`, including `--moe-stream`,
 `--cache-mb`, `--cache-floor-mb`, `--cache-ceil-mb`, `--io-threads`, `--moe-threads`,
-`--moe-overlap`, `--moe-zero-copy`, `--moe-prefault`, `--moe-cache-per-source`,
-`--moe-release-cold`, `--moe-release-idle`, `--moe-fused-route-limit`, and `--moe-stats`.
+`--moe-overlap`, `--moe-zero-copy`, `--moe-ram-cache`, `--moe-prefault`,
+`--moe-cache-per-source`, `--moe-release-cold`, `--moe-release-idle`,
+`--moe-fused-route-limit`, and `--moe-stats`.
 Boolean controls accept explicit values with equals syntax: `--moe-zero-copy=false` and
 `--moe-prefault=false` provide clean baseline runs without changing the benchmark command.
 
