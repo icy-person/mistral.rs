@@ -503,6 +503,23 @@ fn oldest_unleased_key(
         .map(|(key, _)| key.clone())
 }
 
+// Byte-budget eviction must not discard zero-cost mmap descriptors: removing
+// one does not free RAM and can evict useful lookup state without making room.
+fn oldest_unleased_heap_key(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    exclude: Option<&MxFp4StreamKey>,
+) -> Option<MxFp4StreamKey> {
+    entries
+        .iter()
+        .filter(|(key, entry)| {
+            entry.bytes > 0
+                && exclude.map_or(true, |excluded| *key != excluded)
+                && Arc::strong_count(&entry.data) == 1
+        })
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, _)| key.clone())
+}
+
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
@@ -691,17 +708,67 @@ impl MxFp4StreamCache {
 
         if let Some((shard, offset, len)) = promote_range {
             if let Ok(bytes) = self.archive.shard_data_slice(shard, offset, len) {
-                // Keep a bounded anonymous-RAM copy of experts that prove hot so
-                // page-cache eviction doesn't force a later SSD read for the same expert.
+                // Copy a repeatedly used mmap range into the bounded heap cache.
+                // insert() intentionally leaves duplicate keys untouched, so promotion
+                // must replace the existing descriptor and account for its RAM bytes.
                 let owned = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())));
-                self.insert(key.clone(), owned.clone());
-                self.stats.promotions.fetch_add(1, Ordering::Relaxed);
-                self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                return Some(owned);
+                if self.replace_mapped_with_owned(key, owned.clone()) {
+                    self.stats.promotions.fetch_add(1, Ordering::Relaxed);
+                    self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                    return Some(owned);
+                }
             }
         }
 
         Some(current)
+    }
+
+    fn replace_mapped_with_owned(
+        &self,
+        key: &MxFp4StreamKey,
+        data: Arc<MxFp4StreamData>,
+    ) -> bool {
+        let len = data.len();
+        if len == 0 || len > self.budget_bytes {
+            return false;
+        }
+
+        let Ok(mut guard) = self.inner.lock() else {
+            return false;
+        };
+        let Some(old_bytes) = guard.entries.get(key).and_then(|entry| {
+            matches!(entry.data.as_ref(), MxFp4StreamData::ArchiveMapped { .. })
+                .then_some(entry.bytes)
+        }) else {
+            // The descriptor may have been evicted or replaced while bytes were copied.
+            return false;
+        };
+
+        while guard.used_bytes.saturating_add(len) > self.budget_bytes {
+            let Some(victim) = oldest_unleased_heap_key(&guard.entries, Some(key)) else {
+                // Keep the current mmap entry rather than exceeding the configured RAM cap.
+                return false;
+            };
+            if let Some(old) = guard.entries.remove(&victim) {
+                guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
+                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        guard.clock = guard.clock.wrapping_add(1);
+        let now = guard.clock;
+        guard.used_bytes = guard.used_bytes.saturating_sub(old_bytes).saturating_add(len);
+        // The cache mutex has remained locked since the descriptor was validated above,
+        // so this entry cannot be removed or replaced between validation and mutation.
+        let entry = guard
+            .entries
+            .get_mut(key)
+            .expect("validated mapped cache entry must remain present under lock");
+        entry.data = data;
+        entry.bytes = len;
+        entry.last_used = now;
+        entry.dontneed_advised = false;
+        true
     }
 
     fn insert(&self, key: MxFp4StreamKey, data: Arc<MxFp4StreamData>) {
@@ -751,7 +818,7 @@ impl MxFp4StreamCache {
             }
 
             while guard.used_bytes.saturating_add(len) > self.budget_bytes {
-                let Some(victim) = oldest_unleased_key(&guard.entries, None) else {
+                let Some(victim) = oldest_unleased_heap_key(&guard.entries, None) else {
                     // All candidates are actively used. Serve this call with its
                     // returned Arc, then drop it instead of exceeding the cache budget.
                     return;
@@ -1260,8 +1327,11 @@ fn read_file_range(
             match read_direct(direct, aligned_start, aligned_len) {
                 Ok(buf) => {
                     let begin = usize::try_from(offset - aligned_start).unwrap_or(0);
+                    // Copy just the requested range directly into its Arc allocation.
+                    // Returning a Vec from the aligned buffer first would make a second
+                    // full-buffer copy before constructing the cached Arc<[u8]>.
                     return Ok(MxFp4StreamData::Owned(Arc::<[u8]>::from(
-                        buf[begin..begin + len].to_vec(),
+                        &buf.as_slice()[begin..begin + len],
                     )));
                 }
                 Err(err) => {
@@ -1279,10 +1349,10 @@ fn read_file_range(
 }
 
 #[cfg(target_os = "linux")]
-fn read_direct(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+fn read_direct(file: &File, offset: u64, len: usize) -> io::Result<AlignedBuffer> {
     let mut aligned = AlignedBuffer::new(len)?;
     read_exact_at(file, offset, aligned.as_mut_slice())?;
-    Ok(aligned.to_vec())
+    Ok(aligned)
 }
 
 #[cfg(target_os = "linux")]
@@ -1309,12 +1379,12 @@ impl AlignedBuffer {
         Ok(Self { ptr, len, layout })
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    fn to_vec(&self) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len).to_vec() }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 
@@ -1497,6 +1567,9 @@ mod tests {
                 data: cold_data.clone(),
                 bytes: 8,
                 last_used: 1,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
             },
         );
         drop(cold_data);
@@ -1508,6 +1581,9 @@ mod tests {
                 data: leased_data.clone(),
                 bytes: 8,
                 last_used: 0,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
             },
         );
         let active_lease = leased_data.clone();
@@ -1516,6 +1592,44 @@ mod tests {
         assert_eq!(oldest_unleased_key(&entries, None), Some(cold_key));
         drop(active_lease);
         assert_eq!(oldest_unleased_key(&entries, None), Some(leased_key));
+    }
+
+    #[test]
+    fn byte_budget_lru_skips_zero_byte_mapping_descriptors() {
+        let descriptor_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 0,
+        };
+        let heap_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 1,
+        };
+        let mut entries = HashMap::new();
+        entries.insert(
+            descriptor_key,
+            CacheEntry {
+                // Represents an mmap descriptor: its accounted heap cost is zero.
+                data: Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(Vec::<u8>::new()))),
+                bytes: 0,
+                last_used: 0,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+        entries.insert(
+            heap_key.clone(),
+            CacheEntry {
+                data: Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![7u8; 8]))),
+                bytes: 8,
+                last_used: 1,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+
+        assert_eq!(oldest_unleased_heap_key(&entries, None), Some(heap_key));
     }
 
     #[test]
