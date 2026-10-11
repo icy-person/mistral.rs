@@ -21,7 +21,7 @@ use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
-const HOT_PROMOTION_HITS: u16 = 3;
+const HOT_PROMOTION_HITS: u16 = 2;
 // A fused gate/up source can have the LRU entry plus two persistent OnceLock descriptors.
 // More references indicate a live request should be allowed to finish before DONTNEED.
 const MAX_IDLE_MMAP_REFS: usize = 3;
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_promotion_preflight_preserves_cache_contents() {
+    fn promotion_capacity_preflight_respects_live_leases() {
         let heap_key = MxFp4StreamKey {
             source: Arc::<str>::from("gate"),
             expert_index: 2,
@@ -1780,8 +1780,8 @@ mod tests {
 
     #[test]
     fn promotes_only_repeated_mapped_experts_that_fit_the_budget() {
-        assert!(!should_promote_mapped(2, 64, 1024, false));
-        assert!(should_promote_mapped(3, 64, 1024, false));
+        assert!(!should_promote_mapped(1, 64, 1024, false));
+        assert!(should_promote_mapped(2, 64, 1024, false));
         assert!(!should_promote_mapped(3, 64, 0, false));
         assert!(!should_promote_mapped(3, 2048, 1024, false));
         assert!(!should_promote_mapped(3, 64, 1024, true));
