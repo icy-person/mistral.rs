@@ -21,7 +21,7 @@ use std::{os::unix::fs::OpenOptionsExt, path::Path};
 
 const MIB: usize = 1024 * 1024;
 const DIRECT_ALIGNMENT: u64 = 4096;
-const HOT_PROMOTION_HITS: u16 = 3;
+const HOT_PROMOTION_HITS: u16 = 2;
 // A fused gate/up source can have the LRU entry plus two persistent OnceLock descriptors.
 // More references indicate a live request should be allowed to finish before DONTNEED.
 const MAX_IDLE_MMAP_REFS: usize = 3;
@@ -520,6 +520,28 @@ fn oldest_unleased_heap_key(
         .map(|(key, _)| key.clone())
 }
 
+fn reclaimable_heap_bytes(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    exclude: Option<&MxFp4StreamKey>,
+) -> usize {
+    entries
+        .iter()
+        .filter(|(key, entry)| {
+            entry.bytes > 0
+                && exclude.map_or(true, |excluded| *key != excluded)
+                && Arc::strong_count(&entry.data) == 1
+        })
+        .fold(0usize, |sum, (_, entry)| sum.saturating_add(entry.bytes))
+}
+
+fn can_reclaim_heap_bytes(
+    entries: &HashMap<MxFp4StreamKey, CacheEntry>,
+    exclude: Option<&MxFp4StreamKey>,
+    needed: usize,
+) -> bool {
+    reclaimable_heap_bytes(entries, exclude) >= needed
+}
+
 #[derive(Debug)]
 pub(crate) struct MxFp4StreamCache {
     inner: Mutex<CacheInner>,
@@ -707,20 +729,42 @@ impl MxFp4StreamCache {
         };
 
         if let Some((shard, offset, len)) = promote_range {
-            if let Ok(bytes) = self.archive.shard_data_slice(shard, offset, len) {
-                // Copy a repeatedly used mmap range into the bounded heap cache.
-                // insert() intentionally leaves duplicate keys untouched, so promotion
-                // must replace the existing descriptor and account for its RAM bytes.
-                let owned = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())));
-                if self.replace_mapped_with_owned(key, owned.clone()) {
-                    self.stats.promotions.fetch_add(1, Ordering::Relaxed);
-                    self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                    return Some(owned);
-                }
+            let promoted = self
+                .archive
+                .shard_data_slice(shard, offset, len)
+                .ok()
+                .map(|bytes| {
+                    // Copy a repeatedly used mmap range into the bounded heap cache.
+                    // insert() leaves duplicate keys untouched, so promotion must replace
+                    // the descriptor and account for its actual RAM bytes.
+                    Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(bytes.to_vec())))
+                })
+                .filter(|owned| self.replace_mapped_with_owned(key, owned.clone()));
+
+            if let Some(owned) = promoted {
+                self.stats.promotions.fetch_add(1, Ordering::Relaxed);
+                self.stats.promoted_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                return Some(owned);
             }
+
+            // Do not permanently disable promotion when the cache was temporarily full
+            // or the mapped slice could not be read. A later access can retry after LRU
+            // entries become evictable.
+            self.reset_promotion_claim(key);
         }
 
         Some(current)
+    }
+
+    fn reset_promotion_claim(&self, key: &MxFp4StreamKey) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = guard.entries.get_mut(key) {
+            if matches!(entry.data.as_ref(), MxFp4StreamData::ArchiveMapped { .. }) {
+                entry.promotion_claimed = false;
+            }
+        }
     }
 
     fn replace_mapped_with_owned(
@@ -744,11 +788,20 @@ impl MxFp4StreamCache {
             return false;
         };
 
+        // Decide whether promotion can fit before evicting anything. Otherwise a
+        // partially reclaimable cache would lose useful hot entries even though the
+        // promotion itself must be abandoned because remaining buffers are leased.
+        let needed_bytes = guard
+            .used_bytes
+            .saturating_add(len)
+            .saturating_sub(self.budget_bytes);
+        if !can_reclaim_heap_bytes(&guard.entries, Some(key), needed_bytes) {
+            return false;
+        }
+
         while guard.used_bytes.saturating_add(len) > self.budget_bytes {
-            let Some(victim) = oldest_unleased_heap_key(&guard.entries, Some(key)) else {
-                // Keep the current mmap entry rather than exceeding the configured RAM cap.
-                return false;
-            };
+            let victim = oldest_unleased_heap_key(&guard.entries, Some(key))
+                .expect("reclaimable byte preflight guarantees an evictable heap entry");
             if let Some(old) = guard.entries.remove(&victim) {
                 guard.used_bytes = guard.used_bytes.saturating_sub(old.bytes);
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1630,6 +1683,51 @@ mod tests {
         );
 
         assert_eq!(oldest_unleased_heap_key(&entries, None), Some(heap_key));
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 8);
+        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 0);
+    }
+
+    #[test]
+    fn promotion_capacity_preflight_respects_live_leases() {
+        let heap_key = MxFp4StreamKey {
+            source: Arc::<str>::from("gate"),
+            expert_index: 2,
+        };
+        let leased_key = MxFp4StreamKey {
+            source: Arc::<str>::from("up"),
+            expert_index: 3,
+        };
+        let mut entries = HashMap::new();
+        entries.insert(
+            heap_key.clone(),
+            CacheEntry {
+                data: Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![1u8; 4]))),
+                bytes: 4,
+                last_used: 1,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+        let leased = Arc::new(MxFp4StreamData::Owned(Arc::<[u8]>::from(vec![2u8; 4])));
+        entries.insert(
+            leased_key,
+            CacheEntry {
+                data: leased.clone(),
+                bytes: 4,
+                last_used: 0,
+                hits: 0,
+                promotion_claimed: false,
+                dontneed_advised: false,
+            },
+        );
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 4);
+        // Excluding the only unleased item leaves no reclaimable bytes.
+        assert_eq!(reclaimable_heap_bytes(&entries, Some(&heap_key)), 0);
+        assert!(!can_reclaim_heap_bytes(&entries, None, 5));
+        drop(leased);
+        assert_eq!(reclaimable_heap_bytes(&entries, None), 8);
+        assert!(can_reclaim_heap_bytes(&entries, None, 5));
     }
 
     #[test]
@@ -1689,8 +1787,8 @@ mod tests {
 
     #[test]
     fn promotes_only_repeated_mapped_experts_that_fit_the_budget() {
-        assert!(!should_promote_mapped(2, 64, 1024, false));
-        assert!(should_promote_mapped(3, 64, 1024, false));
+        assert!(!should_promote_mapped(1, 64, 1024, false));
+        assert!(should_promote_mapped(2, 64, 1024, false));
         assert!(!should_promote_mapped(3, 64, 0, false));
         assert!(!should_promote_mapped(3, 2048, 1024, false));
         assert!(!should_promote_mapped(3, 64, 1024, true));
